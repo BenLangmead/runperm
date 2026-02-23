@@ -80,6 +80,14 @@ public:
         return alphabet.unmap_char(Base::template get_base_column<BaseColumns::CHARACTER>(pos.interval));
     }
 
+    std::vector<uchar> get_alphabet() const {
+        std::vector<uchar> sigma;
+        sigma.reserve(static_cast<size_t>(alphabet.size()));
+        for (size_t i = 0; i < static_cast<size_t>(alphabet.size()); ++i)
+            sigma.push_back(alphabet.unmap_char(static_cast<uchar>(i)));
+        return sigma;
+    }
+
     size_t serialize(std::ostream& out) {
         return Base::serialize(out) + alphabet.serialize(out);
     }
