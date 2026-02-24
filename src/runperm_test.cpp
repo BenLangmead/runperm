@@ -6,6 +6,7 @@
     #include "runperm.hpp"
     
     #include <iostream>
+    #include <set>
     #include <cassert>
     #include <sstream>
     #include <optional>
@@ -118,12 +119,9 @@
                       const std::vector<ulint>& interval_permutation, 
                       const std::vector<std::array<ulint, 2>>& run_data, 
                       size_t n) {
-        
-        SplitParams split_params;
-        split_params.length_capping_factor = length_capping_factor;
-    
         auto start_time = high_resolution_clock::now();
-        auto runperm = RunPermType(lengths, interval_permutation, n, run_data);
+        // 5-arg with NO_SPLITTING: run_data is sized to lengths.size(), not the potentially larger split structure
+        auto runperm = RunPermType(lengths, interval_permutation, n, NO_SPLITTING, run_data);
         auto creation_time = high_resolution_clock::now();
     
         auto pos = runperm.first();
@@ -152,6 +150,31 @@
         std::cout << "    Total: " << total_duration.count() << "μs" << std::endl;
         std::stringstream ss;
         std::cout << "    Size: " << runperm.serialize(ss) << std::endl;
+    }
+
+    template<typename RunData, typename RunPermType>
+    void test_runperm_with_splitting(const std::vector<ulint>& lengths, 
+                                      const std::vector<ulint>& interval_permutation, 
+                                      const std::vector<std::array<ulint, 2>>& run_data, 
+                                      size_t n) {
+        SplitParams split_params(length_capping_factor, std::nullopt);
+        // 5-arg constructor extends run_data via lambda when splitting creates more runs
+        auto runperm = RunPermType(lengths, interval_permutation, n, split_params, run_data);
+
+        assert(runperm.move_runs() >= lengths.size() && "splitting can only add runs");
+
+        std::set<ulint> valid_val1, valid_val2;
+        for (size_t i = 0; i < run_data.size(); ++i) {
+            valid_val1.insert(run_data[i][0]);
+            valid_val2.insert(run_data[i][1]);
+        }
+
+        auto pos = runperm.first();
+        for (size_t i = 0; i < n; ++i) {
+            pos = runperm.next(pos);
+            assert(valid_val1.count(runperm.template get<RunData::VAL_1>(pos)));
+            assert(valid_val2.count(runperm.template get<RunData::VAL_2>(pos)));
+        }
     }
     
     void tests() {
@@ -189,6 +212,11 @@
                 test_runperm<RunData, RunPerm<RunData, true, false>>(lengths, interval_permutation, run_data, n);
                 test_runperm<RunData, RunPerm<RunData, false, true>>(lengths, interval_permutation, run_data, n);
                 test_runperm<RunData, RunPerm<RunData, false, false>>(lengths, interval_permutation, run_data, n);
+
+                test_runperm_with_splitting<RunData, RunPerm<RunData, true, true>>(lengths, interval_permutation, run_data, n);
+                test_runperm_with_splitting<RunData, RunPerm<RunData, true, false>>(lengths, interval_permutation, run_data, n);
+                test_runperm_with_splitting<RunData, RunPerm<RunData, false, true>>(lengths, interval_permutation, run_data, n);
+                test_runperm_with_splitting<RunData, RunPerm<RunData, false, false>>(lengths, interval_permutation, run_data, n);
                 std::cout << std::endl;
             }
         }
