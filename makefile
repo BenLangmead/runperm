@@ -5,29 +5,53 @@ CXXFLAGS = -std=c++17 -Iinclude -O3
 
 HEADERS = $(shell find include -name "*.hpp")
 
+BUILD_DIR = build
+UNIT_BUILD_DIR = $(BUILD_DIR)/unit
+INTEGRATION_BUILD_DIR = $(BUILD_DIR)/integration
+BENCH_BUILD_DIR = $(BUILD_DIR)/bench
+
+# High-level targets
+# - all: build all unit/integration tests + benchmarks + examples
+# - test: build unit/integration tests and run them
+
+UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test
+INTEGRATION_TESTS = $(INTEGRATION_BUILD_DIR)/rlbwt_test
+BENCH_TESTS = $(BENCH_BUILD_DIR)/move_bench \
+              $(BENCH_BUILD_DIR)/runperm_bench \
+              $(BENCH_BUILD_DIR)/rlbwt_bench
+
 # all: build invert move_build
-all: move_test rlbwt_test runperm_test example_test
+all: $(UNIT_TESTS) $(INTEGRATION_TESTS) $(BENCH_TESTS) example_test
 
-# Target to build the executable for build.cpp
-# build: src/build.cpp $(HEADERS)
-# 	$(CXX) $(CXXFLAGS) -o build src/build.cpp
+test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
+	$(UNIT_BUILD_DIR)/packed_vector_test
+	$(INTEGRATION_BUILD_DIR)/rlbwt_test
 
-# # Target to build the executable for invert.cpp
-# invert: src/invert.cpp $(HEADERS)
-# 	$(CXX) $(CXXFLAGS) -o invert src/invert.cpp
+example_test: examples/example_test.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
-# Target to build the test executable for move_build.cpp
-move_test: src/move_test.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o move_test src/move_test.cpp
+# Unit tests (header-only data structures)
+$(UNIT_BUILD_DIR)/packed_vector_test: ./tests/unit/ds/packed_vector_test.cpp $(HEADERS)
+	mkdir -p $(UNIT_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
-rlbwt_test: src/rlbwt_test.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o rlbwt_test src/rlbwt_test.cpp
+# Integration-style tests that exercise larger rlbwt/runperm flows
+$(INTEGRATION_BUILD_DIR)/rlbwt_test: ./tests/integration/rlbwt_test.cpp $(HEADERS)
+	mkdir -p $(INTEGRATION_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
-runperm_test: src/runperm_test.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o runperm_test src/runperm_test.cpp
+# Benchmarks (not run by default in `make test`)
+$(BENCH_BUILD_DIR)/move_bench: ./tests/benchmark/move_bench.cpp $(HEADERS)
+	mkdir -p $(BENCH_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
-example_test: src/example_test.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o example_test src/example_test.cpp
+$(BENCH_BUILD_DIR)/runperm_bench: ./tests/benchmark/runperm_bench.cpp $(HEADERS)
+	mkdir -p $(BENCH_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(BENCH_BUILD_DIR)/rlbwt_bench: ./tests/benchmark/rlbwt_bench.cpp $(HEADERS)
+	mkdir -p $(BENCH_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
 .PHONY: debug
 debug: CXXFLAGS += -g -O0
@@ -35,4 +59,5 @@ debug: all
 
 # Clean up build files
 clean:
-	rm -f build invert move_build move_test rlbwt_test runperm_test example_test
+	rm -rf $(BUILD_DIR)
+	rm -f invert move_build example_test

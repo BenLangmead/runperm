@@ -80,13 +80,9 @@ public:
     [[nodiscard]] size_t rows() const noexcept { return num_rows; }
     [[nodiscard]] static constexpr size_t cols() noexcept { return NumCols; }
     [[nodiscard]] size_t data_size() const noexcept {
-        return byte_row_width*num_rows + sizeof(ulint)/sizeof(word_t);
+        return byte_row_width * num_rows + sizeof(ulint) / sizeof(word_t);
     }
-    [[nodiscard]] const std::array<uchar, NumCols>& widths() const noexcept { return widths; }
-    size_t size() const { return num_rows; }
-    size_t data_size() const { 
-        return byte_row_width*num_rows + sizeof(ulint)/sizeof(word_t);
-    }
+    [[nodiscard]] const std::array<uchar, NumCols>& get_widths() const noexcept { return widths; }
 
     size_t serialize(std::ostream &out) {
         size_t written_bytes = 0;
@@ -164,7 +160,7 @@ private:
 };
 
 template<class Columns>
-class PackedVectorAligned : public PackedMatrixAligned<static_cast<size_t>(Columns::NUM_COLS)> {
+class PackedVectorAligned : public PackedMatrixAligned<static_cast<size_t>(Columns::COUNT)> {
     using Base = PackedMatrixAligned<static_cast<size_t>(Columns::COUNT)>;
 
 public:
