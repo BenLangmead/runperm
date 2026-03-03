@@ -172,4 +172,3 @@ int main() {
     std::cout << "move_structure unit tests passed" << std::endl;
     return 0;
 }
-

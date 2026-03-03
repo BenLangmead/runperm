@@ -133,4 +133,3 @@ int main() {
     std::cout << "runperm_lf_fl unit tests passed" << std::endl;
     return 0;
 }
-

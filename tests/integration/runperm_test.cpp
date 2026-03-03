@@ -97,4 +97,3 @@ int main() {
     std::cout << "runperm integration tests passed" << std::endl;
     return 0;
 }
-

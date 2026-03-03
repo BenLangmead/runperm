@@ -179,4 +179,3 @@ int main() {
     std::cout << "moveperm unit tests passed" << std::endl;
     return 0;
 }
-

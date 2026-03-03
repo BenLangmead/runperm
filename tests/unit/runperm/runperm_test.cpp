@@ -206,4 +206,3 @@ int main() {
     std::cout << "runperm unit tests passed" << std::endl;
     return 0;
 }
-

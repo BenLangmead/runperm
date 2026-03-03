@@ -86,4 +86,3 @@ int main() {
     std::cout << "rlbwt_row unit tests passed" << std::endl;
     return 0;
 }
-

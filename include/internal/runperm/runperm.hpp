@@ -54,6 +54,9 @@ public:
     using RunData = DataTuple<RunCols>;
     using Position = typename MoveStructurePerm::Position;
 
+
+    static_assert(has_count_enumerator<RunCols>::value, "RunColsType must have a COUNT enumerator");
+    
     // check if we're using MoveTable
     static constexpr bool is_move_table_type() {
         return std::is_same_v<TableType<void>, MoveTable<void>>;

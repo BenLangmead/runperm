@@ -212,4 +212,3 @@ int main() {
     std::cout << "columns tests passed" << std::endl;
     return 0;
 }
-

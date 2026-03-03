@@ -103,4 +103,3 @@ int main() {
     std::cout << "runperm_phi_invphi unit tests passed" << std::endl;
     return 0;
 }
-

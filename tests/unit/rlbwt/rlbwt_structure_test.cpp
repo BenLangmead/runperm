@@ -111,4 +111,3 @@ int main() {
     std::cout << "rlbwt_structure unit tests passed" << std::endl;
     return 0;
 }
-

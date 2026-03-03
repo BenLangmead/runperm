@@ -104,4 +104,3 @@ int main() {
     std::cout << "api tests passed" << std::endl;
     return 0;
 }
-

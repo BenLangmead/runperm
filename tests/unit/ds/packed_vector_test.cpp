@@ -234,4 +234,3 @@ int main() {
     std::cout << "packed_vector tests passed" << std::endl;
     return 0;
 }
-

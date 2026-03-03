@@ -171,4 +171,3 @@ int main() {
     std::cout << "move_structure integration tests passed" << std::endl;
     return 0;
 }
-

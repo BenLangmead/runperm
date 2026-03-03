@@ -255,4 +255,3 @@ int main() {
     std::cout << "move_row/move_table tests passed" << std::endl;
     return 0;
 }
-

@@ -131,4 +131,3 @@ int main() {
     std::cout << "moveperm integration tests passed" << std::endl;
     return 0;
 }
-

@@ -11,6 +11,21 @@
 using std::size_t;
 using std::vector;
 
+void test_define_run_cols_macro() {
+    // Exercise DEFINE_ENUM_CLASS_WITH_COUNT and enum helpers from common.hpp.
+    DEFINE_RUN_COLS(RunCols, A, B);
+
+    // COUNT is appended as the last enumerator, but the total size is the number of fields provided.
+    static_assert(enum_count<RunCols>() == 2, "enum_count should match number of fields provided");
+
+    DataTuple<RunCols> tuple{};
+    tuple[to_index(RunCols::A)] = 7;
+    tuple[to_index(RunCols::B)] = 11;
+
+    assert(tuple[to_index(RunCols::A)] == 7);
+    assert(tuple[to_index(RunCols::B)] == 11);
+}
+
 void test_bit_width_basic() {
     // By contract, bit_width(0) is 1.
     assert(bit_width(0) == 1);
@@ -168,6 +183,7 @@ void test_macros_sanity() {
 
 int main() {
     test_bit_width_basic();
+    test_define_run_cols_macro();
     test_enum_helpers();
     test_permutation_intervals_trivial_and_runs();
     test_bwt_to_rlbwt_basic();
@@ -176,4 +192,3 @@ int main() {
     std::cout << "common tests passed" << std::endl;
     return 0;
 }
-
