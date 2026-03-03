@@ -39,8 +39,8 @@ This library is header-only. Just add `include/` to your compiler's include path
 The provided `makefile` only builds example/test executables:
 
 - `make examples` builds the `examples` executable with helpful use cases.
-- `make test` builds and runs all test modules
-- `make bench` builds benchmarking executables
+- `make test` builds and runs all test modules.
+- `make bench` builds benchmarking executables.
 
 ### Basic Usage
 
