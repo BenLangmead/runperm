@@ -4,7 +4,7 @@ Flexible plug-and-play header library implementing data structures for represent
 
 Described in greater detail at [https://arxiv.org/abs/2602.11029](https://arxiv.org/abs/2602.11029).
 
-Alpha Version 0.1.3
+Alpha Version 0.2.0
 
 ## Overview
 
@@ -35,16 +35,15 @@ This library is header-only. Just add `include/` to your compiler's include path
 - `move.hpp` loads the underlying move structure implementation only.
 - `rlbwt.hpp` loads specialized classes to represent LF/FL and Phi/InvPhi.
 
-The provided `makefile` only builds example/test executables from `src`:
-- `example_test`
-- `move_test`
-- `rlbwt_test`
-- `runperm_test`
+The provided `makefile` only builds example/test executables:
+- `make examples` builds the `examples` executable with helpful use cases.
+- `make test` builds and runs all test modules
+- `make bench` builds benchmarking executables
 
 ### Basic Usage
 
 #### RunPerm
-`RunPerm` is the generic implementation allowing storage of user defined fields alongside a runny permutation, included with `runperm.hpp`. Some small examples are given in the `src/example_test.cpp` file.
+`RunPerm` is the generic implementation allowing storage of user defined fields alongside a runny permutation, included with `runperm.hpp`. Some small examples are given in the provided `examples.cpp` file.
 
 Given the runny permutation example:
 
