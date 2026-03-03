@@ -23,9 +23,9 @@ help:
 	@echo "Usage: make [target]"
 	@echo "Targets:"
 	@echo "  all: build all unit/integration tests + benchmarks + examples"
+	@echo "  examples: build examples"
 	@echo "  test: build unit/integration tests and run them"
 	@echo "  bench: build benchmarks"
-	@echo "  examples: build examples"
 	@echo "  clean: clean build files"
 	@echo "  debug: build with debug symbols"
 
@@ -54,6 +54,9 @@ BENCH_TESTS = $(BENCH_BUILD_DIR)/move_bench \
 
 all: $(UNIT_TESTS) $(INTEGRATION_TESTS) $(BENCH_TESTS) examples
 
+examples: examples.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
 test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(UNIT_BUILD_DIR)/packed_vector_test
 	$(UNIT_BUILD_DIR)/alphabet_test
@@ -79,9 +82,6 @@ test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	@echo "==============================================="
 
 bench: $(BENCH_TESTS)
-
-examples: examples.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o $@ $<
 
 # Unit tests (header-only data structures)
 $(UNIT_BUILD_DIR)/packed_vector_test: ./tests/unit/ds/packed_vector_test.cpp $(HEADERS)
