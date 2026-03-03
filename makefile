@@ -13,6 +13,21 @@ BENCH_BUILD_DIR = $(BUILD_DIR)/bench
 # High-level targets
 # - all: build all unit/integration tests + benchmarks + examples
 # - test: build unit/integration tests and run them
+# - bench: build benchmarks
+# - examples: build examples
+# - clean: clean build files
+# - debug: build with debug symbols
+
+# make help: print this help message
+help:
+	@echo "Usage: make [target]"
+	@echo "Targets:"
+	@echo "  all: build all unit/integration tests + benchmarks + examples"
+	@echo "  test: build unit/integration tests and run them"
+	@echo "  bench: build benchmarks"
+	@echo "  examples: build examples"
+	@echo "  clean: clean build files"
+	@echo "  debug: build with debug symbols"
 
 UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test \
              $(UNIT_BUILD_DIR)/alphabet_test \
@@ -24,10 +39,11 @@ UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test \
              $(UNIT_BUILD_DIR)/move_structure_test \
              $(UNIT_BUILD_DIR)/moveperm_test \
              $(UNIT_BUILD_DIR)/runperm_test \
+             $(UNIT_BUILD_DIR)/runperm_random_test \
              $(UNIT_BUILD_DIR)/rlbwt_row_test \
              $(UNIT_BUILD_DIR)/rlbwt_structure_test \
-			 $(UNIT_BUILD_DIR)/runperm_lf_fl_test \
-			 $(UNIT_BUILD_DIR)/runperm_phi_invphi_test
+             $(UNIT_BUILD_DIR)/runperm_lf_fl_test \
+             $(UNIT_BUILD_DIR)/runperm_phi_invphi_test
 INTEGRATION_TESTS = $(INTEGRATION_BUILD_DIR)/rlbwt_test \
                     $(INTEGRATION_BUILD_DIR)/move_structure_test \
                     $(INTEGRATION_BUILD_DIR)/moveperm_test \
@@ -49,6 +65,7 @@ test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(UNIT_BUILD_DIR)/move_structure_test
 	$(UNIT_BUILD_DIR)/moveperm_test
 	$(UNIT_BUILD_DIR)/runperm_test
+	$(UNIT_BUILD_DIR)/runperm_random_test
 	$(UNIT_BUILD_DIR)/rlbwt_row_test
 	$(UNIT_BUILD_DIR)/rlbwt_structure_test
 	$(UNIT_BUILD_DIR)/runperm_lf_fl_test
@@ -57,9 +74,9 @@ test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(INTEGRATION_BUILD_DIR)/move_structure_test
 	$(INTEGRATION_BUILD_DIR)/moveperm_test
 	$(INTEGRATION_BUILD_DIR)/runperm_test
-	@echo "================================================="
+	@echo "==============================================="
 	@echo "     All unit and integration tests passed"
-	@echo "================================================="
+	@echo "==============================================="
 
 bench: $(BENCH_TESTS)
 
@@ -104,6 +121,10 @@ $(UNIT_BUILD_DIR)/moveperm_test: ./tests/unit/runperm/moveperm_test.cpp $(HEADER
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 $(UNIT_BUILD_DIR)/runperm_test: ./tests/unit/runperm/runperm_test.cpp $(HEADERS)
+	mkdir -p $(UNIT_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(UNIT_BUILD_DIR)/runperm_random_test: ./tests/unit/runperm/runperm_random_test.cpp $(HEADERS)
 	mkdir -p $(UNIT_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
