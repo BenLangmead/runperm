@@ -25,11 +25,11 @@ public:
 // Also implements LF, LF(steps), get_character(), get_character(row)
 
 template<typename RunColsType, typename AlphabetType = Nucleotide>
-using RunPermLFSeperated = RunPermLF<RunColsType, false, false, AlphabetType>; // Default
+using RunPermLFSeparated = RunPermLF<RunColsType, false, false, AlphabetType>; // Default
 template<typename RunColsType, typename AlphabetType = Nucleotide>
 using RunPermLFIntegrated = RunPermLF<RunColsType, true, false, AlphabetType>;
 template<typename RunColsType, typename AlphabetType = Nucleotide>
-using RunPermLFSeperatedAbsolute = RunPermLF<RunColsType, false, true, AlphabetType>;
+using RunPermLFSeparatedAbsolute = RunPermLF<RunColsType, false, true, AlphabetType>;
 template<typename RunColsType, typename AlphabetType = Nucleotide>
 using RunPermLFIntegratedAbsolute = RunPermLF<RunColsType, true, true, AlphabetType>;
 
@@ -62,11 +62,11 @@ public:
 // Also implements FL(pos), FL(pos, steps), get_character(pos), get_character(interval)
 
 template<typename RunColsType, typename AlphabetType = Nucleotide>
-using RunPermFLSeperated = RunPermFL<RunColsType, false, false, AlphabetType>; // Default
+using RunPermFLSeparated = RunPermFL<RunColsType, false, false, AlphabetType>; // Default
 template<typename RunColsType, typename AlphabetType = Nucleotide>
 using RunPermFLIntegrated = RunPermFL<RunColsType, true, false, AlphabetType>;
 template<typename RunColsType, typename AlphabetType = Nucleotide>
-using RunPermFLSeperatedAbsolute = RunPermFL<RunColsType, false, true, AlphabetType>;
+using RunPermFLSeparatedAbsolute = RunPermFL<RunColsType, false, true, AlphabetType>;
 template<typename RunColsType, typename AlphabetType = Nucleotide>
 using RunPermFLIntegratedAbsolute = RunPermFL<RunColsType, true, true, AlphabetType>;
 

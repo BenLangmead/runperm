@@ -51,7 +51,7 @@ static void test_runperm_separated_absolute_basic_mapping_and_run_data() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 100)};
     }
 
-    using RP = RunPermSeperatedAbsolute<TestRunCols>;
+    using RP = RunPermSeparatedAbsolute<TestRunCols>;
     RP rp(lengths, interval_perm, domain, run_data);
 
     assert(rp.domain() == domain);
@@ -88,7 +88,7 @@ static void test_runperm_up_down_navigation() {
         run_data[i] = {static_cast<ulint>(i), 0};
     }
 
-    using RP = RunPermSeperatedAbsolute<TestRunCols>;
+    using RP = RunPermSeparatedAbsolute<TestRunCols>;
     RP rp(lengths, interval_perm, domain, run_data);
 
     auto pos = rp.first();
@@ -120,7 +120,7 @@ static void test_runperm_serialize_roundtrip_separated_absolute() {
         run_data[i] = {static_cast<ulint>(i * 10), static_cast<ulint>(i * 10 + 1)};
     }
 
-    using RP = RunPermSeperatedAbsolute<TestRunCols>;
+    using RP = RunPermSeparatedAbsolute<TestRunCols>;
     RP rp(lengths, interval_perm, domain, run_data);
 
     std::stringstream ss;
@@ -158,7 +158,7 @@ static void test_runperm_next_with_steps_and_pred_succ() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(10 + i)};
     }
 
-    using RP = RunPermSeperatedAbsolute<TestRunCols>;
+    using RP = RunPermSeparatedAbsolute<TestRunCols>;
     RP rp(lengths, interval_perm, domain, run_data);
 
     // next with steps: compare to repeated single-step.

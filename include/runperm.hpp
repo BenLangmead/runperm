@@ -27,11 +27,11 @@ public:
 
 /* === Basic types === */
 template<typename RunColsType>
-using RunPermSeperated = RunPerm<RunColsType, false, false>; // Same as RunPerm<RunColsType>, the default
+using RunPermSeparated = RunPerm<RunColsType, false, false>; // Same as RunPerm<RunColsType>, the default
 template<typename RunColsType>
 using RunPermIntegrated = RunPerm<RunColsType, true, false>;
 template<typename RunColsType>
-using RunPermSeperatedAbsolute = RunPerm<RunColsType, false, true>;
+using RunPermSeparatedAbsolute = RunPerm<RunColsType, false, true>;
 template<typename RunColsType>
 using RunPermIntegratedAbsolute = RunPerm<RunColsType, true, true>;
 

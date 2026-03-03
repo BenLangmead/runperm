@@ -78,7 +78,7 @@ void test_runperm_header_is_available() {
         COUNT
     };
 
-    using RPSeparated = RunPermSeperated<TestCols>;
+    using RPSeparated = RunPermSeparated<TestCols>;
     using RPIntegratedAbs = RunPermIntegratedAbsolute<TestCols>;
 
     const vector<ulint> lengths = {3};

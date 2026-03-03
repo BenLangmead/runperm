@@ -77,7 +77,7 @@ static void test_runperm_random_small_permutations() {
                 run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 100)};
             }
 
-            using RPSeparatedAbs = RunPermSeperatedAbsolute<TestRunCols>;
+            using RPSeparatedAbs = RunPermSeparatedAbsolute<TestRunCols>;
             using RPIntegratedAbs = RunPermIntegratedAbsolute<TestRunCols>;
 
             RPSeparatedAbs rp_sep(lengths, interval_perm, domain, run_data);

@@ -59,7 +59,7 @@ static void integration_runperm_separated_and_integrated_absolute() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 10)};
     }
 
-    using RPSeparatedAbs = RunPermSeperatedAbsolute<TestRunColsInt>;
+    using RPSeparatedAbs = RunPermSeparatedAbsolute<TestRunColsInt>;
     using RPIntegratedAbs = RunPermIntegratedAbsolute<TestRunColsInt>;
 
     RPSeparatedAbs rp_sep(lengths, interval_perm, domain, run_data);
