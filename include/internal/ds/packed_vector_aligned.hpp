@@ -328,6 +328,12 @@ public:
             set(i, data[i]);
         }
     }
+    IntVectorAligned(std::vector<ulint> data, uchar width)
+    : Base(data.size(), {width}) {
+        for (size_t i = 0; i < data.size(); i++) {
+            set(i, data[i]);
+        }
+    }
 
     ulint get(size_t row) const {
         return Base::template get<0>(row);

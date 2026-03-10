@@ -109,6 +109,18 @@ void test_int_vector_vector_ctor_empty() {
     assert(v.rows() == 0);
 }
 
+// (data, width) constructor: initialize from vector with explicit bit width.
+void test_int_vector_vector_width_ctor() {
+    std::vector<ulint> data = {0, 1, 15, 127, 255}; // fits in 8 bits
+    const uchar width = 8;
+
+    IntVector v(data, width);
+    assert(v.rows() == data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+        assert(v.get(i) == data[i]);
+    }
+}
+
 // Iterator tests for IntVector: mutable and const access.
 void test_int_vector_iterators() {
     const size_t rows = 32;
@@ -248,6 +260,18 @@ void test_int_vector_aligned_vector_ctor_empty() {
     assert(v.rows() == 0);
 }
 
+// (data, width) constructor for aligned variant.
+void test_int_vector_aligned_vector_width_ctor() {
+    std::vector<ulint> data = {0, 100, 500, 1023}; // fits in 10 bits
+    const uchar width = 10;
+
+    IntVectorAligned v(data, width);
+    assert(v.rows() == data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+        assert(v.get(i) == data[i]);
+    }
+}
+
 // Iterator tests for IntVectorAligned: mutable and const access.
 void test_int_vector_aligned_iterators() {
     const size_t rows = 40;
@@ -344,12 +368,14 @@ int main() {
     test_int_vector_serialize_roundtrip();
     test_int_vector_vector_ctor_non_empty();
     test_int_vector_vector_ctor_empty();
+    test_int_vector_vector_width_ctor();
     test_int_vector_iterators();
     test_packed_vector_with_enum();
     test_packed_matrix_aligned_basic();
     test_int_vector_aligned();
     test_int_vector_aligned_vector_ctor_non_empty();
     test_int_vector_aligned_vector_ctor_empty();
+    test_int_vector_aligned_vector_width_ctor();
     test_int_vector_aligned_serialize_roundtrip();
     test_packed_vector_aligned_with_enum();
     test_int_vector_aligned_iterators();

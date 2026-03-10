@@ -23,54 +23,95 @@ inline SplitParams DEFAULT_SPLITTING = SplitParams(DEFAULT_LENGTH_CAPPING_FACTOR
 inline SplitParams ONLY_LENGTH_CAPPING = SplitParams(DEFAULT_LENGTH_CAPPING_FACTOR, std::nullopt);
 inline SplitParams ONLY_BALANCING = SplitParams(std::nullopt, DEFAULT_BALANCING_FACTOR);
 
+template<class IntVectorType>
 struct SplitResult {
-    std::vector<ulint> lengths;
-    std::vector<ulint> interval_permutations;
+    IntVectorType lengths;
+    IntVectorType tau_inv;
     ulint max_length;
 };
 
-inline void split_by_length_capping(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const double length_capping_factor, SplitResult& result) {
-    assert(lengths.size() == interval_permutation.size());
+template<class IntVectorType>
+inline void split_by_length_capping(
+    const IntVectorType& lengths, 
+    const IntVectorType& tau_inv, 
+    const ulint domain, 
+    const double length_capping_factor, 
+    SplitResult<IntVectorType>& result
+) {
+    assert(lengths.size() == tau_inv.size());
     assert(length_capping_factor > 0.0);
 
     double avg_run_length = static_cast<double>(domain) / static_cast<double>(lengths.size());
     ulint desired_max_allowed_length = static_cast<ulint>(std::ceil(avg_run_length * length_capping_factor));
     uchar bits = bit_width(desired_max_allowed_length);
     ulint max_allowed_length = MAX_VAL(bits);
-    
-    result.lengths.clear();
-    result.interval_permutations.clear();
-    result.lengths.reserve(static_cast<size_t>(lengths.size() + lengths.size()/length_capping_factor));
-    result.interval_permutations.reserve(static_cast<size_t>(interval_permutation.size() + interval_permutation.size()/length_capping_factor));
-    result.max_length = 0;
 
+    split_by_max_allowed_length(lengths, tau_inv, domain, max_allowed_length, result);
+}
+
+template<class IntVectorType>
+inline void split_by_max_allowed_length(
+    const IntVectorType& lengths, 
+    const IntVectorType& tau_inv,
+    const ulint domain,
+    const ulint max_allowed_length, 
+    SplitResult<IntVectorType>& result
+) {
+    assert(lengths.size() == tau_inv.size());
+    assert(max_allowed_length > 0);
+
+    // First pass to determine the number of intervals after splitting and the max length
+    size_t num_intervals_after_splitting = 0;
+    // Map from original interval index to new interval index
+    IntVectorType old_to_new_interval_idx(lengths.size(), bit_width(domain - 1));
+    result.max_length = 0;
     for (size_t i = 0; i < lengths.size(); ++i) {
+        old_to_new_interval_idx.set(i, num_intervals_after_splitting);
         if (lengths[i] > max_allowed_length) {
             ulint remaining = lengths[i];
-            size_t sum_to_curr_chunk = 0;
             while (remaining > 0) {
                 ulint chunk = std::min(remaining, max_allowed_length);
-                result.lengths.push_back(chunk);
-                result.interval_permutations.push_back(interval_permutation[i] + sum_to_curr_chunk);
                 remaining -= chunk;
-                sum_to_curr_chunk += chunk;
+                ++num_intervals_after_splitting;
             }
             result.max_length = max_allowed_length;
         } else {
-            result.lengths.push_back(lengths[i]);
-            result.interval_permutations.push_back(interval_permutation[i]);
             result.max_length = std::max(result.max_length, lengths[i]);
+            ++num_intervals_after_splitting;
         }
     }
-    result.lengths.shrink_to_fit();
-    result.interval_permutations.shrink_to_fit();
+
+    result.lengths = IntVectorType(num_intervals_after_splitting, bit_width(result.max_length));
+    result.tau_inv = IntVectorType(num_intervals_after_splitting, bit_width(num_intervals_after_splitting - 1));
+
+    // Second pass to fill the lengths and tau_inv arrays
+    size_t curr_interval_idx = 0;
+    for (size_t i = 0; i < lengths.size(); ++i) {
+        if (lengths[i] > max_allowed_length) {
+            ulint remaining = lengths[i];
+            size_t relative_interval_idx = 0;
+            while (remaining > 0) {
+                ulint chunk = std::min(remaining, max_allowed_length);
+                result.lengths[curr_interval_idx] = chunk;
+                result.tau_inv[curr_interval_idx] = old_to_new_interval_idx[tau_inv[i]] + relative_interval_idx;
+                ++curr_interval_idx;
+                ++relative_interval_idx;
+                remaining -= chunk;
+            }
+        } else {
+            result.lengths[curr_interval_idx] = lengths[i];
+            result.tau_inv[curr_interval_idx] = old_to_new_interval_idx[tau_inv[i]];
+            ++curr_interval_idx;
+        }
+    }
 }
 
-inline void split_by_balancing(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const ulint balancing_factor, SplitResult& result) {
-    assert(lengths.size() == interval_permutation.size());
+template<class IntVectorType>
+inline void split_by_balancing(const IntVectorType& lengths, const IntVectorType& tau_inv, const ulint domain, const ulint balancing_factor, SplitResult<IntVectorType>& result) {
+    assert(lengths.size() == tau_inv.size());
     // TODO
     result.lengths = lengths;
-    result.interval_permutations = interval_permutation;
+    result.tau_inv = tau_inv;
     // result.max_length = 0;
 }
 
