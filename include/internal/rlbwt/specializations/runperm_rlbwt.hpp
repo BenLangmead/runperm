@@ -42,17 +42,17 @@ public:
 
     RunPermRLBWT(const std::vector<uchar> &rlbwt_heads, const std::vector<ulint> &rlbwt_run_lengths, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
-        Base::orig_intervals = rlbwt_heads.size();
+        size_t runs = rlbwt_heads.size();
 
         alphabet = AlphabetType();
-        ulint num_chars;
+        ulint bwt_length;
         PackedVector<BaseColumns> base_structure;
-        find_permutation_and_alphabet(rlbwt_heads, rlbwt_run_lengths, alphabet, num_chars, base_structure, split_params);
+        find_permutation_and_alphabet(rlbwt_heads, rlbwt_run_lengths, alphabet, bwt_length, base_structure, split_params);
 
         /* extend_run_data is required when find_structure applies splitting:
            base_structure may have more rows than run_data; we copy run_data[orig_interval] for each split row */
-        std::vector<RunData> final_run_data = Base::extend_run_data(rlbwt_run_lengths, num_chars, base_structure, get_run_cols_data);
-        Base::populate_structure(std::move(base_structure), final_run_data, num_chars);
+        std::vector<RunData> final_run_data = Base::extend_run_data(rlbwt_run_lengths, base_structure, bwt_length, get_run_cols_data);
+        Base::populate_structure(std::move(base_structure), final_run_data, bwt_length, runs);
     }
 
     RunPermRLBWT(PackedVector<Columns> &&structure, const ulint domain) : Base::move_structure(std::move(structure), domain), Base::position(Position()), Base::orig_intervals(structure.size()) {
@@ -107,12 +107,12 @@ protected:
         const std::vector<uchar>& rlbwt_heads,
         const std::vector<ulint>& rlbwt_run_lengths,
         AlphabetType& alphabet,
-        ulint& num_chars,
+        ulint& bwt_length,
         PackedVector<BaseColumns>& base_structure,
         const SplitParams& split_params
     ) {
         return static_cast<Derived*>(this)->find_permutation_and_alphabet(
-            rlbwt_heads, rlbwt_run_lengths, alphabet, num_chars, base_structure, split_params);
+            rlbwt_heads, rlbwt_run_lengths, alphabet, bwt_length, base_structure, split_params);
     }
 };
 
@@ -156,8 +156,8 @@ public:
     Position down(Position pos) { return run_perm_rlbwt.down(pos); }
     
     ulint domain() const { return run_perm_rlbwt.domain(); }
-    ulint move_runs() const { return run_perm_rlbwt.move_runs(); }
-    ulint permutation_runs() const { return run_perm_rlbwt.permutation_runs(); }
+    ulint runs() const { return run_perm_rlbwt.runs(); }
+    ulint intervals() const { return run_perm_rlbwt.intervals(); }
     
     // RLBWT-specific method
     uchar get_character(ulint interval) { return run_perm_rlbwt.get_character(interval); }

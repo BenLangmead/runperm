@@ -71,37 +71,6 @@ using ColumnsTuple = std::array<T, num_columns<E>()>;
     static constexpr size_t NumCols = ColsTraits::NUM_COLS; \
     template<typename E> static constexpr Columns to_cols(E e) { return static_cast<Columns>(e); }
 
-/* PERMUTATION UTILITIES */
-inline std::vector<ulint> get_inverse_permutation(const std::vector<ulint>& permutation) {
-    std::vector<ulint> inverse_permutation(permutation.size());
-    for (size_t i = 0; i < permutation.size(); ++i) {
-        inverse_permutation[permutation[i]] = i;
-    }
-    return inverse_permutation;
-}
-
-inline std::pair<std::vector<ulint>, std::vector<ulint>> get_permutation_intervals(const std::vector<ulint> &permutation, ulint* max_length_ret = nullptr) {
-    std::vector<ulint> lengths;
-    std::vector<ulint> interval_permutation;
-    ulint max_length = 0;
-    for (size_t i = 0; i < permutation.size(); ++i) {
-        if (i == 0 || permutation[i] != permutation[i - 1] + 1) {
-            if (!lengths.empty()) {
-                max_length = std::max(max_length, lengths.back());
-            }
-            lengths.push_back(1);
-            interval_permutation.push_back(permutation[i]);
-        } else {
-            ++lengths.back();
-        }
-    }
-    max_length = std::max(max_length, lengths.back());
-    if (max_length_ret) {
-        *max_length_ret = max_length;
-    }
-    return {lengths, interval_permutation};
-}
-
 inline std::pair<std::vector<uchar>, std::vector<ulint>> bwt_to_rlbwt(const std::vector<uchar> &bwt_chars) {
     std::vector<uchar> rlbwt_chars;
     std::vector<ulint> rlbwt_run_lengths;

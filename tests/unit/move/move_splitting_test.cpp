@@ -112,7 +112,7 @@ void test_split_by_length_capping_mixed_lengths() {
 void test_split_by_balancing_dummy() {
     const vector<ulint> lengths_vec = {3, 5, 2};
     const vector<ulint> perm_vec    = {0, 3, 8};
-    const vector<ulint> tau_inv_vec = permutation_helpers::get_tau_inv(perm_vec);
+    const vector<ulint> tau_inv_vec = {2, 1, 0};
     const ulint domain = 10;
     const ulint factor = 4;
 

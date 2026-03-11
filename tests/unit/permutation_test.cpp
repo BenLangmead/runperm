@@ -19,13 +19,57 @@ using TestPermutation = PermutationImpl<TestIntVector>;
 
 // Basic helper to check that tau_inv is a permutation of [0, n).
 static void assert_tau_inv_is_permutation(TestPermutation &perm) {
-    const size_t n = perm.get_split_runs();
-    vector<bool> seen(n, false);
-    for (size_t i = 0; i < n; ++i) {
+    const size_t r = perm.runs();
+    vector<bool> seen(r, false);
+    for (size_t i = 0; i < r; ++i) {
         ulint v = perm.get_tau_inv(i);
-        assert(v < n);
+        assert(v < r);
         assert(!seen[v]);
         seen[v] = true;
+    }
+}
+
+void test_inverse_permutation() {
+    {
+        const vector<ulint> perm = {0, 1, 2, 3, 4};
+        const vector<ulint> expected_inv_perm = {0, 1, 2, 3, 4};
+        assert(get_inverse_permutation(perm) == expected_inv_perm);
+    }
+}
+
+void test_permutation_intervals_trivial_and_runs() {
+    {
+        // Empty permutation -> empty intervals.
+        vector<ulint> perm;
+        auto [lengths, intervals] = get_permutation_intervals(perm);
+        assert(lengths.empty());
+        assert(intervals.empty());
+    }
+    {
+        // Single element permutation.
+        vector<ulint> perm = {5};
+        auto [lengths, intervals] = get_permutation_intervals(perm);
+        assert(lengths.size() == 1);
+        assert(intervals.size() == 1);
+        assert(lengths[0] == 1);
+        assert(intervals[0] == 5);
+    }
+    {
+        // Increasing consecutive block followed by a jump.
+        // permutation: [3,4,5, 10,11]
+        vector<ulint> perm = {3, 4, 5, 10, 11};
+        auto [lengths, intervals] = get_permutation_intervals(perm);
+
+        assert(lengths.size() == 2);
+        assert(intervals.size() == 2);
+
+        // First interval [3,4,5] of length 3 starting at 3.
+        assert(lengths[0] == 3);
+        assert(intervals[0] == 3);
+
+        // Second interval [10,11] of length 2 starting at 10.
+        assert(lengths[1] == 2);
+        assert(intervals[1] == 10);
     }
 }
 
@@ -34,7 +78,7 @@ static void test_permutation_helpers() {
     {
         const vector<ulint> starts = {0, 3, 8};
         const ulint domain = 10;
-        auto [lengths, max_len] = permutation_helpers::starts_to_lengths(starts, domain);
+        auto [lengths, max_len] = starts_to_lengths(starts, domain);
         const vector<ulint> expected_lengths = {3, 5, 2};
         assert(lengths == expected_lengths);
         assert(max_len == 5);
@@ -43,7 +87,7 @@ static void test_permutation_helpers() {
     // sum_and_max
     {
         const vector<ulint> data = {1, 5, 3};
-        auto [sum, max_val] = permutation_helpers::sum_and_max(data);
+        auto [sum, max_val] = sum_and_max(data);
         assert(sum == 9);
         assert(max_val == 5);
     }
@@ -51,10 +95,12 @@ static void test_permutation_helpers() {
     // get_tau_inv
     {
         const vector<ulint> interval_starts = {5, 1, 10};
-        auto tau_inv = permutation_helpers::get_tau_inv(interval_starts);
+        auto tau_inv = compute_tau_inv(interval_starts);
         // Sorted by interval_starts: indices [1, 0, 2].
         const vector<ulint> expected_tau_inv = {1, 0, 2};
-        assert(tau_inv == expected_tau_inv);
+        for (size_t i = 0; i < tau_inv.size(); ++i) {
+            assert(tau_inv[i] == expected_tau_inv[i]);
+        }
     }
 
     // get_permutation_intervals (from common.hpp)
@@ -82,7 +128,11 @@ static void test_all_construction_paths_no_splitting() {
     assert(std::find(interval_perm.begin(), interval_perm.end(), 0) != interval_perm.end());
 
     // tau_inv as defined by the library (ranks intervals by their output start).
-    const vector<ulint> tau_inv = permutation_helpers::get_tau_inv(interval_perm);
+    auto tau_inv_packed_vector = compute_tau_inv(interval_perm);
+    std::vector<ulint> tau_inv(tau_inv_packed_vector.size());
+    for (size_t i = 0; i < tau_inv_packed_vector.size(); ++i) {
+        tau_inv[i] = tau_inv_packed_vector.get(i);
+    }
 
     // tau is the inverse of tau_inv: tau[rank] = original_interval_index.
     vector<ulint> tau = get_inverse_permutation(tau_inv);
@@ -102,10 +152,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_lengths_and_tau_inv(
             lengths, tau_inv, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p1.get_length(i) == lengths[i]);
             assert(p1.get_tau_inv(i) == tau_inv[i]);
@@ -115,10 +165,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p2 = TestPermutation::from_lengths_and_tau_inv(
             lengths, tau_inv, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p2.get_length(i) == lengths[i]);
             assert(p2.get_tau_inv(i) == tau_inv[i]);
@@ -138,10 +188,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_lengths_and_tau(
             lengths, tau, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p1.get_length(i) == lengths[i]);
             assert(p1.get_tau_inv(i) == expected_tau_inv[i]);
@@ -151,10 +201,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p2 = TestPermutation::from_lengths_and_tau(
             lengths, tau, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p2.get_length(i) == lengths[i]);
             assert(p2.get_tau_inv(i) == expected_tau_inv[i]);
@@ -167,19 +217,19 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_lengths_and_interval_permutation(
             lengths, interval_perm, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         assert_tau_inv_is_permutation(p1);
 
         TestPermutation p2 = TestPermutation::from_lengths_and_interval_permutation(
             lengths, interval_perm, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         assert_tau_inv_is_permutation(p2);
     }
 
@@ -188,10 +238,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_starts_and_tau_inv(
             starts, tau_inv, domain, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p1.get_length(i) == lengths[i]);
             assert(p1.get_tau_inv(i) == tau_inv[i]);
@@ -201,10 +251,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p2 = TestPermutation::from_starts_and_tau_inv(
             starts, tau_inv, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p2.get_length(i) == lengths[i]);
             assert(p2.get_tau_inv(i) == tau_inv[i]);
@@ -223,10 +273,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_starts_and_tau(
             starts, tau, domain, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p1.get_length(i) == lengths[i]);
             assert(p1.get_tau_inv(i) == expected_tau_inv[i]);
@@ -236,10 +286,10 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p2 = TestPermutation::from_starts_and_tau(
             starts, tau, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         for (size_t i = 0; i < lengths.size(); ++i) {
             assert(p2.get_length(i) == lengths[i]);
             assert(p2.get_tau_inv(i) == expected_tau_inv[i]);
@@ -252,19 +302,19 @@ static void test_all_construction_paths_no_splitting() {
         TestPermutation p1 = TestPermutation::from_starts_and_interval_permutation(
             starts, interval_perm, domain, NO_SPLITTING
         );
-        assert(p1.get_domain() == domain);
-        assert(p1.get_original_runs() == lengths.size());
-        assert(p1.get_split_runs() == lengths.size());
-        assert(p1.get_max_length() == max_length);
+        assert(p1.domain() == domain);
+        assert(p1.runs() == lengths.size());
+        assert(p1.intervals() == lengths.size());
+        assert(p1.max_length() == max_length);
         assert_tau_inv_is_permutation(p1);
 
         TestPermutation p2 = TestPermutation::from_starts_and_interval_permutation(
             starts, interval_perm, domain, max_length, NO_SPLITTING
         );
-        assert(p2.get_domain() == domain);
-        assert(p2.get_original_runs() == lengths.size());
-        assert(p2.get_split_runs() == lengths.size());
-        assert(p2.get_max_length() == max_length);
+        assert(p2.domain() == domain);
+        assert(p2.runs() == lengths.size());
+        assert(p2.intervals() == lengths.size());
+        assert(p2.max_length() == max_length);
         assert_tau_inv_is_permutation(p2);
     }
 }
@@ -278,13 +328,13 @@ static void test_from_permutation_and_split_run_data() {
         perm_vec, NO_SPLITTING
     );
 
-    assert(perm_no_split.get_domain() == domain);
-    assert(perm_no_split.get_original_runs() == 3);
-    assert(perm_no_split.get_split_runs() == 3);
+    assert(perm_no_split.domain() == domain);
+    assert(perm_no_split.runs() == 3);
+    assert(perm_no_split.intervals() == 3);
 
     const vector<ulint> expected_lengths = {3, 4, 1};
     const vector<ulint> expected_tau_inv = {0, 1, 2};
-    assert(perm_no_split.get_max_length() == 4);
+    assert(perm_no_split.max_length() == 4);
     for (size_t i = 0; i < expected_lengths.size(); ++i) {
         assert(perm_no_split.get_length(i) == expected_lengths[i]);
         assert(perm_no_split.get_tau_inv(i) == expected_tau_inv[i]);
@@ -301,9 +351,9 @@ static void test_from_permutation_and_split_run_data() {
         original_lengths, tau_inv, domain2, max_length2, DEFAULT_SPLITTING
     );
 
-    assert(perm_split.get_domain() == domain2);
-    assert(perm_split.get_original_runs() == original_lengths.size());
-    assert(perm_split.get_split_runs() >= perm_split.get_original_runs());
+    assert(perm_split.domain() == domain2);
+    assert(perm_split.runs() == original_lengths.size());
+    assert(perm_split.intervals() >= perm_split.runs());
     assert_tau_inv_is_permutation(perm_split);
 
     // Run data: just store the original run index.
@@ -313,7 +363,7 @@ static void test_from_permutation_and_split_run_data() {
     }
 
     auto new_run_data = perm_split.split_run_data_with_copy(original_lengths, run_data);
-    assert(new_run_data.size() == perm_split.get_split_runs());
+    assert(new_run_data.size() == perm_split.intervals());
 
     // Each split interval derived from original run i should carry run_data[i].
     size_t new_idx = 0;
@@ -326,10 +376,12 @@ static void test_from_permutation_and_split_run_data() {
             ++new_idx;
         }
     }
-    assert(new_idx == perm_split.get_split_runs());
+    assert(new_idx == perm_split.intervals());
 }
 
 int main() {
+    test_inverse_permutation();
+    test_permutation_intervals_trivial_and_runs();
     test_permutation_helpers();
     test_all_construction_paths_no_splitting();
     test_from_permutation_and_split_run_data();

@@ -2,6 +2,7 @@
 #define _INTERNAL_RUNPERM_HPP
 
 #include "internal/common.hpp"
+#include "internal/permutation.hpp"
 #include "internal/move/move_structure.hpp"
 #include "internal/runperm/run_columns.hpp"
 
@@ -54,6 +55,7 @@ public:
     using RunData = ColumnsTuple<RunCols>;
     using Position = typename MoveStructurePerm::Position;
 
+    // TODO use IntVector and container templates here
 
     static_assert(has_count_enumerator<RunCols>::value, "RunColsType must have a COUNT enumerator");
     static_assert(!(!StoreAbsolutePositions && ExponentialSearch), "Exponential search is only supported with absolute positions");
@@ -76,12 +78,12 @@ public:
      * domain -> domain of the permutation, i.e. a permutatation over 1..n has domain n
      * run_data -> run data for each interval, the size of this vector should be the same as the number of intervals
      */
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const std::vector<RunData> &run_data)
-        : RunPermImpl(lengths, interval_permutation, domain, SplitParams(), run_data) {}
+    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const std::vector<RunData> &run_data)
+        : RunPermImpl(lengths, interval_permutation, SplitParams(), run_data) {}
 
     // When Splitting, by default just copy the run data for the original interval if the move structure intervals have been split
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const SplitParams &split_params, const std::vector<RunData> &run_data)
-        : RunPermImpl(lengths, interval_permutation, domain, split_params,
+    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data)
+        : RunPermImpl(lengths, interval_permutation, split_params,
             [&run_data](ulint orig_interval, ulint orig_interval_length, ulint new_offset_from_orig_start, ulint new_length) {
                 return run_data[orig_interval];
             }
@@ -96,32 +98,34 @@ public:
      * - the new interval length
      * and returns the values to be stored in the new interval (run data) for that new row
      */
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(lengths.size() == interval_permutation.size());
-        orig_intervals = lengths.size();
         
         // Find the base structure (move structure without run data)
-        PackedVector<BaseColumns> base_structure = MoveStructureBase::find_structure(lengths, interval_permutation, domain, split_params);
-        std::vector<RunData> final_run_data = extend_run_data(lengths, domain, base_structure, get_run_cols_data);
-        populate_structure(std::move(base_structure), final_run_data, domain);
+        auto permutation = Permutation::from_lengths_and_interval_permutation(lengths, interval_permutation, split_params);
+        size_t domain = permutation.domain();
+        size_t runs = permutation.runs();
+        PackedVector<BaseColumns> base_structure = MoveStructureBase::find_structure(permutation);
+        std::vector<RunData> final_run_data = extend_run_data(lengths, base_structure, domain, get_run_cols_data);
+        populate_structure(std::move(base_structure), final_run_data, domain, runs);
     }
 
     // Constructor from pre-computed table (move semantics) for advanced users with integrated move structure
-    RunPermImpl(PackedVector<Columns> &&structure, const ulint domain) : move_structure(MoveStructurePerm(std::move(structure), domain)), orig_intervals(structure.size()) {
+    RunPermImpl(PackedVector<Columns> &&structure, const size_t domain, const size_t runs) : move_structure(MoveStructurePerm(std::move(structure), domain, runs)) {
         static_assert(IntegratedMoveStructure, "Cannot construct RunPerm with pre-computed permutation structure if not integrating user data with move structure");
     }
 
     // Constructor from pre-computed table (move semantics) for advanced users without integrated move structure
-    RunPermImpl(PackedVector<BaseColumns> &&structure, std::vector<RunData> &run_data, const ulint domain) : move_structure(MoveStructurePerm(std::move(structure), domain)), orig_intervals(structure.size()) {
+    RunPermImpl(PackedVector<BaseColumns> &&structure, std::vector<RunData> &run_data, const size_t domain, const size_t runs) : move_structure(MoveStructurePerm(std::move(structure), domain, runs)) {
         static_assert(!IntegratedMoveStructure, "Cannot construct RunPerm with pre-computed permutation structure if integrating user data with move structure");
-        populate_run_data(std::move(structure), run_data, domain);
+        populate_run_data(std::move(structure), run_data);
     }
 
-    RunPermImpl(MoveStructurePerm &&ms, const ulint domain) : move_structure(std::move(ms)), orig_intervals(move_structure.size()) {
+    RunPermImpl(MoveStructurePerm &&ms) : move_structure(std::move(ms)) {
         static_assert(IntegratedMoveStructure, "Cannot construct RunPerm with pre-computed move structure if not integrating user data with move structure");
     }
 
-    RunPermImpl(MoveStructurePerm &&ms, std::vector<RunData> &run_data, const ulint domain) : move_structure(std::move(ms)), orig_intervals(move_structure.size()) {
+    RunPermImpl(MoveStructurePerm &&ms, std::vector<RunData> &run_data) : move_structure(std::move(ms)) {
         static_assert(!IntegratedMoveStructure, "Cannot construct RunPerm with pre-computed move structure if integrating user data with move structure");
         auto run_cols_widths = get_run_cols_widths(run_data);
         fill_separated_data(run_data, run_cols_widths);
@@ -231,9 +235,9 @@ public:
     Position first() { return move_structure.first(); }
     Position last() { return move_structure.last(); }
 
-    ulint domain() const { return move_structure.size(); }
-    ulint move_runs() const { return move_structure.runs(); }
-    ulint permutation_runs() const { return orig_intervals; }
+    ulint domain() const { return move_structure.domain(); }
+    ulint runs() const { return move_structure.runs(); }
+    ulint intervals() const { return move_structure.intervals(); }
 
     const std::array<uchar, NumCols>& get_widths() const {
         return move_structure.get_widths();
@@ -278,9 +282,6 @@ public:
     size_t serialize(std::ostream& os) {
         size_t written_bytes = 0;
 
-        os.write((char *)&orig_intervals, sizeof(orig_intervals));
-        written_bytes += sizeof(orig_intervals);
-
         written_bytes += move_structure.serialize(os);
         if constexpr (!IntegratedMoveStructure) {
             written_bytes += this->run_cols_data.serialize(os);
@@ -289,8 +290,6 @@ public:
     }
 
     void load(std::istream& is) {
-        is.read((char *)&orig_intervals, sizeof(orig_intervals));
-
         move_structure.load(is);
         if constexpr (!IntegratedMoveStructure) {
             this->run_cols_data.load(is);
@@ -299,7 +298,6 @@ public:
 
 protected:
     MoveStructurePerm move_structure;
-    size_t orig_intervals; // before splitting, underlying move structure may be larger
 
     template<BaseColumns Col>
     ulint get_base_column(size_t row) const {
@@ -310,7 +308,7 @@ protected:
         return get_base_column<Col>(position.interval);
     }
     
-    std::vector<RunData> extend_run_data(const std::vector<ulint>& lengths, const ulint domain, const PackedVector<BaseColumns>& structure, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    std::vector<RunData> extend_run_data(const std::vector<ulint>& lengths, const PackedVector<BaseColumns>& structure, const size_t domain, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         std::vector<RunData> final_run_data(structure.size());
         auto get_structure_length = [&](size_t row) {
             if constexpr (StoreAbsolutePositions) {
@@ -387,7 +385,7 @@ protected:
     }
 
     // Sets move structure and run data from the base structure and run data
-    void populate_structure(PackedVector<BaseColumns>&& base_structure, const std::vector<RunData>& run_data, const ulint domain) {
+    void populate_structure(PackedVector<BaseColumns>&& base_structure, const std::vector<RunData>& run_data, const size_t domain, const size_t runs) {
         auto run_cols_widths = get_run_cols_widths(run_data);
         if constexpr (IntegratedMoveStructure) {
             auto base_widths = base_structure.get_widths();
@@ -400,9 +398,9 @@ protected:
                 auto row = get_row(base_row, run_row);
                 final_structure.set_row(i, row);
             }
-            move_structure = MoveStructurePerm(std::move(final_structure), domain);
+            move_structure = MoveStructurePerm(std::move(final_structure), domain, runs);
         } else {
-            move_structure = MoveStructurePerm(std::move(base_structure), domain);
+            move_structure = MoveStructurePerm(std::move(base_structure), domain, runs);
             fill_separated_data(run_data, run_cols_widths);
         }
     }
@@ -421,16 +419,16 @@ public:
     MovePermImpl() = default;
     
     // Constructor from permutation vector
-    MovePermImpl(std::vector<ulint>& permutation, SplitParams split_params = SplitParams()) {
+    MovePermImpl(std::vector<ulint>& permutation, const SplitParams& split_params = SplitParams()) {
         auto [lengths, interval_permutation] = get_permutation_intervals(permutation);
         std::vector<std::array<ulint, 0>> empty_run_data(lengths.size());
-        run_perm = RunPermType(lengths, interval_permutation, permutation.size(), split_params, empty_run_data);
+        run_perm = RunPermType(lengths, interval_permutation, split_params, empty_run_data);
     }
     
     // Constructor from lengths and interval permutation
-    MovePermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, SplitParams split_params = SplitParams()) {
+    MovePermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams& split_params = SplitParams()) {
         std::vector<std::array<ulint, 0>> empty_run_data(lengths.size());
-        run_perm = RunPermType(lengths, interval_permutation, domain, split_params, empty_run_data);
+        run_perm = RunPermType(lengths, interval_permutation, split_params, empty_run_data);
     }
     
     // Delegate all RunPerm methods
@@ -444,8 +442,8 @@ public:
     ulint get_length(Position position) const { return run_perm.get_length(position); }
     
     ulint domain() const { return run_perm.domain(); }
-    ulint move_runs() const { return run_perm.move_runs(); }
-    ulint permutation_runs() const { return run_perm.permutation_runs(); }
+    ulint runs() const { return run_perm.runs(); }
+    ulint intervals() const { return run_perm.intervals(); }
     
     size_t serialize(std::ostream& out) { return run_perm.serialize(out); }
     void load(std::istream& in) { run_perm.load(in); }

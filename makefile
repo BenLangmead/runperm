@@ -106,7 +106,7 @@ $(UNIT_BUILD_DIR)/columns_test: ./tests/unit/columns_test.cpp $(HEADERS)
 	mkdir -p $(UNIT_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-$(UNIT_BUILD_DIR)/permutation_test: ./tests/unit/runperm/permutation_test.cpp $(HEADERS)
+$(UNIT_BUILD_DIR)/permutation_test: ./tests/unit/permutation_test.cpp $(HEADERS)
 	mkdir -p $(UNIT_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 

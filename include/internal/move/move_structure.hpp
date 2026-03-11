@@ -15,7 +15,6 @@
 #include "internal/permutation.hpp"
 #include "internal/move/move_table.hpp"
 #include "internal/move/move_splitting.hpp"
-#include "internal/ds/packed_vector.hpp"
 
 template <typename ColumnsType = MoveCols, template<typename> class TableType = MoveVector>
 class MoveStructure
@@ -29,41 +28,23 @@ public:
     MoveStructure() = default;
     
     // Constructor from permutation data
-    MoveStructure(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const SplitParams& split_params = SplitParams()) 
-        : table(find_structure(lengths, interval_permutation, domain, split_params)), n(domain), r(table.size()) {}
+    MoveStructure(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams& split_params = SplitParams())
+    : MoveStructure(Permutation::from_lengths_and_interval_permutation(lengths, interval_permutation, split_params)) {}
 
-    // Constructor from pre-computed table (move semantics) for advanced users
-    MoveStructure(PackedVector<Columns> &&structure, const ulint domain) 
-        : table(std::move(structure)), n(domain), r(table.size()) {}
-
-    static PackedVector<Columns> find_structure(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const ulint domain, const SplitParams& split_params = SplitParams()) {
-        assert(lengths.size() == interval_permutation.size());
-
-        PermutationImpl<IntVectorType> permutation(lengths, interval_permutation, domain);
-
-        // Determined the final lengths and interval permutations, which change if we use splitting
-        const std::vector<ulint>* final_lengths = &lengths;
-        const std::vector<ulint>* final_interval_permutation = &interval_permutation;
-        ulint max_length = 0;
-        
-        // Split the lengths and interval permutations if needed, using length/balancing splitting
-        SplitResult split_result;
-        apply_splitting(final_lengths, final_interval_permutation, domain,max_length, split_params, split_result);
-        
-        // Initialize the structure with the final lengths and interval permutations
-        PackedVector<Columns> structure(final_lengths->size(), get_move_widths(domain, final_lengths->size(), max_length));
-        
-        // Sort the interval idx by their interval permutation, used to find pointers/offsets
-        auto sorted_indices = compute_sorted_indices(*final_interval_permutation);
-        
-        // Fill the structure with move permutation data
-        populate_structure(structure, *final_lengths, *final_interval_permutation, sorted_indices);
-        return structure;
+    template<typename PermutationType = Permutation>
+    MoveStructure(const PermutationType& permutation, const SplitParams& split_params = SplitParams()) {
+        n = permutation.domain();
+        r = permutation.runs();
+        table = find_structure(permutation);
     }
 
-    template<typename PermutationType>
-    static PackedVector<Columns> find_structure(const PermutationType& permutation, const SplitParams& split_params = SplitParams()) {
-        PackedVector<Columns> structure(permutation.split_runs(), get_move_widths(permutation.domain(), permutation.split_runs(), permutation.max_length()));
+    // Constructor from pre-computed table (move semantics) for advanced users
+    MoveStructure(PackedVector<Columns> &&structure, const size_t domain, const ulint runs) 
+        : table(std::move(structure)), n(domain), r(runs) {}
+
+    template<typename PermutationType = Permutation>
+    static PackedVector<Columns> find_structure(const PermutationType& permutation) {
+        PackedVector<Columns> structure(permutation.intervals(), get_move_widths(permutation.domain(), permutation.intervals(), permutation.max_length()));
         populate_structure(structure, permutation);
         return structure;
     }
@@ -129,11 +110,14 @@ public:
     }
 
     // === Structure Properties ===
-    ulint size() const {
+    ulint domain() const {
         return n;
     }
     ulint runs() const {
         return r;
+    }
+    ulint intervals() const {
+        return table.size();
     }
 
     const std::array<uchar, NumCols>& get_widths() const {
@@ -191,7 +175,8 @@ public:
     void move_stats() const
     {
         std::cout << "Number of contigious permutations: r = " << r << std::endl;
-        std::cout << "Length of permutation: n = " << n << std::endl;
+        std::cout << "Number of move intervals: r' = " << table.size() << std::endl;
+        std::cout << "Domain of permutation: n = " << n << std::endl;
         std::cout << "Rate n/r = " << double(n) / r << std::endl;
     }
 
@@ -225,7 +210,7 @@ protected:
     ulint n;
     ulint r;
     
-    static std::array<uchar, NumCols> get_move_widths(const ulint domain, const ulint runs, const ulint max_length) {
+    static std::array<uchar, NumCols> get_move_widths(const ulint domain, const ulint intervals, const ulint max_length) {
         std::array<uchar, NumCols> widths = {0};
         for (size_t i = 0; i < NumCols; ++i) {
             widths[i] = BYTES_TO_BITS(DEFAULT_BYTES);
@@ -234,32 +219,22 @@ protected:
         if constexpr (ColsTraits::RELATIVE) {
             widths[static_cast<size_t>(ColsTraits::PRIMARY)] = bit_width(max_length);
         } else {
-            widths[static_cast<size_t>(ColsTraits::PRIMARY)] = bit_width(domain);
+            widths[static_cast<size_t>(ColsTraits::PRIMARY)] = bit_width(domain - 1);
         }
 
-        widths[static_cast<size_t>(ColsTraits::POINTER)] = bit_width(runs);
+        widths[static_cast<size_t>(ColsTraits::POINTER)] = bit_width(intervals - 1);
         widths[static_cast<size_t>(ColsTraits::OFFSET)] = bit_width(max_length);
 
         return widths;
     }
-
-    static std::vector<size_t> compute_sorted_indices(const std::vector<ulint>& interval_perm) {
-        std::vector<size_t> indices(interval_perm.size());
-        std::iota(indices.begin(), indices.end(), 0);
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return interval_perm[a] < interval_perm[b]; });
-        return indices;
-    }
     
-    static void populate_structure(
-        PackedVector<Columns>& structure,
-        const std::vector<ulint>& lengths,
-        const std::vector<ulint>& interval_permutation,
-        const std::vector<size_t>& sorted_indices
-    ) {
+    template<typename PermutationType = Permutation>
+    static void populate_structure(PackedVector<Columns>& structure, const PermutationType& permutation) {
         size_t start_val = 0;
-        auto sort_itr = sorted_indices.begin();
-        for (size_t i = 0; i < lengths.size(); ++i) {
-            size_t length = lengths[i];
+        size_t output_start_val = 0;
+        size_t tau_inv_idx = 0;
+        for (size_t i = 0; i < permutation.intervals(); ++i) {
+            size_t length = permutation.get_length(i);
             if constexpr (ColsTraits::RELATIVE) {
                 structure.template set<to_cols(ColsTraits::PRIMARY)>(i, length);
             }
@@ -267,10 +242,12 @@ protected:
                 structure.template set<to_cols(ColsTraits::PRIMARY)>(i, start_val);
             }
 
-            while (sort_itr != sorted_indices.end() && interval_permutation[*sort_itr] < start_val + length) {
-                structure.template set<to_cols(ColsTraits::POINTER)>(*sort_itr, i);
-                structure.template set<to_cols(ColsTraits::OFFSET)>(*sort_itr, interval_permutation[*sort_itr] - start_val);
-                ++sort_itr;
+            while (tau_inv_idx < permutation.intervals() && output_start_val < start_val + length) {
+                ulint tau_inv_val = permutation.get_tau_inv(tau_inv_idx);
+                structure.template set<to_cols(ColsTraits::POINTER)>(tau_inv_val, i);
+                structure.template set<to_cols(ColsTraits::OFFSET)>(tau_inv_val, output_start_val - start_val);
+                output_start_val += permutation.get_length(tau_inv_val);
+                ++tau_inv_idx;
             }
             start_val += length;
         }

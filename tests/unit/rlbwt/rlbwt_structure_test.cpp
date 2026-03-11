@@ -22,7 +22,7 @@ static void test_rlbwt_move_structure_relative_chars_and_widths() {
     using MS = RLBWTMoveStructure<RLBWTCols>;
     MS ms(rlbwt_chars, lengths, interval_perm, domain, sigma, NO_SPLITTING);
 
-    assert(ms.size() == domain);
+    assert(ms.domain() == domain);
     assert(ms.runs() == lengths.size());
 
     auto widths = ms.get_widths();
@@ -55,10 +55,10 @@ static void test_rlbwt_move_structure_relative_splitting_preserves_chars() {
     using MS = RLBWTMoveStructure<RLBWTCols>;
 
     SplitParams split;
-    split.length_capping_factor = 1.0; // force aggressive splitting if beneficial
+    split.length_capping = 1.0; // force aggressive splitting if beneficial
     MS ms(rlbwt_chars, lengths, interval_perm, domain, sigma, split);
 
-    assert(ms.size() == domain);
+    assert(ms.domain() == domain);
     assert(ms.runs() >= lengths.size()); // first run may be split into multiple
 
     // Sum up lengths per character to ensure splitting preserved run heads.
@@ -89,7 +89,7 @@ static void test_rlbwt_move_structure_absolute_chars_and_widths() {
     using MS = RLBWTMoveStructure<RLBWTColsIdx>;
     MS ms(rlbwt_chars, lengths, interval_perm, domain, sigma, NO_SPLITTING);
 
-    assert(ms.size() == domain);
+    assert(ms.domain() == domain);
     assert(ms.runs() == lengths.size());
 
     auto widths = ms.get_widths();

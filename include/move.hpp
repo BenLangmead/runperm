@@ -3,6 +3,7 @@
 #define _MOVE_HPP
 
 #include "internal/common.hpp"
+#include "internal/permutation.hpp"
 #include "internal/move/move_structure.hpp"
 
 // No simplified interface for MoveStructure, see documentation in include/internal/move/move_structure.hpp

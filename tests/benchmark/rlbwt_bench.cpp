@@ -240,7 +240,7 @@ void bench_move_phi(const string &name,
     cout << "  " << name << endl;
 
     auto t0 = high_resolution_clock::now();
-    MovePhi move_phi(lengths, interval_permutation, domain, split_params);
+    MovePhi move_phi(lengths, interval_permutation, split_params);
     auto t1 = high_resolution_clock::now();
 
     using Position = typename MovePhi::Position;
@@ -291,7 +291,7 @@ void bench_move_phi_exp(const string &name,
         ulint SA(Position pos) { return pos.idx; }
     };
 
-    MovePhiExp move_phi(lengths, interval_permutation, domain, split_params);
+    MovePhiExp move_phi(lengths, interval_permutation, split_params);
     auto t1 = high_resolution_clock::now();
 
     using Position = typename MovePhiExp::Position;
@@ -330,7 +330,7 @@ void bench_move_invphi(const string &name,
     cout << "  " << name << endl;
 
     auto t0 = high_resolution_clock::now();
-    MoveInvPhi move_invphi(lengths, interval_permutation, domain, split_params);
+    MoveInvPhi move_invphi(lengths, interval_permutation, split_params);
     auto t1 = high_resolution_clock::now();
 
     using Position = typename MoveInvPhi::Position;
@@ -380,7 +380,7 @@ void bench_move_invphi_exp(const string &name,
         ulint SA(Position pos) { return pos.idx; }
     };
 
-    MoveInvPhiExp move_invphi(lengths, interval_permutation, domain, split_params);
+    MoveInvPhiExp move_invphi(lengths, interval_permutation, split_params);
     auto t1 = high_resolution_clock::now();
 
     using Position = typename MoveInvPhiExp::Position;
@@ -417,8 +417,12 @@ void run_phi_invphi_benchmarks(const vector<uchar> &bwt_heads,
     cout << "Domain (SA size): " << sa_truth.size() << endl;
 
     // Build Phi / InvPhi structures from the RLBWT.
-    auto [phi_lengths, phi_interval_permutations, phi_domain] = rlbwt_to_phi<AlphabetType>(bwt_heads, bwt_run_lengths);
-    auto [invphi_lengths, invphi_interval_permutations, invphi_domain] = rlbwt_to_invphi<AlphabetType>(bwt_heads, bwt_run_lengths);
+    size_t phi_domain;
+    ulint max_length;
+    auto [phi_lengths, phi_interval_permutations] = rlbwt_to_phi<AlphabetType>(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    size_t invphi_domain;
+    ulint max_length_inv;
+    auto [invphi_lengths, invphi_interval_permutations] = rlbwt_to_invphi<AlphabetType>(bwt_heads, bwt_run_lengths, &invphi_domain, &max_length_inv);
 
     assert(phi_domain == sa_truth.size());
     assert(invphi_domain == sa_truth.size());

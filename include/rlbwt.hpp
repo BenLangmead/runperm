@@ -47,6 +47,7 @@
 #define _RLBWT_HPP
 
 #include "internal/common.hpp"
+#include "internal/permutation.hpp"
 #include "internal/rlbwt/runperm_lf.hpp"
 #include "internal/rlbwt/runperm_fl.hpp"
 #include "internal/rlbwt/runperm_phi.hpp"

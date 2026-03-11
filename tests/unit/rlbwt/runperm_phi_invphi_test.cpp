@@ -16,8 +16,12 @@ void test_phi_invphi_structure_on_small_rlbwt() {
     vector<uchar> heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> lens  =       { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    auto [phi_lengths, phi_perm, phi_domain] = rlbwt_to_phi(heads, lens);
-    auto [inv_lengths, inv_perm, inv_domain] = rlbwt_to_invphi(heads, lens);
+    size_t phi_domain;
+    ulint max_length;
+    auto [phi_lengths, phi_perm] = rlbwt_to_phi(heads, lens, &phi_domain, &max_length);
+    size_t inv_domain;
+    ulint max_length_inv;
+    auto [inv_lengths, inv_perm] = rlbwt_to_invphi(heads, lens, &inv_domain, &max_length_inv);
 
     assert(phi_domain == 27);
     assert(inv_domain == 27);
@@ -43,8 +47,12 @@ void test_runperm_phi_invphi_wrapper_equivalence() {
     vector<uchar> bwt_heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    auto [phi_lengths, phi_perm, phi_domain] = rlbwt_to_phi(bwt_heads, bwt_run_lengths);
-    auto [inv_lengths, inv_perm, inv_domain] = rlbwt_to_invphi(bwt_heads, bwt_run_lengths);
+    size_t phi_domain;
+    ulint max_length;
+    auto [phi_lengths, phi_perm] = rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    size_t inv_domain;
+    ulint max_length_inv;
+    auto [inv_lengths, inv_perm] = rlbwt_to_invphi(bwt_heads, bwt_run_lengths, &inv_domain, &max_length_inv);
 
     assert(phi_domain == inv_domain);
 
@@ -62,8 +70,8 @@ void test_runperm_phi_invphi_wrapper_equivalence() {
         run_data_inv[i][0] = static_cast<ulint>(i * 2);
     }
 
-    RunPermPhi<RunCols> rp_phi(phi_lengths, phi_perm, phi_domain, run_data_phi);
-    RunPermInvPhi<RunCols> rp_inv(inv_lengths, inv_perm, inv_domain, run_data_inv);
+    RunPermPhi<RunCols> rp_phi(phi_lengths, phi_perm, run_data_phi);
+    RunPermInvPhi<RunCols> rp_inv(inv_lengths, inv_perm, run_data_inv);
 
     using PosPhi = typename RunPermPhi<RunCols>::Position;
     using PosInv = typename RunPermInvPhi<RunCols>::Position;
