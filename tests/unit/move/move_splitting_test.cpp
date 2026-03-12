@@ -60,18 +60,6 @@ void test_split_by_length_capping_with_splitting() {
     const vector<ulint> expected_perm = {1, 9, 11, 3, 12, 4, 14, 0, 15, 6, 8};
     const vector<ulint> expected_tau_inv = {7, 0, 3, 5, 9, 10, 1, 2, 4, 6, 8};
 
-
-    std::cout << "result.lengths: " << std::endl;
-    for (size_t i = 0; i < result.lengths.size(); ++i) {
-        std::cout << result.lengths[i] << " ";
-    }
-    std::cout << std::endl;
-    std::cout << "result.tau_inv: " << std::endl;
-    for (size_t i = 0; i < result.tau_inv.size(); ++i) {
-        std::cout << result.tau_inv[i] << " ";
-    }
-    std::cout << std::endl;
-    
     assert(result.lengths.size() == expected_lengths.size());
     assert(result.tau_inv.size() == expected_tau_inv.size());
 
