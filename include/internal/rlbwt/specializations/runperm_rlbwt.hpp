@@ -2,6 +2,7 @@
 #define _INTERNAL_RUNPERM_RLBWT_HPP
 
 #include "internal/common.hpp"
+#include "internal/permutation.hpp"
 #include "internal/runperm/runperm.hpp"
 #include "internal/ds/alphabet.hpp"
 #include "internal/rlbwt/specializations/rlbwt_columns.hpp"
@@ -30,9 +31,12 @@ public:
 
     RunPermRLBWT() = default;
 
+    template<typename PermutationType = Permutation>
+    RunPermRLBWT(const PermutationType& permutation, const std::vector<RunData> &run_data) : Base(permutation, run_data) {}
+
     template<class Container1, class Container2>
     RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const std::vector<RunData> &run_data)
-        : RunPermRLBWT(rlbwt_heads, rlbwt_run_lengths, SplitParams(), run_data) {}
+        : RunPermRLBWT(rlbwt_heads, rlbwt_run_lengths, NO_SPLITTING, run_data) {}
 
     template<class Container1, class Container2>
     RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const SplitParams &split_params, const std::vector<RunData> &run_data)
@@ -41,6 +45,25 @@ public:
                 return run_data[orig_interval];
             }
         ){}
+
+    // TODO reduce code duplication with the constructors next
+    template<class Container1, class Container2>
+    RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const SplitParams &split_params, const std::vector<RunData> &run_data, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+        assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
+        size_t runs = rlbwt_heads.size();
+
+        alphabet = AlphabetType();
+        ulint bwt_length;
+        PackedVector<BaseColumns> base_structure;
+        find_permutation_and_alphabet(rlbwt_heads, rlbwt_run_lengths, alphabet, bwt_length, base_structure, split_params);
+
+        if (split_params == NO_SPLITTING) {
+            Base::populate_structure(std::move(base_structure), run_data, bwt_length, runs);
+        } else {
+            std::vector<RunData> final_run_data = Base::extend_run_data(rlbwt_run_lengths, base_structure, bwt_length, get_run_cols_data);
+            Base::populate_structure(std::move(base_structure), final_run_data, bwt_length, runs);
+        }
+    }
 
     template<class Container1, class Container2>
     RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
@@ -58,25 +81,21 @@ public:
         Base::populate_structure(std::move(base_structure), final_run_data, bwt_length, runs);
     }
 
-    RunPermRLBWT(PackedVector<Columns> &&structure, const ulint domain) : Base::move_structure(std::move(structure), domain), Base::position(Position()), Base::orig_intervals(structure.size()) {
-        static_assert(IntegratedMoveStructure, "Cannot construct RunPermRLBWT with pre-computed permutation structure if not integrating user data with move structure");
+    static RunPermRLBWT from_structure(PackedVector<BaseColumns> &&structure, const size_t domain, const size_t runs) {
+        return RunPermRLBWT(std::move(structure), domain, runs);
     }
 
-    RunPermRLBWT(PackedVector<BaseColumns> &&structure, std::vector<RunData> &run_data, const ulint domain) : Base::move_structure(std::move(structure), domain), Base::position(Position()), Base::orig_intervals(structure.size()) {
-        static_assert(!IntegratedMoveStructure, "Cannot construct RunPermRLBWT with pre-computed permutation structure if integrating user data with move structure");
-        populate_run_data(std::move(structure), run_data, domain);
+    static RunPermRLBWT from_structure(PackedVector<BaseColumns> &&structure, std::vector<RunData> &run_data, const size_t domain, const size_t runs) {
+        return RunPermRLBWT(std::move(structure), run_data, domain, runs);
     }
 
-    RunPermRLBWT(MoveStructurePerm &&ms, const ulint domain) : Base::move_structure(std::move(ms)), Base::position(Position()), Base::orig_intervals(Base::move_structure.size()) {
-        static_assert(IntegratedMoveStructure, "Cannot construct RunPermRLBWT with pre-computed move structure if not integrating user data with move structure");
+    static RunPermRLBWT from_move_structure(MoveStructurePerm &&ms) {
+        return RunPermRLBWT(std::move(ms));
     }
 
-    RunPermRLBWT(MoveStructurePerm &&ms, std::vector<RunData> &run_data, const ulint domain) : Base::move_structure(std::move(ms)), Base::position(Position()), Base::orig_intervals(Base::move_structure.size()) {
-        static_assert(!IntegratedMoveStructure, "Cannot construct RunPermRLBWT with pre-computed move structure if integrating user data with move structure");
-        auto run_cols_widths = get_run_cols_widths(run_data);
-        fill_separated_data(run_data, run_cols_widths);
+    static RunPermRLBWT from_move_structure(MoveStructurePerm &&ms, std::vector<RunData> &run_data) {
+        return RunPermRLBWT(std::move(ms), run_data);
     }
-
 
     uchar get_character(ulint interval) {
         return alphabet.unmap_char(Base::template get_base_column<BaseColumns::CHARACTER>(interval));

@@ -238,10 +238,14 @@ public:
     ulint max_length() const {
         return max_length_;
     }
+    SplitParams get_split_params() const {
+        return split_params_;
+    }
 
 private:
     IntVectorType lengths;
     IntVectorType tau_inv;
+    SplitParams split_params_;
     size_t domain_;
     size_t runs_;
     size_t intervals_;
@@ -255,6 +259,8 @@ private:
     
     template<class Container1, class Container2>
     void init_tau(const Container1& lengths, const Container2& tau, const SplitParams& split_params) {
+        this->split_params_ = split_params;
+
         uchar length_bits = bit_width(this->max_length_);
         uchar tau_inv_bits = bit_width(this->runs_ - 1);
 
@@ -266,7 +272,7 @@ private:
         }
 
         ulint new_max_length = 0;
-        apply_splitting(curr_lengths, curr_tau_inv, new_max_length, split_params);
+        apply_splitting(curr_lengths, curr_tau_inv, new_max_length);
 
         this->lengths = std::move(curr_lengths);
         this->tau_inv = std::move(curr_tau_inv);
@@ -276,6 +282,8 @@ private:
 
     template<class Container1, class Container2>
     void init_tau_inv(const Container1& lengths, const Container2& tau_inv, const SplitParams& split_params) {
+        this->split_params_ = split_params;
+        
         uchar length_bits = bit_width(this->max_length_);
         uchar tau_inv_bits = bit_width(this->runs_ - 1);
 
@@ -287,7 +295,7 @@ private:
         }
 
         ulint new_max_length = 0;
-        apply_splitting(curr_lengths, curr_tau_inv, new_max_length, split_params);
+        apply_splitting(curr_lengths, curr_tau_inv, new_max_length);
 
         this->lengths = std::move(curr_lengths);
         this->tau_inv = std::move(curr_tau_inv);
@@ -295,22 +303,22 @@ private:
         this->intervals_ = this->lengths.size();
     }
 
-    void apply_splitting(IntVectorType& curr_lengths, IntVectorType& curr_tau_inv, ulint& new_max_length, const SplitParams& split_params) {
-        if (split_params == NO_SPLITTING) {
+    void apply_splitting(IntVectorType& curr_lengths, IntVectorType& curr_tau_inv, ulint& new_max_length) {
+        if (this->split_params_ == NO_SPLITTING) {
             new_max_length = this->max_length_;
             return;
         }
         
         SplitResult<IntVectorType> split_result;
         
-        if (split_params.length_capping) {
-            split_by_length_capping(curr_lengths, curr_tau_inv, this->domain_, *split_params.length_capping, split_result);
+        if (this->split_params_.length_capping) {
+            split_by_length_capping(curr_lengths, curr_tau_inv, this->domain_, *this->split_params_.length_capping, split_result);
             curr_lengths = std::move(split_result.lengths);
             curr_tau_inv = std::move(split_result.tau_inv);
             new_max_length = split_result.max_length;
         }
-        if (split_params.balancing) {
-            split_by_balancing(curr_lengths, curr_tau_inv, this->domain_, *split_params.balancing, split_result);
+        if (this->split_params_.balancing) {
+            split_by_balancing(curr_lengths, curr_tau_inv, this->domain_, *this->split_params_.balancing, split_result);
             curr_lengths = std::move(split_result.lengths);
             curr_tau_inv = std::move(split_result.tau_inv);
             new_max_length = split_result.max_length;

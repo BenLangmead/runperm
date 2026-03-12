@@ -22,6 +22,46 @@ struct SplitParams {
         return length_capping == other.length_capping && balancing == other.balancing;
     }
     bool operator!=(const SplitParams& other) const { return !(*this == other); }
+
+    size_t serialize(std::ostream& out) const {
+        size_t written_bytes = 0;
+        bool has_length_capping = length_capping.has_value();
+        out.write(reinterpret_cast<const char*>(&has_length_capping), sizeof(has_length_capping));
+        written_bytes += sizeof(has_length_capping);
+        if (length_capping.has_value()) {
+            double length_capping_value = length_capping.value();
+            out.write(reinterpret_cast<const char*>(&length_capping_value), sizeof(length_capping_value));
+            written_bytes += sizeof(length_capping_value);
+        }
+        bool has_balancing = balancing.has_value();
+        out.write(reinterpret_cast<const char*>(&has_balancing), sizeof(has_balancing));
+        written_bytes += sizeof(has_balancing);
+        if (balancing.has_value()) {
+            ulint balancing_value = balancing.value();
+            out.write(reinterpret_cast<const char*>(&balancing_value), sizeof(balancing_value));
+            written_bytes += sizeof(balancing_value);
+        }
+        return written_bytes;
+    }
+
+    void load(std::istream& in) {
+        length_capping = std::nullopt;
+        balancing = std::nullopt;
+        bool has_length_capping;
+        in.read(reinterpret_cast<char*>(&has_length_capping), sizeof(has_length_capping));
+        if (has_length_capping) {
+            double length_capping_value;
+            in.read(reinterpret_cast<char*>(&length_capping_value), sizeof(length_capping_value));
+            length_capping = length_capping_value;
+        }
+        bool has_balancing;
+        in.read(reinterpret_cast<char*>(&has_balancing), sizeof(has_balancing));
+        if (has_balancing) {
+            ulint balancing_value;
+            in.read(reinterpret_cast<char*>(&balancing_value), sizeof(balancing_value));
+            balancing = balancing_value;
+        }
+    }
 };
 
 inline SplitParams NO_SPLITTING = SplitParams(std::nullopt, std::nullopt);

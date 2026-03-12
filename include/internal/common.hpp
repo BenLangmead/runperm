@@ -5,6 +5,35 @@
 #include <vector>
 #include <array>
 #include <cmath>
+#include <fstream>
+#include <tuple>
+
+#define VERSION_MAJOR 0
+#define VERSION_MINOR 2
+#define VERSION_PATCH 1
+#define VERSION_STRING VERSION_MAJOR "." VERSION_MINOR "." VERSION_PATCH
+
+size_t serialize_version(std::ostream& out) {
+    size_t written_bytes = 0;
+    size_t major = VERSION_MAJOR;
+    size_t minor = VERSION_MINOR;
+    size_t patch = VERSION_PATCH;
+    out.write(reinterpret_cast<char *>(&major), sizeof(major));
+    written_bytes += sizeof(major);
+    out.write(reinterpret_cast<char *>(&minor), sizeof(minor));
+    written_bytes += sizeof(minor);
+    out.write(reinterpret_cast<char *>(&patch), sizeof(patch));
+    written_bytes += sizeof(patch);
+    return written_bytes;
+}
+
+std::tuple<size_t, size_t, size_t> load_version(std::istream& is) {
+    size_t major, minor, patch;
+    is.read(reinterpret_cast<char *>(&major), sizeof(major));
+    is.read(reinterpret_cast<char *>(&minor), sizeof(minor));
+    is.read(reinterpret_cast<char *>(&patch), sizeof(patch));
+    return {major, minor, patch};
+}
 
 // LEAVE UNCHANGED
 #define MAX_ALPHABET_SIZE 256

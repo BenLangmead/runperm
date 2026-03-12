@@ -75,6 +75,7 @@ public:
     // Intended constructor for manual splitting of run data
     template<typename PermutationType = Permutation>
     RunPermImpl(const PermutationType& permutation, const std::vector<RunData> &run_data) {
+        split_params_ = permutation.get_split_params();
         PackedVector<BaseColumns> base_structure = MoveStructureBase::find_structure(permutation);
         if (run_data.size() == permutation.intervals()) {
             populate_structure(std::move(base_structure), run_data, permutation.domain(), permutation.runs());
@@ -111,7 +112,8 @@ public:
     template<class Container1, class Container2>
     RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(lengths.size() == interval_permutation.size());
-        
+        split_params_ = split_params;
+
         // Find the base structure (move structure without run data)
         auto permutation = Permutation::from_lengths_and_interval_permutation(lengths, interval_permutation, split_params);
         size_t domain = permutation.domain();
@@ -138,7 +140,8 @@ public:
     template<class Container1, class Container2>
     RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(lengths.size() == interval_permutation.size());
-        
+        split_params_ = split_params;
+
         // Find the base structure (move structure without run data)
         auto permutation = Permutation::from_lengths_and_interval_permutation(lengths, interval_permutation, split_params);
         size_t domain = permutation.domain();
@@ -336,6 +339,9 @@ public:
     size_t serialize(std::ostream& os) {
         size_t written_bytes = 0;
 
+        written_bytes += serialize_version(os);
+        written_bytes += split_params_.serialize(os);
+
         written_bytes += move_structure.serialize(os);
         if constexpr (!IntegratedMoveStructure) {
             written_bytes += this->run_cols_data.serialize(os);
@@ -344,6 +350,11 @@ public:
     }
 
     void load(std::istream& is) {
+        auto [serialized_major, serialized_minor, serialized_patch] = load_version(is);
+        if (serialized_major != VERSION_MAJOR || serialized_minor != VERSION_MINOR || serialized_patch != VERSION_PATCH) {
+            // TODO handle version mismatches
+        }
+        split_params_.load(is);
         move_structure.load(is);
         if constexpr (!IntegratedMoveStructure) {
             this->run_cols_data.load(is);
@@ -352,6 +363,7 @@ public:
 
 protected:
     MoveStructurePerm move_structure;
+    SplitParams split_params_;
 
     template<BaseColumns Col>
     ulint get_base_column(size_t row) const {
