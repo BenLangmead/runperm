@@ -30,17 +30,20 @@ public:
 
     RunPermRLBWT() = default;
 
-    RunPermRLBWT(const std::vector<uchar> &rlbwt_heads, const std::vector<ulint> &rlbwt_run_lengths, const std::vector<RunData> &run_data)
+    template<class Container1, class Container2>
+    RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const std::vector<RunData> &run_data)
         : RunPermRLBWT(rlbwt_heads, rlbwt_run_lengths, SplitParams(), run_data) {}
 
-    RunPermRLBWT(const std::vector<uchar> &rlbwt_heads, const std::vector<ulint> &rlbwt_run_lengths, const SplitParams &split_params, const std::vector<RunData> &run_data)
+    template<class Container1, class Container2>
+    RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const SplitParams &split_params, const std::vector<RunData> &run_data)
         : RunPermRLBWT(rlbwt_heads, rlbwt_run_lengths, split_params,
             [&run_data](ulint orig_interval, ulint orig_interval_length, ulint new_offset_from_orig_start, ulint new_length) {
                 return run_data[orig_interval];
             }
         ){}
 
-    RunPermRLBWT(const std::vector<uchar> &rlbwt_heads, const std::vector<ulint> &rlbwt_run_lengths, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    template<class Container1, class Container2>
+    RunPermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
         size_t runs = rlbwt_heads.size();
 
@@ -139,8 +142,8 @@ public:
     }
     
     // Constructor from RLBWT data
-    MovePermRLBWT(const std::vector<uchar> &rlbwt_heads, 
-                  const std::vector<ulint> &rlbwt_run_lengths, 
+    template<class Container1, class Container2>
+    MovePermRLBWT(const Container1 &rlbwt_heads, const Container2 &rlbwt_run_lengths, 
                   SplitParams split_params = SplitParams()) {
         std::vector<std::array<ulint, 0>> empty_run_data(rlbwt_heads.size());
         run_perm_rlbwt = RunPermRLBWTType(rlbwt_heads, rlbwt_run_lengths, split_params, empty_run_data);

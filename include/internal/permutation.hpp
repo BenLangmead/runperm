@@ -45,15 +45,16 @@ inline std::pair<std::vector<ulint>, std::vector<ulint>> get_permutation_interva
     return {lengths, interval_permutation};
 }
 
-inline std::tuple<std::vector<ulint>, ulint> starts_to_lengths(const std::vector<ulint>& starts, const ulint domain) {
-    std::vector<ulint> lengths(starts.size());
+template<class Container, class IntVectorType = IntVectorAligned>
+inline std::tuple<IntVectorType, ulint> starts_to_lengths(const Container& starts, const ulint domain) {
+    IntVectorType lengths(starts.size(), bit_width(domain - 1));
     ulint max_length = 0;
     for (size_t i = 0; i < lengths.size() - 1; ++i) {
         lengths[i] = starts[i + 1] - starts[i];
-        max_length = std::max(max_length, lengths[i]);
+        max_length = std::max(max_length, static_cast<ulint>(lengths[i]));
     }
     lengths[lengths.size() - 1] = domain - starts[starts.size() - 1];
-    max_length = std::max(max_length, lengths[lengths.size() - 1]);
+    max_length = std::max(max_length, static_cast<ulint>(lengths[lengths.size() - 1]));
     return {lengths, max_length};
 }
 
@@ -63,16 +64,18 @@ inline std::tuple<ulint, ulint> sum_and_max(const Container& data) {
     ulint max = 0;
     for (const auto& element : data) {
         sum += element;
-        max = std::max(max, element);
+        max = std::max(max, static_cast<ulint>(element));
     }
     return {sum, max};
 }
 
-template<class IntVectorType = IntVectorAligned>
-inline IntVectorType compute_tau_inv(const std::vector<ulint>& interval_output_starts) {
+template<class IntVectorType = IntVectorAligned, class Container>
+inline IntVectorType compute_tau_inv(const Container& interval_output_starts) {
     IntVectorType tau_inv(interval_output_starts.size(), bit_width(interval_output_starts.size() - 1));
     std::iota(tau_inv.begin(), tau_inv.end(), 0);
-    std::sort(tau_inv.begin(), tau_inv.end(), [&](ulint a, ulint b) { return interval_output_starts[a] < interval_output_starts[b]; });
+    std::sort(tau_inv.begin(), tau_inv.end(), [&](ulint a, ulint b) { 
+        return static_cast<ulint>(interval_output_starts[a]) < static_cast<ulint>(interval_output_starts[b]); 
+    });
     return tau_inv;
 }
 
@@ -135,61 +138,69 @@ public:
         return permutation;
     }
 
-    static PermutationImpl<IntVectorType> from_lengths_and_interval_permutation(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_lengths_and_interval_permutation(const Container1& lengths, const Container2& interval_permutation, const SplitParams& split_params = SplitParams()) {
         assert(lengths.size() == interval_permutation.size());
 
         auto [domain, max_length] = sum_and_max(lengths);
         return from_lengths_and_interval_permutation(lengths, interval_permutation, domain, max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_lengths_and_interval_permutation(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_lengths_and_interval_permutation(const Container1& lengths, const Container2& interval_permutation, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
         assert(lengths.size() == interval_permutation.size());
 
         IntVectorType tau_inv = compute_tau_inv<IntVectorType>(interval_permutation);
         return from_lengths_and_tau_inv(lengths, tau_inv, domain, max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_tau_inv(const std::vector<ulint>& starts, const std::vector<ulint>& tau_inv, const size_t domain, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_tau_inv(const Container1& starts, const Container2& tau_inv, const size_t domain, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == tau_inv.size());
         auto [lengths, max_length] = starts_to_lengths(starts, domain);
         return from_lengths_and_tau_inv(lengths, tau_inv, domain, max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_tau_inv(const std::vector<ulint>& starts, const std::vector<ulint>& tau_inv, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_tau_inv(const Container1& starts, const Container2& tau_inv, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == tau_inv.size());
         auto [lengths, calculated_max_length] = starts_to_lengths(starts, domain);
         assert(calculated_max_length == max_length);
         return from_lengths_and_tau_inv(lengths, tau_inv, domain, calculated_max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_tau(const std::vector<ulint>& starts, const std::vector<ulint>& tau, const size_t domain, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_tau(const Container1& starts, const Container2& tau, const size_t domain, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == tau.size());
         auto [lengths, max_length] = starts_to_lengths(starts, domain);
         return from_lengths_and_tau(lengths, tau, domain, max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_tau(const std::vector<ulint>& starts, const std::vector<ulint>& tau, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_tau(const Container1& starts, const Container2& tau, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == tau.size());
         auto [lengths, calculated_max_length] = starts_to_lengths(starts, domain);
         assert(calculated_max_length == max_length);
         return from_lengths_and_tau(lengths, tau, domain, calculated_max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_interval_permutation(const std::vector<ulint>& starts, const std::vector<ulint>& interval_permutation, const size_t domain, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_interval_permutation(const Container1& starts, const Container2& interval_permutation, const size_t domain, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == interval_permutation.size());
         auto [lengths, max_length] = starts_to_lengths(starts, domain);
         return from_lengths_and_interval_permutation(lengths, interval_permutation, domain, max_length, split_params);
     }
 
-    static PermutationImpl<IntVectorType> from_starts_and_interval_permutation(const std::vector<ulint>& starts, const std::vector<ulint>& interval_permutation, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    static PermutationImpl<IntVectorType> from_starts_and_interval_permutation(const Container1& starts, const Container2& interval_permutation, const size_t domain, const ulint max_length, const SplitParams& split_params = SplitParams()) {
         assert(starts.size() == interval_permutation.size());
         auto [lengths, calculated_max_length] = starts_to_lengths(starts, domain);
         assert(calculated_max_length == max_length);
         return from_lengths_and_interval_permutation(lengths, interval_permutation, domain, calculated_max_length, split_params);
     }
 
-    template<typename T>
-    std::vector<T> split_run_data_with_copy(const std::vector<ulint>& original_lengths, const std::vector<T>& run_data) {
+    template<typename T, class Container>
+    std::vector<T> split_run_data_with_copy(const Container& original_lengths, const std::vector<T>& run_data) {
         assert(original_lengths.size() == run_data.size());
         assert(original_lengths.size() == this->runs_);
 

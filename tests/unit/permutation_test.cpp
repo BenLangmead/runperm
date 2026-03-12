@@ -80,7 +80,9 @@ static void test_permutation_helpers() {
         const ulint domain = 10;
         auto [lengths, max_len] = starts_to_lengths(starts, domain);
         const vector<ulint> expected_lengths = {3, 5, 2};
-        assert(lengths == expected_lengths);
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            assert(lengths[i] == expected_lengths[i]);
+        }
         assert(max_len == 5);
     }
 

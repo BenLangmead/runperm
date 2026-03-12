@@ -341,7 +341,7 @@ void test_runperm_phi(std::vector<uchar> bwt_heads, std::vector<ulint> bwt_run_l
 
     size_t phi_domain;
     ulint max_length;
-    auto [phi_lengths, phi_interval_permutations] = rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    auto [phi_lengths, phi_interval_permutations] = phi::rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
     RunPermPhi<RunData> runperm_phi(phi_lengths, phi_interval_permutations, run_data);
             
     using Position = typename RunPermPhi<RunData>::Position;
@@ -367,9 +367,9 @@ void test_runperm_phi(std::vector<uchar> bwt_heads, std::vector<ulint> bwt_run_l
 void test_move_phi_with_splitting(std::vector<uchar> bwt_heads, std::vector<ulint> bwt_run_lengths, std::vector<ulint> sa) {
     size_t phi_domain;
     ulint max_length;
-    auto [phi_lengths, phi_interval_permutations] = rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    auto [phi_lengths, phi_interval_permutations] = phi::rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
     MovePhi move_phi(phi_lengths, phi_interval_permutations, DEFAULT_SPLITTING);
-                using Position = typename MovePhi::Position;
+    using Position = typename MovePhi::Position;
     Position pos = move_phi.first();
     for (size_t i = 0; i < move_phi.domain(); ++i) {
         pos = move_phi.next(pos);
@@ -392,7 +392,7 @@ void test_move_phi_with_splitting(std::vector<uchar> bwt_heads, std::vector<ulin
 void test_move_phi(std::vector<uchar> bwt_heads, std::vector<ulint> bwt_run_lengths, std::vector<ulint> sa) {
     size_t phi_domain;
     ulint max_length;
-    auto [phi_lengths, phi_interval_permutations] = rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    auto [phi_lengths, phi_interval_permutations] = phi::rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
     MovePhi move_phi(phi_lengths, phi_interval_permutations);
                 using Position = typename MovePhi::Position;
     Position pos = move_phi.first();

@@ -94,11 +94,13 @@ public:
      * run_data -> run data for each interval, the size of this vector should be the same as the number of intervals
      */
      // When user doesn't pass splitting params without providing permutation object input, use NO_SPLITTING
-     RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const std::vector<RunData> &run_data)
+    template<class Container1, class Container2>
+     RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const std::vector<RunData> &run_data)
      : RunPermImpl(lengths, interval_permutation, NO_SPLITTING, run_data) {}
 
     // If splitting, copy the run data by default
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data)
+    template<class Container1, class Container2>
+    RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data)
         : RunPermImpl(lengths, interval_permutation, split_params, run_data,
             [&run_data](ulint orig_interval, ulint orig_interval_length, ulint new_offset_from_orig_start, ulint new_length) {
                 return run_data[orig_interval];
@@ -107,7 +109,8 @@ public:
 
     // Path for constructor above, see below constructor for more details
     // This exists as a fast path in case no splitting is set and we do not need to call extend_run_data
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    template<class Container1, class Container2>
+    RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const SplitParams &split_params, const std::vector<RunData> &run_data, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(lengths.size() == interval_permutation.size());
         
         // Find the base structure (move structure without run data)
@@ -133,7 +136,8 @@ public:
      * - the new interval length
      * and returns the values to be stored in the new interval (run data) for that new row
      */
-    RunPermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    template<class Container1, class Container2>
+    RunPermImpl(const Container1 &lengths, const Container2 &interval_permutation, const SplitParams &split_params, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         assert(lengths.size() == interval_permutation.size());
         
         // Find the base structure (move structure without run data)
@@ -344,7 +348,8 @@ protected:
         return get_base_column<Col>(position.interval);
     }
     
-    std::vector<RunData> extend_run_data(const std::vector<ulint>& lengths, const PackedVector<BaseColumns>& structure, const size_t domain, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
+    template<class Container>
+    std::vector<RunData> extend_run_data(const Container& lengths, const PackedVector<BaseColumns>& structure, const size_t domain, std::function<RunData(ulint, ulint, ulint, ulint)> get_run_cols_data) {
         std::vector<RunData> final_run_data(structure.size());
         auto get_structure_length = [&](size_t row) {
             if constexpr (StoreAbsolutePositions) {
@@ -468,7 +473,8 @@ public:
     }
     
     // Constructor from lengths and interval permutation
-    MovePermImpl(const std::vector<ulint>& lengths, const std::vector<ulint>& interval_permutation, const SplitParams& split_params = SplitParams()) {
+    template<class Container1, class Container2>
+    MovePermImpl(const Container1& lengths, const Container2& interval_permutation, const SplitParams& split_params = SplitParams()) {
         std::vector<std::array<ulint, 0>> empty_run_data(lengths.size());
         run_perm = RunPermType(lengths, interval_permutation, split_params, empty_run_data);
     }
