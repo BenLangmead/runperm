@@ -140,6 +140,8 @@ static void test_runperm_serialize_roundtrip_separated_absolute() {
     assert(loaded.domain() == rp.domain());
     assert(loaded.intervals() == rp.intervals());
     assert(loaded.runs() == rp.runs());
+    assert(loaded.get_split_params() == NO_SPLITTING);
+    assert(loaded.get_split_params() == rp.get_split_params());
 
     for (ulint i = 0; i < loaded.intervals(); ++i) {
         assert(loaded.get_length(i) == rp.get_length(i));

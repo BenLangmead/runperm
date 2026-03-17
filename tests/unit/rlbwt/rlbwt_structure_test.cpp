@@ -48,7 +48,7 @@ static void test_rlbwt_move_structure_relative_splitting_preserves_chars() {
     // Two runs: a long run (symbol 0) followed by a short run (symbol 1).
     const vector<uchar> rlbwt_chars = {0, 1};
     const vector<ulint> lengths     = {5, 1};
-    const vector<ulint> interval_perm = {0, 1};
+    const vector<ulint> interval_perm = {0, 5};
     const ulint domain = 6;
     const uchar sigma = 4;
 

@@ -333,6 +333,10 @@ public:
     ulint get_length(Position position) const {
         return get_length(position.interval);
     }
+    
+    SplitParams get_split_params() const {
+        return split_params_;
+    }
 
     /*** SERIALIZATION METHODS ***/
     
