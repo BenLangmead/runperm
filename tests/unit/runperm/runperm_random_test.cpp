@@ -6,7 +6,7 @@
 //   configurations (separated vs integrated, absolute) all represent
 //   the same underlying permutation and expose consistent run data.
 
-#include "runperm.hpp"
+#include "orbit/runperm.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -23,13 +23,15 @@ enum class TestRunCols {
     COUNT
 };
 
-using TestRunData = ColumnsTuple<TestRunCols>;
+using namespace orbit;
+
+using TestRunData = columns_tuple<TestRunCols>;
 
 // Helper to build an absolute RunPerm position from a global index.
 template <typename RP>
-static typename RP::Position make_pos_absolute(const RP &rp, ulint idx) {
-    using Position = typename RP::Position;
-    Position pos{};
+static typename RP::position make_pos_absolute(const RP &rp, ulint idx) {
+    using position = typename RP::position;
+    position pos{};
     pos.idx = idx;
     ulint prefix = 0;
     for (ulint interval = 0; interval < rp.intervals(); ++interval) {
@@ -77,8 +79,8 @@ static void test_runperm_random_small_permutations() {
                 run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 100)};
             }
 
-            using RPSeparatedAbs = RunPermSeparatedAbsolute<TestRunCols>;
-            using RPIntegratedAbs = RunPermIntegratedAbsolute<TestRunCols>;
+            using RPSeparatedAbs = runperm_separated_absolute<TestRunCols>;
+            using RPIntegratedAbs = runperm_integrated_absolute<TestRunCols>;
 
             RPSeparatedAbs rp_sep(lengths, interval_perm, run_data);
             RPIntegratedAbs rp_int(lengths, interval_perm, run_data);

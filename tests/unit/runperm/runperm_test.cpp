@@ -1,7 +1,7 @@
 // Unit tests for RunPerm (RunPermImpl via public alias).
 // Simple assert-based tests, no external framework.
 
-#include "runperm.hpp"
+#include "orbit/runperm.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -11,6 +11,8 @@
 using std::size_t;
 using std::vector;
 
+using namespace orbit;
+
 // Simple run-data schema with two fields.
 enum class TestRunCols {
     VAL1,
@@ -18,13 +20,13 @@ enum class TestRunCols {
     COUNT
 };
 
-using TestRunData = ColumnsTuple<TestRunCols>;
+using TestRunData = columns_tuple<TestRunCols>;
 
 // Helper to build an absolute RunPerm position from a global index.
 template <typename RP>
-static typename RP::Position make_pos_absolute(const RP &rp, ulint idx) {
-    using Position = typename RP::Position;
-    Position pos{};
+static typename RP::position make_pos_absolute(const RP &rp, ulint idx) {
+    using position = typename RP::position;
+    position pos{};
     pos.idx = idx;
     ulint prefix = 0;
     for (ulint interval = 0; interval < rp.intervals(); ++interval) {
@@ -51,7 +53,7 @@ static void test_runperm_separated_absolute_basic_mapping_and_run_data() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 100)};
     }
 
-    using RP = RunPermSeparatedAbsolute<TestRunCols>;
+    using RP = runperm_separated_absolute<TestRunCols>;
     RP rp(lengths, interval_perm, run_data);
 
     assert(rp.domain() == domain);
@@ -70,7 +72,7 @@ static void test_runperm_separated_absolute_basic_mapping_and_run_data() {
         assert(row == run_data[i]);
     }
 
-    // Position-level mapping: next() must follow perm, and run data must agree.
+    // position-level mapping: next() must follow perm, and run data must agree.
     for (ulint idx = 0; idx < domain; ++idx) {
         auto pos = make_pos_absolute<RP>(rp, idx);
         auto next_pos = rp.next(pos);
@@ -80,7 +82,7 @@ static void test_runperm_separated_absolute_basic_mapping_and_run_data() {
         ulint interval = next_pos.interval;
         assert(rp.get<TestRunCols::VAL1>(next_pos) == rp.get<TestRunCols::VAL1>(interval));
         assert(rp.get<TestRunCols::VAL2>(next_pos) == rp.get<TestRunCols::VAL2>(interval));
-        // get_row(Position) must equal get_row(interval)
+        // get_row(position) must equal get_row(interval)
         assert(rp.get_row(next_pos) == rp.get_row(interval));
     }
 }
@@ -95,7 +97,7 @@ static void test_runperm_up_down_navigation() {
         run_data[i] = {static_cast<ulint>(i), 0};
     }
 
-    using RP = RunPermSeparatedAbsolute<TestRunCols>;
+    using RP = runperm_separated_absolute<TestRunCols>;
     RP rp(lengths, interval_perm, run_data);
 
     auto pos = rp.first();
@@ -127,7 +129,7 @@ static void test_runperm_serialize_roundtrip_separated_absolute() {
         run_data[i] = {static_cast<ulint>(i * 10), static_cast<ulint>(i * 10 + 1)};
     }
 
-    using RP = RunPermSeparatedAbsolute<TestRunCols>;
+    using RP = runperm_separated_absolute<TestRunCols>;
     RP rp(lengths, interval_perm, run_data);
 
     std::stringstream ss;
@@ -168,7 +170,7 @@ static void test_runperm_next_with_steps_and_pred_succ() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(10 + i)};
     }
 
-    using RP = RunPermSeparatedAbsolute<TestRunCols>;
+    using RP = runperm_separated_absolute<TestRunCols>;
     RP rp(lengths, interval_perm, run_data);
 
     // next with steps: compare to repeated single-step.

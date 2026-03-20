@@ -1,22 +1,21 @@
-#include "orbit/runperm.hpp"
-#include "orbit/rlbwt.hpp"
+#include "runperm.hpp"
+#include "rlbwt.hpp"
 
 typedef unsigned long int ulint;
-typedef unsigned char uchar;
 
 /***** HELPER FUNCTIONS *****/
-template<typename run_perm_type>
-void print_run_data(run_perm_type& rp) {
-    using run_cols = typename run_perm_type::data_columns;
+template<typename RunPermType>
+void print_run_data(RunPermType& rp) {
+    using RunCols = typename RunPermType::RunCols;
     std::cout << "Intervals:" << std::endl;
     auto pos = rp.first();
     for (ulint i = 0; i < rp.intervals(); ++i) {
         std::cout << "Interval: " << pos.interval << ", Length: " << rp.get_length(pos.interval) << " --> ";
-        std::cout << "Run Data: " << rp.template get<run_cols::VAL1>(pos) << ", " << rp.template get<run_cols::VAL2>(pos);
-        if constexpr (std::is_same_v<run_perm_type, orbit::runperm<run_cols, true, true>>) {
+        std::cout << "Run Data: " << rp.template get<RunCols::VAL1>(pos) << ", " << rp.template get<RunCols::VAL2>(pos);
+        if constexpr (std::is_same_v<RunPermType, RunPerm<RunCols, true, true>>) {
             std::cout << "Absolute Position: " << pos.idx;
         }
-        if constexpr (std::is_same_v<run_perm_type, orbit::rlbwt::runperm_lf<run_cols>> || std::is_same_v<run_perm_type, orbit::rlbwt::runperm_fl<run_cols>>) {
+        if constexpr (std::is_same_v<RunPermType, RunPermLF<RunCols>> || std::is_same_v<RunPermType, RunPermFL<RunCols>>) {
             if (rp.get_character(pos.interval) == 0) {
                 std::cout << ", Character: $";
             } else {
@@ -33,11 +32,11 @@ void print_run_data(run_perm_type& rp) {
     pos = rp.first();
     for (size_t i = 0; i < rp.domain(); ++i) {
         std::cout << "Position: " << pos.interval << ", " << pos.offset << " --> ";
-        std::cout << "Run Data: " << rp.template get<run_cols::VAL1>(pos) << ", " << rp.template get<run_cols::VAL2>(pos);
-        if constexpr (std::is_same_v<run_perm_type, orbit::runperm<run_cols, true, true>>) {
+        std::cout << "Run Data: " << rp.template get<RunCols::VAL1>(pos) << ", " << rp.template get<RunCols::VAL2>(pos);
+        if constexpr (std::is_same_v<RunPermType, RunPerm<RunCols, true, true>>) {
             std::cout << "Absolute Position: " << pos.idx;
         }
-        if constexpr (std::is_same_v<run_perm_type, orbit::rlbwt::runperm_lf<run_cols>> || std::is_same_v<run_perm_type, orbit::rlbwt::runperm_fl<run_cols>>) {
+        if constexpr (std::is_same_v<RunPermType, RunPermLF<RunCols>> || std::is_same_v<RunPermType, RunPermFL<RunCols>>) {
             if (rp.get_character(pos.interval) == 0) {
                 std::cout << ", Character: $";
             } else {
@@ -50,16 +49,16 @@ void print_run_data(run_perm_type& rp) {
     assert(pos == rp.first());
 }
 
-template<typename move_perm_type>
-void print_move_permutation(move_perm_type& mp) {
+template<typename MovePermType>
+void print_move_permutation(MovePermType& mp) {
     std::cout << "Intervals:" << std::endl;
     auto pos = mp.first();
     for (ulint i = 0; i < mp.intervals(); ++i) {
         std::cout << "Interval: " << pos.interval << ", Length: " << mp.get_length(pos.interval);
-        if constexpr (std::is_same_v<move_perm_type, orbit::moveperm_absolute>) {
+        if constexpr (std::is_same_v<MovePermType, MovePermAbsolute>) {
             std::cout << ", Absolute Position: " << pos.idx;
         }
-        if constexpr (std::is_same_v<move_perm_type, orbit::rlbwt::move_lf<>> || std::is_same_v<move_perm_type, orbit::rlbwt::move_fl<>>) {
+        if constexpr (std::is_same_v<MovePermType, MoveLF<>> || std::is_same_v<MovePermType, MoveFL<>>) {
             if (mp.get_character(pos.interval) == 0) {
                 std::cout << ", Character: $";
             } else {
@@ -75,10 +74,10 @@ void print_move_permutation(move_perm_type& mp) {
     pos = mp.first();
     for (size_t i = 0; i < mp.domain(); ++i) {
         std::cout << "Position: " << pos.interval << ", " << pos.offset;
-        if constexpr (std::is_same_v<move_perm_type, orbit::moveperm_absolute>) {
+        if constexpr (std::is_same_v<MovePermType, MovePermAbsolute>) {
             std::cout << ", Absolute Position: " << pos.idx;
         }
-        if constexpr (std::is_same_v<move_perm_type, orbit::rlbwt::move_lf<>> || std::is_same_v<move_perm_type, orbit::rlbwt::move_fl<>>) {
+        if constexpr (std::is_same_v<MovePermType, MoveLF<>> || std::is_same_v<MovePermType, MoveFL<>>) {
             if (mp.get_character(pos.interval) == 0) {
                 std::cout << ", Character: $";
             } else {
@@ -120,26 +119,26 @@ void example1() {
     std::vector<ulint> permutation = { 1, 9, 3, 12, 4, 14, 0, 15, 6};       // Permutation of runs
 
     // Some example data columns to store alongside these runs.
-    DEFINE_COLUMNS(run_cols, VAL1, VAL2);
+    DEFINE_COLUMNS(RunCols, VAL1, VAL2);
     // The DEFINE_COLUMNS(enum_name, ...) macro above is equivalent to:
-    // enum class run_cols {
+    // enum class RunCols {
     //     VAL1,
     //     VAL2,
     //     COUNT
     // };
-    // !!! The COUNT enumerator is automatically added by the DEFINE_COLUMNS macro,
+    // !!! The COUNT enumerator is automatically added by the DEFINE_RUN_COLS macro,
     // !!! but must be included manually in the enum definition.
 
-    // Defines std::array<ulint, static_cast<size_t>(run_cols::COUNT)>
-    using run_cols_tuple = orbit::columns_tuple<run_cols>;
-    std::vector<run_cols_tuple> run_data(lengths.size()); // Some data with tuples per run
+    // Defines std::array<ulint, static_cast<size_t>(RunCols::COUNT)>
+    using RunColsTuple = ColumnsTuple<RunCols>;
+    std::vector<RunColsTuple> run_data(lengths.size()); // Some data with tuples per run
     // Fill with dummy data
     for (size_t i = 0; i < lengths.size(); ++i) {
         run_data[i] = {i, i + 1};
     }
 
     // Basic construction
-    orbit::runperm<run_cols> rp(lengths, permutation, run_data);
+    RunPerm<RunCols> rp(lengths, permutation, run_data);
     print_run_data(rp);
 }
 
@@ -150,14 +149,15 @@ void example2() {
     std::vector<ulint> permutation = {1, 2, 9, 10, 11, 3, 12, 13, 4, 5, 14, 0, 15, 6, 7, 8};
     // Same as MovePerm<> --> Know interval/offset at any point during navigation
     std::cout << "Move Permutation (Relative):" << std::endl;
-    orbit::moveperm_relative mp_relative(permutation);
+    MovePermRelative mp_relative(permutation);
     print_move_permutation(mp_relative);
 
     std::cout << "\n\nMove Permutation (Absolute):" << std::endl;
     // Or, can create from lengths and interval permutation
-    auto [lengths, interval_permutation] = orbit::get_permutation_intervals(permutation);
-    // moveperm_absolute also stores the absolute position in the permutation
-    orbit::moveperm_absolute mp_absolute(lengths, interval_permutation);
+    auto [lengths, interval_permutation] = get_permutation_intervals(permutation);
+    ulint domain = permutation.size();
+    // MovePermAbsolute also stores the absolute position in the permutation
+    MovePermAbsolute mp_absolute(lengths, interval_permutation);
     print_move_permutation(mp_absolute);
 }
 
@@ -166,30 +166,31 @@ void example3() {
     std::cout << "Example 3: " << example_names[2] << std::endl;
     std::vector<ulint> lengths = {2, 1, 8};
     std::vector<ulint> interval_permutation = {9, 0, 1};
+    ulint domain = 11;
 
     // Original move permutation
     std::cout << "Original Move Permutation (Relative):" << std::endl;
-    orbit::moveperm_relative mp_relative(lengths, interval_permutation);
+    MovePermRelative mp_relative(lengths, interval_permutation);
     print_move_permutation(mp_relative);
 
     std::cout << "\n\nSplitting..." << std::endl;
     std::cout << "Runs, r: " << lengths.size() << std::endl;
-    std::cout << "Domain, n: " << mp_relative.domain() << std::endl;
-    std::cout << "n/r: " << static_cast<double>(mp_relative.domain()) / static_cast<double>(lengths.size()) << std::endl;
+    std::cout << "Domain, n: " << domain << std::endl;
+    std::cout << "n/r: " << static_cast<double>(domain) / static_cast<double>(lengths.size()) << std::endl;
 
-    orbit::split_params sp;
-    sp.length_capping = 1;
+    SplitParams split_params;
+    split_params.length_capping = 1;
 
-    std::cout << "Length Capping Factor: " << sp.length_capping.value() << std::endl;
-    std::cout << "Capped Length (n/r * length_capping_factor): " << static_cast<ulint>(std::ceil(static_cast<double>(mp_relative.domain()) / static_cast<double>(lengths.size()) * sp.length_capping.value())) << std::endl;
-    std::cout << "Round up to use all log2(n/r * length_capping_factor) bits: " << MAX_VAL(orbit::bit_width(static_cast<ulint>(std::ceil(static_cast<double>(mp_relative.domain()) / static_cast<double>(lengths.size()) * sp.length_capping.value())))) << std::endl;
+    std::cout << "Length Capping Factor: " << split_params.length_capping.value() << std::endl;
+    std::cout << "Capped Length (n/r * length_capping_factor): " << static_cast<ulint>(std::ceil(static_cast<double>(domain) / static_cast<double>(lengths.size()) * split_params.length_capping.value())) << std::endl;
+    std::cout << "Round up to use all log2(n/r * length_capping_factor) bits: " << MAX_VAL(bit_width(static_cast<ulint>(std::ceil(static_cast<double>(domain) / static_cast<double>(lengths.size()) * split_params.length_capping.value())))) << std::endl;
 
     std::cout << "\nMove Permutation (Relative):" << std::endl;
-    orbit::moveperm_relative mp_relative_split(lengths, interval_permutation, sp);
+    MovePermRelative mp_relative_split(lengths, interval_permutation, split_params);
     print_move_permutation(mp_relative_split);
 
     std::cout << "\n\nMove Permutation (Absolute):" << std::endl;
-    orbit::moveperm_absolute mp_absolute_split(lengths, interval_permutation, sp);
+    MovePermAbsolute mp_absolute_split(lengths, interval_permutation, split_params);
     print_move_permutation(mp_absolute_split);
 }
 
@@ -204,23 +205,23 @@ void example4() {
 
     // LF using Move-only interface
     std::cout << "LF using Move-only interface" << std::endl;
-    orbit::rlbwt::move_lf<> move_lf(bwt_heads, bwt_run_lengths);
+    MoveLF<> move_lf(bwt_heads, bwt_run_lengths);
     print_move_permutation(move_lf);
 
     // LF with RunPerm + run data columns
     std::cout << "\n\nLF with RunPerm + run data columns" << std::endl;
     // Alternative to example 1, without using the macro
-    enum class run_cols {
+    enum class RunCols {
         VAL1,
         VAL2,
         COUNT
     };
-    using run_cols_tuple = orbit::columns_tuple<run_cols>;
-    std::vector<run_cols_tuple> lf_run_data(bwt_heads.size()); // Insert with some type of data
+    using LFRunData = ColumnsTuple<RunCols>;
+    std::vector<LFRunData> lf_run_data(bwt_heads.size()); // Insert with some type of data
     for (size_t i = 0; i < bwt_heads.size(); ++i) {
         lf_run_data[i] = {i, i + 1};
     }
-    orbit::rlbwt::runperm_lf<run_cols> runperm_lf(bwt_heads, bwt_run_lengths, lf_run_data);
+    RunPermLF<RunCols> runperm_lf(bwt_heads, bwt_run_lengths, lf_run_data);
     print_run_data(runperm_lf);
 }
 
@@ -232,7 +233,7 @@ void example5() {
     // RLBWT as run heads (characters) and run lengths, with 0 as terminator
     std::vector<uchar> bwt_heads =       {'T','C','G','A','T', 0 ,'A','T','A'};
     std::vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
-    orbit::rlbwt::move_fl<> move_fl(bwt_heads, bwt_run_lengths);
+    MoveFL<> move_fl(bwt_heads, bwt_run_lengths);
 
     std::cout << "Input RLBWT: (T, 5), (C, 3), (G, 3), (A, 3), (T, 1), ($, 1), (A, 1), (T, 4), (A, 6)" << std::endl;
     
@@ -255,13 +256,13 @@ void example6() {
 
     std::cout << "Input RLBWT: (T, 5), (C, 3), (G, 3), (A, 3), (T, 1), ($, 1), (A, 1), (T, 4), (A, 6)" << std::endl;
 
-    auto permutation = orbit::rlbwt::rlbwt_to_phi(bwt_heads, bwt_run_lengths);
-    orbit::rlbwt::move_invphi move_invphi(permutation);
+    auto [phi_lengths, phi_interval_permutations] = rlbwt_to_phi(bwt_heads, bwt_run_lengths);
+    MoveInvPhi move_invphi(phi_lengths, phi_interval_permutations);
     auto pos = move_invphi.last();
     std::vector<ulint> sa_recovered(domain);
     for (size_t i = 0; i < domain; ++i) {
         sa_recovered[i] = move_invphi.SA(pos);
-        pos = move_invphi.invphi(pos);
+        pos = move_invphi.InvPhi(pos);
     }
     std::cout << "Recovered SA: ";
     print_vector(sa_recovered);

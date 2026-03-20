@@ -1,9 +1,9 @@
 // Unit tests for split_by_length_capping and split_by_balancing.
 // These are simple assert-based tests, no external framework.
 
-#include "internal/move/move_splitting.hpp"
-#include "internal/ds/packed_vector.hpp"
-#include "permutation.hpp"
+#include "orbit/internal/move/move_splitting.hpp"
+#include "orbit/internal/ds/packed_vector.hpp"
+#include "orbit/permutation.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -12,9 +12,11 @@
 using std::size_t;
 using std::vector;
 
-// Use the packed IntVector as IntVectorType for tests
-using TestIntVector = IntVector;
-using TestSplitResult = SplitResult<TestIntVector>;
+using namespace orbit;
+
+// Use the packed int_vector as IntVectorType for tests
+using test_int_vector = int_vector;
+using test_split_result = split_result<test_int_vector>;
 
 void test_split_by_length_capping_no_splitting() {
     // Three equal-length runs that should not be split.
@@ -24,10 +26,10 @@ void test_split_by_length_capping_no_splitting() {
     const ulint domain = 12; // Sum of lengths.
     const double factor = 1.0;
 
-    TestIntVector lengths(lengths_vec);
-    TestIntVector tau_inv(tau_inv_vec);
+    test_int_vector lengths(lengths_vec);
+    test_int_vector tau_inv(tau_inv_vec);
 
-    TestSplitResult result;
+    test_split_result result;
     split_by_length_capping(lengths, tau_inv, domain, factor, result);
 
     assert(result.lengths.size() == lengths_vec.size());
@@ -50,10 +52,10 @@ void test_split_by_length_capping_with_splitting() {
     const ulint domain = 15; // Sum of lengths.
     size_t max_length = 2;
 
-    TestIntVector lengths(lengths_vec);
-    TestIntVector tau_inv(tau_inv_vec);
+    test_int_vector lengths(lengths_vec);
+    test_int_vector tau_inv(tau_inv_vec);
 
-    TestSplitResult result;
+    test_split_result result;
     split_by_max_allowed_length(lengths, tau_inv, domain, max_length, result);
 
     const vector<ulint> expected_lengths = {2, 2, 1, 1, 2, 2, 1, 1, 1, 2, 1};
@@ -78,10 +80,10 @@ void test_split_by_length_capping_mixed_lengths() {
     const ulint domain = 19;
     const double factor = 0.5;
 
-    TestIntVector lengths(lengths_vec);
-    TestIntVector tau_inv(tau_inv_vec);
+    test_int_vector lengths(lengths_vec);
+    test_int_vector tau_inv(tau_inv_vec);
 
-    TestSplitResult result;
+    test_split_result result;
     split_by_length_capping(lengths, tau_inv, domain, factor, result);
 
     // avg_run_length = 19 / 3 ≈ 6.333...
@@ -112,10 +114,10 @@ void test_split_by_balancing_dummy() {
     const ulint domain = 10;
     const ulint factor = 4;
 
-    TestIntVector lengths(lengths_vec);
-    TestIntVector tau_inv(tau_inv_vec);
+    test_int_vector lengths(lengths_vec);
+    test_int_vector tau_inv(tau_inv_vec);
 
-    TestSplitResult result;
+    test_split_result result;
     split_by_balancing(lengths, tau_inv, domain, factor, result);
 }
 

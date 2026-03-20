@@ -1,12 +1,15 @@
-// Tiny unit tests for Phi / InvPhi helpers and wrappers.
+// Tiny unit tests for phi / invphi helpers and wrappers.
 // Focus: structural sanity and wrapper behaviour, not full SA reconstruction.
 
-#include "rlbwt.hpp"
+#include "orbit/rlbwt.hpp"
 
 #include <cassert>
 #include <iostream>
 #include <numeric>
 #include <vector>
+
+using namespace orbit;
+using namespace orbit::rlbwt;
 
 using std::size_t;
 using std::vector;
@@ -18,10 +21,10 @@ void test_phi_invphi_structure_on_small_rlbwt() {
 
     size_t phi_domain;
     ulint max_length;
-    auto [phi_lengths, phi_perm] = phi::rlbwt_to_phi(heads, lens, &phi_domain, &max_length);
+    auto [phi_lengths, phi_perm] = rlbwt_to_phi_interval_permutation(heads, lens, &phi_domain, &max_length);
     size_t inv_domain;
     ulint max_length_inv;
-    auto [inv_lengths, inv_perm] = invphi::rlbwt_to_invphi(heads, lens, &inv_domain, &max_length_inv);
+    auto [inv_lengths, inv_perm] = rlbwt_to_invphi_interval_permutation(heads, lens, &inv_domain, &max_length_inv);
 
     assert(phi_domain == 27);
     assert(inv_domain == 27);
@@ -49,10 +52,10 @@ void test_runperm_phi_invphi_wrapper_equivalence() {
 
     size_t phi_domain;
     ulint max_length;
-    auto [phi_lengths, phi_perm] = phi::rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
+    auto [phi_lengths, phi_perm] = rlbwt_to_phi_interval_permutation(bwt_heads, bwt_run_lengths, &phi_domain, &max_length);
     size_t inv_domain;
     ulint max_length_inv;
-    auto [inv_lengths, inv_perm] = invphi::rlbwt_to_invphi(bwt_heads, bwt_run_lengths, &inv_domain, &max_length_inv);
+    auto [inv_lengths, inv_perm] = rlbwt_to_invphi_interval_permutation(bwt_heads, bwt_run_lengths, &inv_domain, &max_length_inv);
 
     assert(phi_domain == inv_domain);
 
@@ -70,36 +73,36 @@ void test_runperm_phi_invphi_wrapper_equivalence() {
         run_data_inv[i][0] = static_cast<ulint>(i * 2);
     }
 
-    RunPermPhi<RunCols> rp_phi(phi_lengths, phi_perm, run_data_phi);
-    RunPermInvPhi<RunCols> rp_inv(inv_lengths, inv_perm, run_data_inv);
+    runperm_phi<RunCols> rp_phi(phi_lengths, phi_perm, run_data_phi);
+    runperm_invphi<RunCols> rp_inv(inv_lengths, inv_perm, run_data_inv);
 
-    using PosPhi = typename RunPermPhi<RunCols>::Position;
-    using PosInv = typename RunPermInvPhi<RunCols>::Position;
+    using PosPhi = typename runperm_phi<RunCols>::position;
+    using PosInv = typename runperm_invphi<RunCols>::position;
 
     PosPhi p0 = rp_phi.first();
-    PosPhi phi1 = rp_phi.Phi(p0);
+    PosPhi phi1 = rp_phi.phi(p0);
     PosPhi next1 = rp_phi.next(p0);
     assert(phi1.interval == next1.interval);
     assert(phi1.offset == next1.offset);
 
-    PosPhi phi3 = rp_phi.Phi(p0, 3);
+    PosPhi phi3 = rp_phi.phi(p0, 3);
     PosPhi it_phi = p0;
-    it_phi = rp_phi.Phi(it_phi);
-    it_phi = rp_phi.Phi(it_phi);
-    it_phi = rp_phi.Phi(it_phi);
+    it_phi = rp_phi.phi(it_phi);
+    it_phi = rp_phi.phi(it_phi);
+    it_phi = rp_phi.phi(it_phi);
     assert(phi3.interval == it_phi.interval);
     assert(phi3.offset == it_phi.offset);
 
     PosInv q0 = rp_inv.first();
-    PosInv inv1 = rp_inv.InvPhi(q0);
+    PosInv inv1 = rp_inv.invphi(q0);
     PosInv next_inv1 = rp_inv.next(q0);
     assert(inv1.interval == next_inv1.interval);
     assert(inv1.offset == next_inv1.offset);
 
-    PosInv inv2 = rp_inv.InvPhi(q0, 2);
+    PosInv inv2 = rp_inv.invphi(q0, 2);
     PosInv it_inv = q0;
-    it_inv = rp_inv.InvPhi(it_inv);
-    it_inv = rp_inv.InvPhi(it_inv);
+    it_inv = rp_inv.invphi(it_inv);
+    it_inv = rp_inv.invphi(it_inv);
     assert(inv2.interval == it_inv.interval);
     assert(inv2.offset == it_inv.offset);
 }
@@ -111,10 +114,10 @@ void test_runperm_invphi_tau_inv_wrapper_equivalence() {
 
     size_t inv_domain_1;
     ulint max_length_inv_1;
-    auto [inv_lengths_1, inv_perm] = invphi::rlbwt_to_invphi(bwt_heads, bwt_run_lengths, &inv_domain_1, &max_length_inv_1);
+    auto [inv_lengths_1, inv_perm] = rlbwt_to_invphi_interval_permutation(bwt_heads, bwt_run_lengths, &inv_domain_1, &max_length_inv_1);
     size_t inv_domain_2;
     ulint max_length_inv_2;
-    auto [inv_lengths_2, invphi_tau_inv] = invphi::rlbwt_to_invphi_tau_inv(bwt_heads, bwt_run_lengths, &inv_domain_2, &max_length_inv_2);
+    auto [inv_lengths_2, invphi_tau_inv] = rlbwt_to_invphi_tau_inv(bwt_heads, bwt_run_lengths, &inv_domain_2, &max_length_inv_2);
 
     assert(inv_domain_1 == inv_domain_2);
     assert(inv_lengths_1.size() == inv_lengths_2.size());
@@ -137,11 +140,11 @@ void test_runperm_phi_tau_inv_wrapper_equivalence() {
 
     size_t phi_domain_1;
     ulint max_length_phi_1;
-    auto [phi_lengths_1, phi_perm] = phi::rlbwt_to_phi(bwt_heads, bwt_run_lengths, &phi_domain_1, &max_length_phi_1);
+    auto [phi_lengths_1, phi_perm] = rlbwt_to_phi_interval_permutation(bwt_heads, bwt_run_lengths, &phi_domain_1, &max_length_phi_1);
 
     size_t phi_domain_2;
     ulint max_length_phi_2;
-    auto [phi_lengths_2, phi_tau_inv] = phi::rlbwt_to_phi_tau_inv(bwt_heads, bwt_run_lengths, &phi_domain_2, &max_length_phi_2);
+    auto [phi_lengths_2, phi_tau_inv] = rlbwt_to_phi_tau_inv(bwt_heads, bwt_run_lengths, &phi_domain_2, &max_length_phi_2);
 
     assert(phi_domain_1 == phi_domain_2);
     assert(phi_lengths_1.size() == phi_lengths_2.size());
@@ -164,10 +167,10 @@ void test_phi_and_invphi_tau_inv_equivalence() {
 
     size_t phi_domain;
     ulint max_length_phi;
-    auto [phi_lengths, phi_tau_inv] = phi::rlbwt_to_phi_tau_inv(bwt_heads, bwt_run_lengths, &phi_domain, &max_length_phi);
+    auto [phi_lengths, phi_tau_inv] = rlbwt_to_phi_tau_inv(bwt_heads, bwt_run_lengths, &phi_domain, &max_length_phi);
     size_t inv_domain;
     ulint max_length_inv;
-    auto [inv_lengths, inv_tau_inv] = invphi::rlbwt_to_invphi_tau_inv(bwt_heads, bwt_run_lengths, &inv_domain, &max_length_inv);
+    auto [inv_lengths, inv_tau_inv] = rlbwt_to_invphi_tau_inv(bwt_heads, bwt_run_lengths, &inv_domain, &max_length_inv);
 
     assert(phi_domain == inv_domain);
     assert(phi_lengths.size() == inv_lengths.size());

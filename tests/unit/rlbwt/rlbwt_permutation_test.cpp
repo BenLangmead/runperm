@@ -1,7 +1,8 @@
 // Unit tests for RLBWT-specific permutation builder (`RLBWTPermutationImpl`).
 // Focus: construction invariants and head/alphabet mapping (with/without splitting).
 
-#include "internal/rlbwt/specializations/rlbwt_permutation.hpp"
+#include "orbit/internal/rlbwt/specializations/rlbwt_permutation.hpp"
+#include "orbit/rlbwt.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -9,6 +10,9 @@
 
 using std::size_t;
 using std::vector;
+
+using namespace orbit;
+using namespace orbit::rlbwt;
 
 template<class Perm>
 static vector<uchar> expected_heads_for_permutation(
@@ -38,11 +42,11 @@ void test_rlbwt_lf_permutation_heads_and_alphabet() {
     vector<ulint> lengths  =    { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
     // No splitting: intervals == runs == original runs.
-    auto perm = RLBWTPermutationImpl<>::lf_permutation(heads, lengths, NO_SPLITTING);
+    auto perm = rlbwt_permutation::lf_permutation(heads, lengths, NO_SPLITTING);
     assert(perm.domain() == 27);
     assert(perm.runs() == heads.size());
     assert(perm.intervals() == heads.size());
-    assert(perm.sigma() == Nucleotide::size());
+    assert(perm.sigma() == nucleotide::size());
 
     const auto& alpha = perm.get_alphabet();
     const auto& perm_heads = perm.get_heads();
@@ -52,7 +56,7 @@ void test_rlbwt_lf_permutation_heads_and_alphabet() {
     }
 
     // With splitting: heads must be expanded consistently with new intervals.
-    auto perm_split = RLBWTPermutationImpl<>::lf_permutation(heads, lengths, DEFAULT_SPLITTING);
+    auto perm_split = rlbwt_permutation::lf_permutation(heads, lengths, DEFAULT_SPLITTING);
     assert(perm_split.domain() == 27);
     assert(perm_split.runs() == heads.size());
     assert(perm_split.intervals() >= heads.size());
@@ -74,17 +78,17 @@ void test_rlbwt_fl_permutation_heads_and_alphabet() {
     vector<ulint> lengths  =    { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
     // For FL, the internal builder derives "F runs" (different heads/lengths).
-    auto perm = RLBWTPermutationImpl<>::fl_permutation(heads, lengths, NO_SPLITTING);
+    auto perm = rlbwt_permutation::fl_permutation(heads, lengths, NO_SPLITTING);
     assert(perm.domain() == 27);
     assert(perm.runs() == heads.size());
-    assert(perm.sigma() == Nucleotide::size());
+    assert(perm.sigma() == nucleotide::size());
 
-    auto [head_counts, F_lens_and_origin_run, n, max_length] = fl::get_FL_head_counts(heads, lengths);
+    auto [head_counts, F_lens_and_origin_run, n, max_length] = get_FL_head_counts(heads, lengths);
     (void)head_counts;
     (void)max_length;
     assert(n == perm.domain());
 
-    auto [F_heads, F_lens, F_tau_inv] = fl::get_FL_runs_and_tau_inv(heads.size(), F_lens_and_origin_run);
+    auto [F_heads, F_lens, F_tau_inv] = get_FL_runs_and_tau_inv(heads.size(), F_lens_and_origin_run);
     (void)F_tau_inv;
     assert(F_heads.size() == heads.size());
     assert(F_lens.size() == lengths.size());

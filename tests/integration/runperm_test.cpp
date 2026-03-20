@@ -1,7 +1,7 @@
 // Integration-style tests for RunPerm (generic, non-RLBWT).
 // These are simple assert-based tests, no external framework.
 
-#include "runperm.hpp"
+#include "orbit/runperm.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -10,6 +10,8 @@
 using std::size_t;
 using std::vector;
 
+using namespace orbit;
+
 // Simple run-data schema with two fields.
 enum class TestRunColsInt {
     VAL1,
@@ -17,12 +19,12 @@ enum class TestRunColsInt {
     COUNT
 };
 
-using TestRunDataInt = ColumnsTuple<TestRunColsInt>;
+using TestRunDataInt = columns_tuple<TestRunColsInt>;
 
 template <typename RP>
-static typename RP::Position make_pos_absolute(const RP &rp, ulint idx) {
-    using Position = typename RP::Position;
-    Position pos{};
+static typename RP::position make_pos_absolute(const RP &rp, ulint idx) {
+    using position = typename RP::position;
+    position pos{};
     pos.idx = idx;
     ulint prefix = 0;
     for (ulint interval = 0; interval < rp.intervals(); ++interval) {
@@ -59,8 +61,8 @@ static void integration_runperm_separated_and_integrated_absolute() {
         run_data[i] = {static_cast<ulint>(i), static_cast<ulint>(i + 10)};
     }
 
-    using RPSeparatedAbs = RunPermSeparatedAbsolute<TestRunColsInt>;
-    using RPIntegratedAbs = RunPermIntegratedAbsolute<TestRunColsInt>;
+    using RPSeparatedAbs = runperm_separated_absolute<TestRunColsInt>;
+    using RPIntegratedAbs = runperm_integrated_absolute<TestRunColsInt>;
 
     RPSeparatedAbs rp_sep(lengths, interval_perm, run_data);
     RPIntegratedAbs rp_int(lengths, interval_perm, run_data);

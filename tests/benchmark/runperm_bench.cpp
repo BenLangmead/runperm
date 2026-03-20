@@ -3,7 +3,7 @@
     benchmarks. Leaving them here for now since they somewhat 
     verify performance. Better benchmarks should be written. */
 
-#include "runperm.hpp"
+#include "orbit/runperm.hpp"
 
 #include <iostream>
 #include <set>
@@ -14,6 +14,8 @@
 #include <chrono>
 #include <functional>
 #include <random>
+
+using namespace orbit;
 
 using namespace std;
 using namespace std::chrono;
@@ -98,18 +100,18 @@ bool verify_permutation(const std::vector<ulint>& perm) {
 // std::vector<ulint> test_n = {1048576, 2097152, 4194304, 8388608};
 std::vector<ulint> test_n = {18388608};  
 std::vector<size_t> percentage_runs = {1, 2, 5, 10};
-SplitParams split_params = NO_SPLITTING;
+split_params sp = NO_SPLITTING;
 std::optional<double> length_capping_factor = 4.0;
 
 template<typename RunData, typename RunPermType>
 std::string get_runperm_type_name() {
-    if constexpr (std::is_same_v<RunPermType, RunPerm<RunData, true, true>>) {
+    if constexpr (std::is_same_v<RunPermType, runperm<RunData, true, true>>) {
         return "RunPermIntegratedAbsolute";
-    } else if constexpr (std::is_same_v<RunPermType, RunPerm<RunData, true, false>>) {
+    } else if constexpr (std::is_same_v<RunPermType, runperm<RunData, true, false>>) {
         return "RunPermIntegratedRelative";
-    } else if constexpr (std::is_same_v<RunPermType, RunPerm<RunData, false, true>>) {
+    } else if constexpr (std::is_same_v<RunPermType, runperm<RunData, false, true>>) {
         return "RunPermSeperatedAbsolute";
-    } else if constexpr (std::is_same_v<RunPermType, RunPerm<RunData, false, false>>) {
+    } else if constexpr (std::is_same_v<RunPermType, runperm<RunData, false, false>>) {
         return "RunPermSeperatedRelative";
     } else {
         return "Unknown";
@@ -123,7 +125,7 @@ void bench_runperm(const std::vector<ulint>& lengths,
                    size_t n) {
 
     auto start_time = high_resolution_clock::now();
-    auto runperm = RunPermType(lengths, interval_permutation, split_params, run_data);
+    auto runperm = RunPermType(lengths, interval_permutation, sp, run_data);
     auto creation_time = high_resolution_clock::now();
 
     auto pos = runperm.first();
@@ -186,10 +188,10 @@ void run_benchmarks() {
 
             std::cout << "Testing n=" << n << ", r=" << r << " (n/r=" << n/r << "):" << std::endl;
 
-            bench_runperm<RunData, RunPerm<RunData, true, true>>(lengths, interval_permutation, run_data, n);
-            bench_runperm<RunData, RunPerm<RunData, true, false>>(lengths, interval_permutation, run_data, n);
-            bench_runperm<RunData, RunPerm<RunData, false, true>>(lengths, interval_permutation, run_data, n);
-            bench_runperm<RunData, RunPerm<RunData, false, false>>(lengths, interval_permutation, run_data, n);
+            bench_runperm<RunData, runperm<RunData, true, true>>(lengths, interval_permutation, run_data, n);
+            bench_runperm<RunData, runperm<RunData, true, false>>(lengths, interval_permutation, run_data, n);
+            bench_runperm<RunData, runperm<RunData, false, true>>(lengths, interval_permutation, run_data, n);
+            bench_runperm<RunData, runperm<RunData, false, false>>(lengths, interval_permutation, run_data, n);
 
             std::cout << std::endl;
         }

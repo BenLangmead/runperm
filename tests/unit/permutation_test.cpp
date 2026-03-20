@@ -1,10 +1,10 @@
 // Unit tests for PermutationImpl and permutation helpers.
 // Simple assert-based tests, no external framework.
 
-#include "permutation.hpp"
-#include "common.hpp"
-#include "internal/ds/packed_vector.hpp"
-#include "internal/move/move_splitting.hpp"
+#include "orbit/permutation.hpp"
+#include "orbit/common.hpp"
+#include "orbit/internal/ds/packed_vector.hpp"
+#include "orbit/internal/move/move_splitting.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -13,12 +13,14 @@
 using std::size_t;
 using std::vector;
 
-// Use the packed IntVector as IntVectorType for tests.
-using TestIntVector = IntVector;
-using TestPermutation = PermutationImpl<TestIntVector>;
+using namespace orbit;
+
+// Use the packed int_vector as IntVectorType for tests.
+using test_int_vector = int_vector;
+using test_permutation = permutation_impl<test_int_vector>;
 
 // Basic helper to check that tau_inv is a permutation of [0, n).
-static void assert_tau_inv_is_permutation(TestPermutation &perm) {
+static void assert_tau_inv_is_permutation(test_permutation &perm) {
     const size_t r = perm.runs();
     vector<bool> seen(r, false);
     for (size_t i = 0; i < r; ++i) {
@@ -151,7 +153,7 @@ static void test_all_construction_paths_no_splitting() {
 
     // 1) lengths + tau_inv (with and without explicit domain/max_length)
     {
-        TestPermutation p1 = TestPermutation::from_lengths_and_tau_inv(
+        test_permutation p1 = test_permutation::from_lengths_and_tau_inv(
             lengths, tau_inv, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -164,7 +166,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_lengths_and_tau_inv(
+        test_permutation p2 = test_permutation::from_lengths_and_tau_inv(
             lengths, tau_inv, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -187,7 +189,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert(expected_tau_inv == tau_inv);
 
-        TestPermutation p1 = TestPermutation::from_lengths_and_tau(
+        test_permutation p1 = test_permutation::from_lengths_and_tau(
             lengths, tau, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -200,7 +202,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_lengths_and_tau(
+        test_permutation p2 = test_permutation::from_lengths_and_tau(
             lengths, tau, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -216,7 +218,7 @@ static void test_all_construction_paths_no_splitting() {
 
     // 3) lengths + interval_permutation
     {
-        TestPermutation p1 = TestPermutation::from_lengths_and_interval_permutation(
+        test_permutation p1 = test_permutation::from_lengths_and_interval_permutation(
             lengths, interval_perm, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -225,7 +227,7 @@ static void test_all_construction_paths_no_splitting() {
         assert(p1.max_length() == max_length);
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_lengths_and_interval_permutation(
+        test_permutation p2 = test_permutation::from_lengths_and_interval_permutation(
             lengths, interval_perm, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -237,7 +239,7 @@ static void test_all_construction_paths_no_splitting() {
 
     // 4) starts + tau_inv
     {
-        TestPermutation p1 = TestPermutation::from_starts_and_tau_inv(
+        test_permutation p1 = test_permutation::from_starts_and_tau_inv(
             starts, tau_inv, domain, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -250,7 +252,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_starts_and_tau_inv(
+        test_permutation p2 = test_permutation::from_starts_and_tau_inv(
             starts, tau_inv, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -272,7 +274,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert(expected_tau_inv == tau_inv);
 
-        TestPermutation p1 = TestPermutation::from_starts_and_tau(
+        test_permutation p1 = test_permutation::from_starts_and_tau(
             starts, tau, domain, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -285,7 +287,7 @@ static void test_all_construction_paths_no_splitting() {
         }
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_starts_and_tau(
+        test_permutation p2 = test_permutation::from_starts_and_tau(
             starts, tau, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -301,7 +303,7 @@ static void test_all_construction_paths_no_splitting() {
 
     // 6) starts + interval_permutation
     {
-        TestPermutation p1 = TestPermutation::from_starts_and_interval_permutation(
+        test_permutation p1 = test_permutation::from_starts_and_interval_permutation(
             starts, interval_perm, domain, NO_SPLITTING
         );
         assert(p1.domain() == domain);
@@ -310,7 +312,7 @@ static void test_all_construction_paths_no_splitting() {
         assert(p1.max_length() == max_length);
         assert_tau_inv_is_permutation(p1);
 
-        TestPermutation p2 = TestPermutation::from_starts_and_interval_permutation(
+        test_permutation p2 = test_permutation::from_starts_and_interval_permutation(
             starts, interval_perm, domain, max_length, NO_SPLITTING
         );
         assert(p2.domain() == domain);
@@ -326,7 +328,7 @@ static void test_from_permutation_and_split_run_data() {
     const vector<ulint> perm_vec = {0, 1, 2, 5, 6, 7, 8, 10};
     const ulint domain = static_cast<ulint>(perm_vec.size());
 
-    TestPermutation perm_no_split = TestPermutation::from_permutation(
+    test_permutation perm_no_split = test_permutation::from_permutation(
         perm_vec, NO_SPLITTING
     );
 
@@ -349,7 +351,7 @@ static void test_from_permutation_and_split_run_data() {
     const ulint domain2 = 15;
     const ulint max_length2 = 10;
 
-    TestPermutation perm_split = TestPermutation::from_lengths_and_tau_inv(
+    test_permutation perm_split = test_permutation::from_lengths_and_tau_inv(
         original_lengths, tau_inv, domain2, max_length2, DEFAULT_SPLITTING
     );
 

@@ -1,11 +1,14 @@
 // Tiny unit tests for LF/FL-based RLBWT components.
 // Focus: wrapper methods (LF/FL) behave like next(), not full text reconstruction.
 
-#include "rlbwt.hpp"
+#include "orbit/rlbwt.hpp"
 
 #include <cassert>
 #include <iostream>
 #include <vector>
+
+using namespace orbit;
+using namespace orbit::rlbwt;
 
 using std::size_t;
 using std::vector;
@@ -16,20 +19,20 @@ void test_move_lf_wrapper_equivalence() {
     vector<uchar> bwt_heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    MoveLF<> move_lf(bwt_heads, bwt_run_lengths);
+    move_lf<> move_lf(bwt_heads, bwt_run_lengths);
 
-    using Position = typename MoveLF<>::Position;
-    Position start = move_lf.first();
+    using position = typename move_lf<>::position;
+    position start = move_lf.first();
 
     // Single-step LF must match next().
-    Position lf1 = move_lf.LF(start);
-    Position next1 = move_lf.next(start);
+    position lf1 = move_lf.LF(start);
+    position next1 = move_lf.next(start);
     assert(lf1.interval == next1.interval);
     assert(lf1.offset == next1.offset);
 
     // Multi-step LF(pos, k) must match k repeated LF calls.
-    Position lf3 = move_lf.LF(start, 3);
-    Position iter = start;
+    position lf3 = move_lf.LF(start, 3);
+    position iter = start;
     iter = move_lf.LF(iter);
     iter = move_lf.LF(iter);
     iter = move_lf.LF(iter);
@@ -51,18 +54,18 @@ void test_runperm_lf_wrapper_equivalence() {
         run_data[i][0] = static_cast<ulint>(i);
     }
 
-    RunPermLF<RunCols> rp_lf(bwt_heads, bwt_run_lengths, run_data);
+    runperm_lf<RunCols> rp_lf(bwt_heads, bwt_run_lengths, run_data);
 
-    using Position = typename RunPermLF<RunCols>::Position;
-    Position start = rp_lf.first();
+    using position = typename runperm_lf<RunCols>::position;
+    position start = rp_lf.first();
 
-    Position lf1 = rp_lf.LF(start);
-    Position next1 = rp_lf.next(start);
+    position lf1 = rp_lf.LF(start);
+    position next1 = rp_lf.next(start);
     assert(lf1.interval == next1.interval);
     assert(lf1.offset == next1.offset);
 
-    Position lf2 = rp_lf.LF(start, 2);
-    Position iter = start;
+    position lf2 = rp_lf.LF(start, 2);
+    position iter = start;
     iter = rp_lf.LF(iter);
     iter = rp_lf.LF(iter);
     assert(lf2.interval == iter.interval);
@@ -73,18 +76,18 @@ void test_move_fl_wrapper_equivalence() {
     vector<uchar> bwt_heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    MoveFL<> move_fl(bwt_heads, bwt_run_lengths);
+    move_fl<> move_fl(bwt_heads, bwt_run_lengths);
 
-    using Position = typename MoveFL<>::Position;
-    Position start = move_fl.first();
+    using position = typename move_fl<>::position;
+    position start = move_fl.first();
 
-    Position fl1 = move_fl.FL(start);
-    Position next1 = move_fl.next(start);
+    position fl1 = move_fl.FL(start);
+    position next1 = move_fl.next(start);
     assert(fl1.interval == next1.interval);
     assert(fl1.offset == next1.offset);
 
-    Position fl4 = move_fl.FL(start, 4);
-    Position iter = start;
+    position fl4 = move_fl.FL(start, 4);
+    position iter = start;
     for (int i = 0; i < 4; ++i) {
         iter = move_fl.FL(iter);
     }
@@ -106,18 +109,18 @@ void test_runperm_fl_wrapper_equivalence() {
         run_data[i][0] = static_cast<ulint>(i * 2);
     }
 
-    RunPermFL<RunCols> rp_fl(bwt_heads, bwt_run_lengths, run_data);
+    runperm_fl<RunCols> rp_fl(bwt_heads, bwt_run_lengths, run_data);
 
-    using Position = typename RunPermFL<RunCols>::Position;
-    Position start = rp_fl.first();
+    using position = typename runperm_fl<RunCols>::position;
+    position start = rp_fl.first();
 
-    Position fl1 = rp_fl.FL(start);
-    Position next1 = rp_fl.next(start);
+    position fl1 = rp_fl.FL(start);
+    position next1 = rp_fl.next(start);
     assert(fl1.interval == next1.interval);
     assert(fl1.offset == next1.offset);
 
-    Position fl2 = rp_fl.FL(start, 2);
-    Position iter = start;
+    position fl2 = rp_fl.FL(start, 2);
+    position iter = start;
     iter = rp_fl.FL(iter);
     iter = rp_fl.FL(iter);
     assert(fl2.interval == iter.interval);
@@ -128,14 +131,14 @@ void test_runpermlf_construct_from_precomputed_permutation_no_splitting() {
     vector<uchar> bwt_heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    auto perm = RLBWTPermutation::lf_permutation(bwt_heads, bwt_run_lengths, NO_SPLITTING);
+    auto perm = rlbwt_permutation::lf_permutation(bwt_heads, bwt_run_lengths, NO_SPLITTING);
 
     enum class RunCols {
         V,
         COUNT
     };
-    using RP = RunPermLF<RunCols>;
-    using RunData = typename RP::RunDataTuple;
+    using RP = runperm_lf<RunCols>;
+    using RunData = typename RP::data_tuple;
 
     vector<RunData> run_data(perm.intervals());
     for (size_t i = 0; i < run_data.size(); ++i) {
@@ -170,15 +173,15 @@ void test_runpermlf_construct_from_precomputed_permutation_with_splitting() {
     vector<uchar> bwt_heads =       {'T','C','G','A','T', 1 ,'A','T','A'};
     vector<ulint> bwt_run_lengths = { 5 , 3 , 3 , 3 , 1 , 1 , 1 , 4 , 6 };
 
-    auto perm = RLBWTPermutation::lf_permutation(bwt_heads, bwt_run_lengths, DEFAULT_SPLITTING);
+    auto perm = rlbwt_permutation::lf_permutation(bwt_heads, bwt_run_lengths, DEFAULT_SPLITTING);
     assert(perm.intervals() >= perm.runs());
 
     enum class RunCols {
         V,
         COUNT
     };
-    using RP = RunPermLF<RunCols>;
-    using RunData = typename RP::RunDataTuple;
+    using RP = runperm_lf<RunCols>;
+    using RunData = typename RP::data_tuple;
 
     vector<RunData> run_data_per_run(perm.runs());
     for (size_t i = 0; i < run_data_per_run.size(); ++i) {

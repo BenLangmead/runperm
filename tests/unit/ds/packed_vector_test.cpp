@@ -1,8 +1,8 @@
-// Unit tests for PackedMatrix / PackedVector and their aligned variants.
+// Unit tests for packed_matrix / packed_vector and their aligned variants.
 // These are simple assert-based tests, no external framework.
 
-#include "internal/ds/packed_vector.hpp"
-#include "internal/ds/packed_vector_aligned.hpp"
+#include "orbit/internal/ds/packed_vector.hpp"
+#include "orbit/internal/ds/packed_vector_aligned.hpp"
 
 #include <cassert>
 #include <array>
@@ -16,13 +16,15 @@ using std::array;
 using std::size_t;
 using std::vector;
 
-// Basic sanity for PackedMatrix with a single column.
+using namespace orbit;
+
+// Basic sanity for packed_matrix with a single column.
 void test_packed_matrix_single_column() {
     constexpr size_t NumCols = 1;
     constexpr uchar width = 6; // values in [0, 63]
     const size_t rows = 32;
 
-    PackedMatrix<NumCols> m(rows, array<uchar, NumCols>{width});
+    packed_matrix<NumCols> m(rows, array<uchar, NumCols>{width});
     assert(m.rows() == rows);
     assert(m.cols() == NumCols);
 
@@ -44,7 +46,7 @@ void test_packed_matrix_multi_column() {
     const array<uchar, NumCols> widths{7, 7};
     const size_t rows = 64;
 
-    PackedMatrix<NumCols> m(rows, widths);
+    packed_matrix<NumCols> m(rows, widths);
     assert(m.rows() == rows);
     assert(m.cols() == NumCols);
 
@@ -65,12 +67,12 @@ void test_packed_matrix_multi_column() {
     }
 }
 
-// Round-trip serialize/load for IntVector.
+// Round-trip serialize/load for int_vector.
 void test_int_vector_serialize_roundtrip() {
     const size_t rows = 50;
     const uchar width = 10; // values < 1024
 
-    IntVector v(rows, width);
+    int_vector v(rows, width);
     for (size_t i = 0; i < rows; ++i) {
         v.set(i, static_cast<ulint>((i * 7) % (1u << width)));
     }
@@ -79,7 +81,7 @@ void test_int_vector_serialize_roundtrip() {
     size_t bytes_written = v.serialize(ss);
     assert(bytes_written > 0);
 
-    IntVector loaded;
+    int_vector loaded;
     loaded.load(ss);
     assert(loaded.rows() == rows);
 
@@ -96,7 +98,7 @@ void test_int_vector_vector_ctor_non_empty() {
         data.push_back(static_cast<ulint>((i * 17) ^ (i >> 1)));
     }
 
-    IntVector v(data);
+    int_vector v(data);
     assert(v.rows() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         assert(v.get(i) == data[i]);
@@ -105,7 +107,7 @@ void test_int_vector_vector_ctor_non_empty() {
 
 void test_int_vector_vector_ctor_empty() {
     std::vector<ulint> data;
-    IntVector v(data);
+    int_vector v(data);
     assert(v.rows() == 0);
 }
 
@@ -114,19 +116,19 @@ void test_int_vector_vector_width_ctor() {
     std::vector<ulint> data = {0, 1, 15, 127, 255}; // fits in 8 bits
     const uchar width = 8;
 
-    IntVector v(data, width);
+    int_vector v(data, width);
     assert(v.rows() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         assert(v.get(i) == data[i]);
     }
 }
 
-// Iterator tests for IntVector: mutable and const access.
+// Iterator tests for int_vector: mutable and const access.
 void test_int_vector_iterators() {
     const size_t rows = 32;
     const uchar width = 10;
 
-    IntVector v(rows, width);
+    int_vector v(rows, width);
 
     // Fill via mutable iterators (exercise proxy assignment).
     ulint value = 0;
@@ -141,7 +143,7 @@ void test_int_vector_iterators() {
     }
 
     // Exercise a standard algorithm (read/write through iterators).
-    std::for_each(v.begin(), v.end(), [](IntVector::reference x) {
+    std::for_each(v.begin(), v.end(), [](int_vector::reference x) {
         ulint current = static_cast<ulint>(x);
         x = current * 2;
     });
@@ -151,7 +153,7 @@ void test_int_vector_iterators() {
     }
 
     // Const iteration: range-for over const reference.
-    const IntVector& cv = v;
+    const int_vector& cv = v;
     size_t idx = 0;
     for (auto x : cv) {
         assert(x == cv.get(idx));
@@ -160,7 +162,7 @@ void test_int_vector_iterators() {
     assert(idx == rows);
 }
 
-// Tests for the Columns-based PackedVector facade.
+// Tests for the Columns-based packed_vector facade.
 void test_packed_vector_with_enum() {
     enum class Columns {
         A,
@@ -173,7 +175,7 @@ void test_packed_vector_with_enum() {
     const array<uchar, NumCols> widths{4, 5, 6};
     const size_t rows = 40;
 
-    PackedVector<Columns> vec(rows, widths);
+    packed_vector<Columns> vec(rows, widths);
     assert(vec.rows() == rows);
     assert(vec.cols() == NumCols);
 
@@ -202,7 +204,7 @@ void test_packed_matrix_aligned_basic() {
     const array<uchar, NumCols> widths{3, 5, 9};
     const size_t rows = 32;
 
-    PackedMatrixAligned<NumCols> m(rows, widths);
+    packed_matrix_aligned<NumCols> m(rows, widths);
     assert(m.rows() == rows);
     assert(m.cols() == NumCols);
 
@@ -227,7 +229,7 @@ void test_int_vector_aligned() {
     const size_t rows = 48;
     const uchar width = 11; // values < 2048
 
-    IntVectorAligned v(rows, width);
+    int_vector_aligned v(rows, width);
     for (size_t i = 0; i < rows; ++i) {
         ulint val = static_cast<ulint>((i * 9) % (1u << width));
         v.set(i, val);
@@ -247,7 +249,7 @@ void test_int_vector_aligned_vector_ctor_non_empty() {
         data.push_back(static_cast<ulint>((i * 17) ^ (i >> 1)));
     }
 
-    IntVectorAligned v(data);
+    int_vector_aligned v(data);
     assert(v.rows() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         assert(v.get(i) == data[i]);
@@ -256,7 +258,7 @@ void test_int_vector_aligned_vector_ctor_non_empty() {
 
 void test_int_vector_aligned_vector_ctor_empty() {
     std::vector<ulint> data;
-    IntVectorAligned v(data);
+    int_vector_aligned v(data);
     assert(v.rows() == 0);
 }
 
@@ -265,19 +267,19 @@ void test_int_vector_aligned_vector_width_ctor() {
     std::vector<ulint> data = {0, 100, 500, 1023}; // fits in 10 bits
     const uchar width = 10;
 
-    IntVectorAligned v(data, width);
+    int_vector_aligned v(data, width);
     assert(v.rows() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         assert(v.get(i) == data[i]);
     }
 }
 
-// Iterator tests for IntVectorAligned: mutable and const access.
+// Iterator tests for int_vector_aligned: mutable and const access.
 void test_int_vector_aligned_iterators() {
     const size_t rows = 40;
     const uchar width = 12;
 
-    IntVectorAligned v(rows, width);
+    int_vector_aligned v(rows, width);
 
     // Use std::iota to fill via iterators.
     std::iota(v.begin(), v.end(), static_cast<ulint>(0));
@@ -298,7 +300,7 @@ void test_int_vector_aligned_iterators() {
     }
 
     // Const iteration over aligned vector.
-    const IntVectorAligned& cv = v;
+    const int_vector_aligned& cv = v;
     size_t idx = 0;
     for (auto x : cv) {
         assert(x == cv.get(idx));
@@ -307,12 +309,12 @@ void test_int_vector_aligned_iterators() {
     assert(idx == rows);
 }
 
-// Round-trip serialize/load for IntVectorAligned.
+// Round-trip serialize/load for int_vector_aligned.
 void test_int_vector_aligned_serialize_roundtrip() {
     const size_t rows = 32;
     const uchar width = 9; // values < 512
 
-    IntVectorAligned v(rows, width);
+    int_vector_aligned v(rows, width);
     for (size_t i = 0; i < rows; ++i) {
         ulint val = static_cast<ulint>((i * 13) % (1u << width));
         v.set(i, val);
@@ -322,7 +324,7 @@ void test_int_vector_aligned_serialize_roundtrip() {
     size_t bytes_written = v.serialize(ss);
     assert(bytes_written > 0);
 
-    IntVectorAligned loaded;
+    int_vector_aligned loaded;
     loaded.load(ss);
     assert(loaded.rows() == rows);
 
@@ -343,7 +345,7 @@ void test_packed_vector_aligned_with_enum() {
     const array<uchar, NumCols> widths{6, 10};
     const size_t rows = 37;
 
-    PackedVectorAligned<Columns> vec(rows, widths);
+    packed_vector_aligned<Columns> vec(rows, widths);
     assert(vec.rows() == rows);
     assert(vec.cols() == NumCols);
 
