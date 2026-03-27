@@ -8,14 +8,41 @@ Described in greater detail at [https://arxiv.org/abs/2602.11029](https://arxiv.
 
 Alpha Version 0.4.0
 
+## Quick Start
+
+`orbit::permutation` is the generic implementation allowing storage of user defined fields alongside a runny permutation.
+
+Consider this runny permutation example:
+
+<img width="598" height="572" alt="Image" src="https://github.com/user-attachments/assets/18933a68-b858-40eb-bfb3-f5fd758557d6" />
+
+We pass the lengths of contiguously permuted intervals and the permutation of their first values (images):
+```cpp
+#include "orbit/permutation.hpp"
+
+// Create a run-length permutation
+// Length of contiguously permuted intervals
+std::vector<unsigned long int> lengths = {2, 3, 1,  2, 2,  1, 1,  1, 3};
+// Permutation at head of each intervals
+std::vector<unsigned long int> images  = {1, 9, 3, 12, 4, 14, 0, 15, 6};   
+```
+
+These can be used to build a permutation object, which permits efficient navigation:
+```cpp
+orbit:permutation perm(lengths, images);
+auto pos = perm.first();
+pos.next();
+...
+```
+
 ## Overview
 
 Orbit provides compact representations of run-length encoded permutations, with specialized implementations for various indexing applications. The core permutation logic is stored in a move structure. The library offers four main components:
 
 - **Permutation**: Core run-length permutation data structure allowing user defined fields stored alongside permutation intervals.
-- **RLBWT**: Specialized RLBWT permutations (LF/FL and $\Phi$/$\Phi^{-1}$) built on Permutation.
+- **RLBWT**: Specialized RLBWT permutations (LF/FL and $\phi$ / $\phi^{-1}$) built on permutation features above.
 - **Move Structure**: Move structure implementation, foundation of above methods.
-- **Interval Encoding**: Decomposition into contigiously permuted intervals, used to construct above. Allows independent use of splitting algorithms such as length capping and balancing.
+- **Interval Encoding**: Decomposition into contigiously permuted intervals, used to construct above methods. Allows independent use of splitting algorithms such as length capping and balancing.
 
 ## Features
 
@@ -25,11 +52,11 @@ Orbit provides compact representations of run-length encoded permutations, with 
 - **Splitting Schemes**: Optimization schemes for length capping and balancing providing faster and smaller move structures.
 - **RLBWT Specializations**:
   - LF/FL navigation with character access.
-  - $\Phi$/$\Phi^{-1}$ navigation with SA retrieval.
-  - Helpers to derive $\Phi$/$\Phi^{-1}$ permutations from RLBWT.
+  - $\phi$ / $\phi^{-1}$ navigation with SA retrieval.
+  - Helpers to derive $\phi$ / $\phi^{-1}$ permutations from RLBWT in $O(n)$-time and $O(r)$-space.
 - **Flexible Configuration**: Multiple template parameters for various move structure representations.
 
-## Quick Start
+## Guide
 
 ### Installation
 
@@ -37,7 +64,7 @@ This library is header-only. Just add `include/` to your compiler's include path
 
 - `permutation.hpp` loads ``orbit::permutation``.
 - `move_structure.hpp` loads the underlying ``orbit::move_structure`` implementation only.
-- `rlbwt.hpp` loads specialized classes to represent LF/FL and $\Phi$/$\Phi^{-1}$. These are ``orbit::rlbwt::lf_permutation``, ``orbit::rlbwt::fl_permutation``, ``orbit::rlbwt::phi_permutation``, and ``orbit::rlbwt::phi_inv_permutation``.
+- `rlbwt.hpp` loads specialized classes to represent LF/FL and $\phi$ / $\phi^{-1}$. These are ``orbit::rlbwt::lf_permutation``, ``orbit::rlbwt::fl_permutation``, ``orbit::rlbwt::phi_permutation``, and ``orbit::rlbwt::phi_inv_permutation``.
 - ``interval_encoding.hpp`` loads ``orbit:interval_encoding`` which converts a permutation into its run/interval length encoding with option to apply splitting algorithms.
 
 The provided `makefile` only builds example/test executables:
@@ -50,35 +77,11 @@ The provided `makefile` only builds example/test executables:
 
 #### Permutation
 
-`orbit::permutation` is the generic implementation allowing storage of user defined fields alongside a runny permutation, included with `permutation.hpp`. Some small examples are given in the provided `examples/example.cpp` file.
-
-Consider this runny permutation example:
-<img width="598" height="572" alt="Image" src="https://github.com/user-attachments/assets/18933a68-b858-40eb-bfb3-f5fd758557d6" />
-
-
-We pass the lengths of contiguously permuted intervals and the permutation of their first values (images):
-
-```cpp
-#include "orbit/permutation.hpp"
-
-// Create a run-length permutation
-// Length of contiguously permuted intervals
-std::vector<unsigned long int> lengths = {2, 3, 1,  2, 2,  1, 1,  1, 3};
-// Permutation at head of each intervals
-std::vector<unsigned long int> images  = {1, 9, 3, 12, 4, 14, 0, 15, 6};   
-```
-
-These can be used to build a permutation object, which permits efficient navigation:
-```
-orbit:permutation perm(lengths, images);
-auto pos = perm.first();
-pos.next();
-...
-```
+See quick start above! Included with `orbit/permutation.hpp` where further documentation is found. Some small examples are given in the provided `examples/example.cpp` file.
 
 #### Data Columns
 
-We cam also define the number of columns of additional data to store alongside the permutation intervals. This is made easier with a macro:
+We can also define the number of columns of additional data to store alongside the permutation intervals. This is made easier with a macro:
 
 ```cpp
 DEFINE_ORBIT_COLUMNS(data_cols, VAL1, VAL2)
@@ -107,28 +110,28 @@ std::vector<data_tuple> run_data(lengths.size());
 Given this information, we pass the user defined run columns to construct a runny permutation:
 
 ```cpp
-orbit::permutation<data_cols> metadata_perm(lengths, permutation, run_data);
+orbit::permutation<data_cols> meta_perm(lengths, permutation, run_data);
 ```
 
 Finally, we use the position object to navigate the permutation and access data:
 
 ```cpp
 using position = typename orbit::permutation<data_cols>::position
-position pos = rp.first(); // start from 0
-unsigned long int some_data = metadata_perm.get<data_cols::VAL1>(pos);
-pos = rp.next(pos); // move one permutation step
-unsigned long int other_data = metadata_perm.get<data_cols::VAL2>(pos);
+position pos = meta_perm.first(); // start from 0
+unsigned long int some_data = meta_perm.get<data_cols::VAL1>(pos);
+pos = meta_perm.next(pos); // move one permutation step
+unsigned long int other_data = meta_perm.get<data_cols::VAL2>(pos);
 ```
 
 #### Interval Splitting
-When we build a permutation object without data columns, default splitting is used. Where a run refers to a contigiously permuted subsequence of the permutation of maximal height, an interval is a potential non-maximal sub-run found by splitting runs/intervals. Given this example:
+When we build a permutation object without data columns, default splitting is used. Where a run refers to a maximal contigiously permuted subsequence, an interval is a potentially non-maximal (sub-run) found by splitting runs/intervals. Given this example:
 
 ```cpp
 std::vector<unsigned long int> lengths = {2, 3, 1,  2, 2,  1, 1,  1, 3};
 std::vector<unsigned long int> images  = {1, 9, 3, 12, 4, 14, 0, 15, 6};
 orbit::permutation perm(lengths, images);
 // This is equivalent to
-orbit::permutation perm(lengths, images, orbit::split_parameters());
+orbit::permutation perm(lengths, images, orbit::split_params());
 ```
 The underlying representation may have more intervals than original runs due to under the hood optimizations which make the Orbit library powerful. Thus, we find that these values may be different:
 ```cpp
@@ -149,7 +152,10 @@ orbit::permutation perm(lengths, images, run_data, orbit::NO_SPLITTING);
 
 This is because it is not obvious if user specified data can be preserved when a run/interval is split. If a user specifies some splitting parameters, data is copied on split, meaning both new intervals contain the same data values as the former before splitting.
 ```cpp
-orbit::permutation perm(lengths, images, run_data, orbit::split_params);
+// Same as passing orbit::split_params(), the default
+orbit::permutation perm(lengths, images, run_data, orbit::split_params(8.0, 16)); // Length cap, balance with param 8/16 resp.
+orbit::permutation perm(lengths, images, run_data, orbit::split_params(8.0, std::nullopt)); // Length cap, no balancing
+orbit::permutation perm(lengths, images, run_data, orbit::split_params(std::nullopt, 16)); // Balancing, no length capping
 ```
 
 If a user desires splitting but data cannot be trivially copied, they should first build the interval encoding which contains the final intervals and their lengths. Users can then manually amend their data values before constructing from the encoding:
@@ -188,7 +194,7 @@ orbit::rlbwt:fl_permutation fl(bwt_heads, bwt_run_lengths);
 ...
 ```
 
-#### RLBWT: Phi/phi_inv
+#### RLBWT: $\phi$ / $\phi^{-1}$
 
 By including `orbit/rlbwt.hpp`, we can also build the permutations from an RLBWT for $\phi$ and $\phi^{-1}$ needed for locate queries.
 
@@ -229,6 +235,8 @@ The main class for run-length encoded permutations with move structure integrati
 - **Absolute vs Relative Positions**: Absolute positions enable full permutation positional information but increase memory usage. The space usage is, for a runny permutation of $r$ runs over domain $n$ is approximately:
   - **Absolute**: $r \log r + 2 r \log n$ bits
   - **Relative**: $r \log r + 2 r \log \frac{n}{r}$ bits
+- **Length Capping**: Can greatly reduce the size of the data structure, especially for relative positions. Also gives amortized guarantees and practical speed up when tuned correctly. Where length capping factor is $c$, splits any runs/intervals longer than $c$ times the average run length of the original permutation.
+- **Balancing**: Where $\alpha$ is the balancing factor, guarantees less than $2\alpha$ complexity for a single permutation step. However, can increase the size of the data structures due to splitting intervals if not tuned correctly. Length capping and balancing often work well together.
 
 ### Dependencies
 
