@@ -89,12 +89,6 @@ inline constexpr size_t num_columns() noexcept {
 template<class E, typename T = ulint>
 using columns_tuple = std::array<T, num_columns<E>()>;
 
-// Defines a macro to generate an enum class named <enum_name> with specified fields, 
-// and appends COUNT as the last enumerator for sizing.
-// Usage: DEFINE_ORBIT_COLUMNS(MyEnum, FIELD1, FIELD2, FIELD3)
-#define DEFINE_ORBIT_COLUMNS(enum_name, ...) \
-    enum class enum_name { __VA_ARGS__, COUNT };
-
 #define MOVE_CLASS_TRAITS(columns_param) \
     using columns = columns_param; \
     template<typename C> \
@@ -104,5 +98,11 @@ using columns_tuple = std::array<T, num_columns<E>()>;
     template<typename E> static constexpr columns to_cols(E e) { return static_cast<columns>(e); }
 
 } // namespace orbit
+
+// Defines a macro to generate an enum class named <enum_name> with specified fields, 
+// and appends COUNT as the last enumerator for sizing.
+// Usage: DEFINE_ORBIT_COLUMNS(MyEnum, FIELD1, FIELD2, FIELD3)
+#define DEFINE_ORBIT_COLUMNS(enum_name, ...) \
+    enum class enum_name { __VA_ARGS__, COUNT };
 
 #endif /* end of include guard: _COMMON_HPP */
