@@ -1,6 +1,6 @@
 # Orbit
 
-$O(r)$ bitpacked (Orbit) move structures for runny permutations! 
+$O(r)$-space bitpacked (Orbit) move structures for runny permutations! 
 
 Flexible plug-and-play header library implementing compact data structures for representing run-length encoded permutations. Since permutations decompose into cycles, navigation becomes a literal orbit, stepping through positions as if circling an encapsulated world. Engineered for compactness, Orbit features $O(r)$-space bitpacked move structures and specialized RLBWT implementations for high-performance indexing. Can be used as a foundation for further applications, providing storage and retrieval of user fields alongside the permutation intervals. Further, powerful splitting optimizations such as length capping and balancing are implemented. 
 
