@@ -82,6 +82,10 @@ template<typename data_columns_t = empty_data_columns,
          bool integrated_move_structure = DEFAULT_INTEGRATED_MOVE_STRUCTURE,
          bool store_absolute_positions = DEFAULT_STORE_ABSOLUTE_POSITIONS>
 using runperm = permutation<data_columns_t, integrated_move_structure, store_absolute_positions>;
+template<typename data_columns_t = empty_data_columns,
+         bool integrated_move_structure = DEFAULT_INTEGRATED_MOVE_STRUCTURE,
+         bool store_absolute_positions = DEFAULT_STORE_ABSOLUTE_POSITIONS>
+using RunPerm = permutation<data_columns_t, integrated_move_structure, store_absolute_positions>;
 template<typename data_columns_t = empty_data_columns>
 using runperm_separated = permutation_separated<data_columns_t>;
 template<typename data_columns_t = empty_data_columns>
@@ -178,6 +182,8 @@ using move_permutation_relative = move_permutation<false>; // Same as move_permu
 // Alpha release aliases
 template<bool store_absolute_positions = DEFAULT_STORE_ABSOLUTE_POSITIONS>
 using moveperm = move_permutation<store_absolute_positions>;
+template<bool store_absolute_positions = DEFAULT_STORE_ABSOLUTE_POSITIONS>
+using MovePerm = move_permutation<store_absolute_positions>;
 using moveperm_absolute = move_permutation_absolute;
 using moveperm_relative = move_permutation_relative;
 
