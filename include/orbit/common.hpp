@@ -31,7 +31,7 @@ inline constexpr size_t DEFAULT_BYTES = 4;
 
 inline constexpr size_t VERSION_MAJOR = 0;
 inline constexpr size_t VERSION_MINOR = 4;
-inline constexpr size_t VERSION_PATCH = 0;
+inline constexpr size_t VERSION_PATCH = 1;
 
 inline size_t serialize_version(std::ostream& out) {
     size_t written_bytes = 0;
