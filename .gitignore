@@ -70,3 +70,15 @@ Testing/
 
 # compiled executables
 example
+
+# App / local (ms branch)
+ms_test
+tsv_load_test
+.cursor
+.vscode
+*.dSYM
+related_papers
+slides
+prompts
+design_thoughts
+old
