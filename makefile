@@ -11,23 +11,22 @@ INTEGRATION_BUILD_DIR = $(BUILD_DIR)/integration
 BENCH_BUILD_DIR = $(BUILD_DIR)/bench
 
 # High-level targets
-# - all: build all unit/integration tests + benchmarks + examples
-# - test: build unit/integration tests and run them
+# - all: build all unit/integration tests + benchmarks + examples + ms + bi
+# - test: build unit/integration tests and run them, then ms and bi app tests
 # - bench: build benchmarks
 # - examples: build examples
 # - clean: clean build files
-# - debug: build with debug symbols
+# - debug: library/tests/example via CXXFLAGS += -g -O0 then all; ms/bi via subdir `make debug`
 
-# make help: print this help message
 help:
 	@echo "Usage: make [target]"
 	@echo "Targets:"
-	@echo "  all: build all unit/integration tests + benchmarks + examples"
-	@echo "  examples: build examples"
-	@echo "  test: build unit/integration tests and run them"
+	@echo "  all: build unit/integration tests + benchmarks + examples + ms + bi"
+	@echo "  examples: build examples (example target)"
+	@echo "  test: run library tests then ./src/ms/ms and ./src/bi/bi tests"
 	@echo "  bench: build benchmarks"
 	@echo "  clean: clean build files"
-	@echo "  debug: build with debug symbols"
+	@echo "  debug: debug build (root tests/example + src/ms + src/bi)"
 
 UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test \
              $(UNIT_BUILD_DIR)/alphabet_test \
@@ -54,12 +53,20 @@ BENCH_TESTS = $(BENCH_BUILD_DIR)/move_bench \
               $(BENCH_BUILD_DIR)/permutation_bench \
               $(BENCH_BUILD_DIR)/rlbwt_bench
 
-all: $(UNIT_TESTS) $(INTEGRATION_TESTS) $(BENCH_TESTS) example
+.PHONY: ms bi example all test bench clean debug help
+
+all: $(UNIT_TESTS) $(INTEGRATION_TESTS) $(BENCH_TESTS) example ms bi
 
 example: examples/example.cpp examples/example.hpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
+ms:
+	$(MAKE) -C src/ms
+
+bi:
+	$(MAKE) -C src/bi
+
+test: $(UNIT_TESTS) $(INTEGRATION_TESTS) ms bi
 	$(UNIT_BUILD_DIR)/packed_vector_test
 	$(UNIT_BUILD_DIR)/alphabet_test
 	$(UNIT_BUILD_DIR)/columns_test
@@ -81,8 +88,10 @@ test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(INTEGRATION_BUILD_DIR)/move_structure_test
 	$(INTEGRATION_BUILD_DIR)/move_test
 	$(INTEGRATION_BUILD_DIR)/permutation_test
+	./src/ms/ms test data
+	./src/bi/bi test data
 	@echo "==============================================="
-	@echo "     All unit and integration tests passed"
+	@echo "     All unit, integration, and app tests passed"
 	@echo "==============================================="
 
 bench: $(BENCH_TESTS)
@@ -186,11 +195,14 @@ $(BENCH_BUILD_DIR)/rlbwt_bench: ./tests/benchmark/rlbwt_bench.cpp $(HEADERS)
 	mkdir -p $(BENCH_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-.PHONY: debug
+# Root tests/benchmarks/example pick up -g -O0 via target-specific CXXFLAGS; ms/bi use their own Makefiles.
 debug: CXXFLAGS += -g -O0
 debug: all
+	$(MAKE) -C src/ms debug
+	$(MAKE) -C src/bi debug
 
-# Clean up build files
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f example
+	$(MAKE) -C src/ms clean
+	$(MAKE) -C src/bi clean
