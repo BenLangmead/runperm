@@ -533,11 +533,23 @@ bool test_rlbwt_input_path(const std::string& data_dir) {
     assert(ok && "load_rlbwt must succeed");
     assert(lens == tsv_lens);
 
+    // Round-trip the retained pairs through a TLMSM minima file, the form
+    // TeraLCP -ominima writes.
+    ulint n = 0;
+    for (ulint l : lens) n += l;
+    auto pairs = retained_lcp_pairs(lcps_per_run, true);
+    const std::string mp = data_dir + "/.ms_test_rlbwt.min";
+    assert(rlbwt_io::write_minima(mp, pairs, n));
+    std::vector<RunLcpPairs> read_back;
+    ok = rlbwt_io::read_minima(mp, heads.size(), n, read_back, err);
+    std::remove(mp.c_str());
+    assert(ok && read_back == pairs && "minima file must round-trip");
+
     ms_io::BuildOptions o;
     o.minima_only = true; o.percentile_k = 0.9; o.coalesce = true; o.spill_split_bits = 6;
     auto from_tsv = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
     auto [run_data, spill_vectors, max_top, max_sub, skinny, jumbo] = build_spill_data_from_pairs(
-        retained_lcp_pairs(lcps_per_run, true), o.percentile_k, o.coalesce, false, o.spill_align, o.spill_split_bits);
+        std::move(read_back), o.percentile_k, o.coalesce, false, o.spill_align, o.spill_split_bits);
     MSIndexSpillLCP<false> from_rlbwt(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub,
                                       o.spill_align, o.spill_split_bits);
     const std::string T = reconstruct_text(*from_tsv);

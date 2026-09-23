@@ -11,6 +11,7 @@
 #include "serialize.hpp"
 #include "inspect.hpp"
 #include "ms_test.hpp"
+#include "rlbwt_io.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -29,6 +30,10 @@ static void usage(const char* prog) {
               << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
               << "            [--minima-only]\n"
               << "              Build index from TSV.\n"
+              << "  build-rlbwt HEADS LENS MINIMA INDEX_PATH [--percentile K]\n"
+              << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
+              << "              Build index from an RLBWT (HEADS: one byte per run; LENS:\n"
+              << "              fixed-width little-endian lengths) and a TeraLCP -ominima file.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output]\n"
@@ -304,6 +309,51 @@ int main(int argc, char** argv) {
             std::cout << ms[i];
         }
         std::cout << "]\n";
+        return 0;
+    }
+
+    if (cmd == "build-rlbwt") {
+        if (argc < 4) {
+            std::cerr << "build-rlbwt requires HEADS, LENS, MINIMA and INDEX_PATH\n";
+            return 1;
+        }
+        const std::string heads_path = argv[0], lens_path = argv[1], minima_path = argv[2], idx_path = argv[3];
+        double percentile_k = 0.98;
+        bool coalesce = false;
+        ulint spill_align = 0;
+        uchar spill_split_bits = 0;
+        for (int i = 4; i < argc; ++i) {
+            if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) percentile_k = std::stod(argv[++i]);
+            else if (strcmp(argv[i], "--coalesce-spillover") == 0) coalesce = true;
+            else if (strcmp(argv[i], "--spill-align") == 0 && i + 1 < argc) spill_align = std::stoull(argv[++i]);
+            else if (strcmp(argv[i], "--spill-split-bits") == 0 && i + 1 < argc)
+                spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
+            else { std::cerr << "Unknown build-rlbwt option: " << argv[i] << "\n"; return 1; }
+        }
+        std::vector<uchar> heads;
+        std::vector<ulint> lens;
+        std::vector<RunLcpPairs> pairs;
+        std::string err;
+        if (!rlbwt_io::load_rlbwt(heads_path, lens_path, heads, lens, err)) {
+            std::cerr << "Failed to load RLBWT: " << err << "\n";
+            return 1;
+        }
+        ulint n = 0;
+        for (ulint l : lens) n += l;
+        if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
+            std::cerr << "Failed to load minima: " << err << "\n";
+            return 1;
+        }
+        auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
+            build_spill_data_from_pairs(std::move(pairs), percentile_k, coalesce, false, spill_align, spill_split_bits);
+        MSIndexSpillLCP<false> idx(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub, spill_align,
+                                   spill_split_bits);
+        if (!ms_serialize::write_index(idx_path, idx)) {
+            std::cerr << "Failed to write index: " << idx_path << "\n";
+            return 1;
+        }
+        std::cout << "Built index: " << idx_path << " (runs=" << heads.size() << ", n=" << n
+                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ")\n";
         return 0;
     }
 
