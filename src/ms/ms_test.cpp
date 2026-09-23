@@ -408,6 +408,92 @@ bool test_ms_query_vs_naive_tsv_reposition(const std::string& data_dir) {
 }
 
 /**
+ * Naive matching statistics using a binary search on each match length.  This
+ * is valid because every prefix of an occurring string also occurs.  Much
+ * faster than naive_matching_statistics for long texts.
+ */
+static std::vector<ulint> naive_matching_statistics_bsearch(const std::string& T, const std::string& P) {
+    std::vector<ulint> ms(P.size(), 0);
+    for (size_t i = 0; i < P.size(); ++i) {
+        size_t lo = 0, hi = P.size() - i;
+        while (lo < hi) {
+            size_t mid = (lo + hi + 1) / 2;
+            if (T.find(P.data() + i, 0, mid) != std::string::npos) lo = mid;
+            else hi = mid - 1;
+        }
+        ms[i] = static_cast<ulint>(lo);
+    }
+    return ms;
+}
+
+/**
+ * Test ms_query vs naive matching statistics on substrings of the text with
+ * random substitutions, across build options.  Unlike the exact-substring
+ * tests above, these patterns force repositioning, so the LCP values read
+ * from the spillover arrays determine the answer.
+ */
+bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
+    std::cout << "Testing ms_query vs naive (mutated patterns, several build options)" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    auto base = ms_io::build_ms_index_spill_from_tsv<false>(path);
+    if (!base) {
+        std::cout << "  DID NOT RUN" << std::endl;
+        return false;
+    }
+    const std::string T = reconstruct_text(*base);
+    std::mt19937 rng(2026);
+    const int num_patterns = 25;
+    const size_t pattern_len = 100;
+    const double sub_rate = 0.03;
+    const std::string dna = "ACGT";
+    std::vector<std::string> patterns;
+    std::vector<std::vector<ulint>> truth;
+    std::uniform_int_distribution<size_t> start_dist(0, T.size() - pattern_len);
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    std::uniform_int_distribution<int> shift_dist(1, 3);
+    for (int k = 0; k < num_patterns; ++k) {
+        std::string P = T.substr(start_dist(rng), pattern_len);
+        for (auto& c : P)
+            if (unif(rng) < sub_rate)
+                c = dna[(dna.find(c) + shift_dist(rng)) % 4];
+        truth.push_back(naive_matching_statistics_bsearch(T, P));
+        patterns.push_back(std::move(P));
+    }
+
+    struct Config { const char* name; ms_io::BuildOptions opts; };
+    std::vector<Config> configs;
+    auto add = [&](const char* name, bool coalesce, ulint align, uchar split_bits, ulint split_threshold) {
+        ms_io::BuildOptions o;
+        o.coalesce = coalesce;
+        o.spill_align = align;
+        o.spill_split_bits = split_bits;
+        o.split_threshold = split_threshold;
+        configs.push_back({name, o});
+    };
+    add("base", false, 0, 0, SPLIT_THRESHOLD_NEVER);
+    add("align4", false, 4, 0, SPLIT_THRESHOLD_NEVER);
+    add("coalesce", true, 0, 0, SPLIT_THRESHOLD_NEVER);
+    add("coalesce+align2", true, 2, 0, SPLIT_THRESHOLD_NEVER);
+    add("coalesce+align4", true, 4, 0, SPLIT_THRESHOLD_NEVER);
+    add("coalesce+align8+splitbits2", true, 8, 2, SPLIT_THRESHOLD_NEVER);
+    add("coalesce+split1+align4", true, 4, 0, 1);
+
+    for (const auto& cfg : configs) {
+        auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, cfg.opts);
+        assert(idx && "index build must succeed");
+        for (size_t k = 0; k < patterns.size(); ++k) {
+            auto ms_idx = ms_query(*idx, patterns[k]);
+            if (ms_idx != truth[k]) {
+                std::cout << "  FAILED for " << cfg.name << " on pattern " << patterns[k] << std::endl;
+                assert(false && "index must match naive on mutated patterns");
+            }
+        }
+        std::cout << "  " << cfg.name << " PASSED" << std::endl;
+    }
+    return true;
+}
+
+/**
  * Compare two indexes by running ms_query on many extract_errory_string patterns
  * and asserting identical matching statistics. Uses extractor for pattern generation.
  */
@@ -587,6 +673,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_multispill_vs_naive_discrepant(data_dir, 2)) all_ran = false;
     std::cout << std::endl;
     if (!test_coalesce_spillover_from_tsv(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!test_ms_query_vs_naive_mutated(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (all_ran) {
         std::cout << "All ms_test checks PASSED" << std::endl;

@@ -275,7 +275,7 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
                  uchar spill_split_bits = 0)
 {
     if (coalesce_lcp_separately && spill_align > 0)
-        throw std::invalid_argument("coalescing LCPs seprately is not compatible with coalesce-spillover");
+        throw std::invalid_argument("coalescing LCPs separately is not compatible with spill-align");
     const size_t r = lcps_per_run.size();
     size_t skinny_count = 0, jumbo_count = 0;
     std::vector<ulint> all_top, all_sub;
@@ -406,8 +406,11 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
                 if (it != jumbo_p->end())
                     run_data[i][2] = static_cast<ulint>(it->second);
                 else {
-                    size_t off_head = append_payload(bucket, p_head);
-                    size_t off_lcp = append_payload(bucket, p_lcp);
+                    // Readers decode the head and then the LCP record at the
+                    // next byte, so the two must be contiguous with no
+                    // alignment padding between them.
+                    size_t off_head = append_payload(bucket, p_full);
+                    size_t off_lcp = off_head + p_head.size();
                     ulint stored = static_cast<ulint>(off_head / align_x);
                     run_data[i][2] = stored;
                     (*jumbo_p)[std::move(p_full)] = stored;
