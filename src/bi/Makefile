@@ -4,7 +4,9 @@ CXXFLAGS = -std=c++17 -I../../include -I. -I../ms -O3
 
 BI_SRCS = bi.cpp bi_test.cpp bi_io.cpp ../ms/tsv.cpp
 
-bi: $(BI_SRCS)
+BI_HDRS = $(wildcard *.hpp ../ms/*.hpp) $(shell find ../../include -name '*.hpp')
+
+bi: $(BI_SRCS) $(BI_HDRS)
 	$(CXX) $(CXXFLAGS) -o bi $(BI_SRCS)
 
 # Debug build: -O0 -g for breakpoints (e.g. lldb ./bi, then run test)
