@@ -295,7 +295,33 @@ inline ulint max_for_bits(uchar w) {
 }
 
 /**
- * Build the full spillover data for the index.
+ * Per-run retained LCPs as (offset, value) pairs: element 0 is (0, top LCP)
+ * and the rest are the stored interior values in increasing offset order.
+ */
+using RunLcpPairs = std::vector<std::pair<ulint, ulint>>;
+
+/**
+ * Reduce full per-row LCP vectors to the retained pairs of each run (see
+ * lcp_keep_mask for which interior values are kept).
+ */
+inline std::vector<RunLcpPairs>
+retained_lcp_pairs(const std::vector<std::vector<ulint>>& lcps_per_run, bool minima_only = false) {
+    const size_t r = lcps_per_run.size();
+    std::vector<RunLcpPairs> all_pairs(r);
+    std::vector<ulint> full;
+    for (size_t i = 0; i < r; ++i) {
+        const std::vector<ulint>* next = (i + 1 < r) ? &lcps_per_run[i + 1] : nullptr;
+        full.clear();
+        compress_lcps(lcps_per_run[i], next, full, minima_only);
+        all_pairs[i] = detail::compressed_to_pairs(full);
+    }
+    return all_pairs;
+}
+
+/**
+ * Build the full spillover data for the index from each run's retained LCP
+ * pairs (as produced by retained_lcp_pairs, or read from a TeraLCP minima
+ * file).
  * spill_align: 0=none, else align chunks to multiples of spill_align bytes.
  * spill_split_bits: X LSBs of row index select which spillover array (0=single array).
  * spill_off is stored as byte_offset / spill_align to save bits.
@@ -303,28 +329,21 @@ inline ulint max_for_bits(uchar w) {
 inline std::tuple<
     std::vector<std::array<ulint, static_cast<size_t>(LCPSpillRunCols::COUNT)>>,
     std::vector<SpilloverVector>, ulint, ulint, size_t, size_t>
-build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
-                 double percentile_k = 0.98,
-                 bool coalesce_spillover = false,
-                 bool coalesce_lcp_separately = false,
-                 ulint split_threshold = SPLIT_THRESHOLD_NEVER,
-                 ulint spill_align = 0,
-                 uchar spill_split_bits = 0,
-                 bool minima_only = false)
+build_spill_data_from_pairs(std::vector<RunLcpPairs> all_pairs,
+                            double percentile_k = 0.98,
+                            bool coalesce_spillover = false,
+                            bool coalesce_lcp_separately = false,
+                            ulint spill_align = 0,
+                            uchar spill_split_bits = 0)
 {
     if (coalesce_lcp_separately && spill_align > 0)
         throw std::invalid_argument("coalescing LCPs separately is not compatible with spill-align");
-    const size_t r = lcps_per_run.size();
+    const size_t r = all_pairs.size();
     size_t skinny_count = 0, jumbo_count = 0;
     std::vector<ulint> all_top, all_sub;
-    std::vector<std::vector<std::pair<ulint, ulint>>> all_pairs(r);
-    std::vector<ulint> full;
 
     for (size_t i = 0; i < r; ++i) {
-        const std::vector<ulint>* next = (i + 1 < r) ? &lcps_per_run[i + 1] : nullptr;
-        full.clear();
-        compress_lcps(lcps_per_run[i], next, full, minima_only);
-        auto pairs = detail::compressed_to_pairs(full);
+        const auto& pairs = all_pairs[i];
         assert(!pairs.empty());
         if (pairs.size() == 1) {
             all_top.push_back(pairs[0].second);
@@ -338,7 +357,6 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
             all_top.push_back(pairs[0].second);
             all_sub.push_back(sub);
         }
-        all_pairs[i] = std::move(pairs);
     }
 
     ulint p_top = detail::percentile(all_top, percentile_k);
@@ -463,6 +481,29 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
         }
     }
     return {run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count};
+}
+
+/**
+ * Build the full spillover data for the index from full per-row LCP vectors.
+ * split_threshold is accepted for interface compatibility; splitting is
+ * applied beforehand by apply_lcp_splitting.
+ */
+inline std::tuple<
+    std::vector<std::array<ulint, static_cast<size_t>(LCPSpillRunCols::COUNT)>>,
+    std::vector<SpilloverVector>, ulint, ulint, size_t, size_t>
+build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
+                 double percentile_k = 0.98,
+                 bool coalesce_spillover = false,
+                 bool coalesce_lcp_separately = false,
+                 ulint split_threshold = SPLIT_THRESHOLD_NEVER,
+                 ulint spill_align = 0,
+                 uchar spill_split_bits = 0,
+                 bool minima_only = false)
+{
+    (void)split_threshold;
+    return build_spill_data_from_pairs(retained_lcp_pairs(lcps_per_run, minima_only), percentile_k,
+                                       coalesce_spillover, coalesce_lcp_separately, spill_align,
+                                       spill_split_bits);
 }
 
 enum class LCPRunCols { TOP_LCP, COUNT };
