@@ -456,6 +456,9 @@ bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
         for (auto& c : P)
             if (unif(rng) < sub_rate)
                 c = dna[(dna.find(c) + shift_dist(rng)) % 4];
+        // Every fifth pattern gets an N, which never occurs in the text: its
+        // statistic must be 0 and matching must restart to its left.
+        if (k % 5 == 0) P[P.size() / 2] = 'N';
         truth.push_back(naive_matching_statistics_bsearch(T, P));
         patterns.push_back(std::move(P));
     }

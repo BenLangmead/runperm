@@ -15,6 +15,10 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <chrono>
+#include <fstream>
+#include <memory>
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -27,6 +31,12 @@ static void usage(const char* prog) {
               << "              Build index from TSV.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
+              << "  batch      INDEX_PATH READS [-o OUT] [--no-output]\n"
+              << "              Load the index once and compute matching statistics for every\n"
+              << "              read in READS (FASTA, FASTQ, or one sequence per line; - for\n"
+              << "              stdin).  Writes one line per read: name, tab, space-separated\n"
+              << "              values.  --no-output skips writing (for timing).  A summary\n"
+              << "              with query time per base goes to stderr.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
               << "              Inspect index and optionally output spillover TSV.\n"
               << "  lcp-list   TSV_PATH\n"
@@ -43,6 +53,132 @@ static void usage(const char* prog) {
               << "                  Compare boundary/row_min/range_min for raw vs compressed vs index.\n"
               << "  probe-internal DATA_DIR FIRST_ROW LAST_ROW\n"
               << "                  Base index: decode spillover, verify 3 query types consistent.\n";
+}
+
+/**
+ * Streaming reader for FASTA, FASTQ, or one sequence per line, chosen by the
+ * first non-empty line.  Sequences are upper-cased; FASTA records may span
+ * several lines.
+ */
+class ReadStream {
+public:
+    explicit ReadStream(std::istream& in) : in_(in) {}
+
+    bool next(std::string& name, std::string& seq) {
+        name.clear();
+        seq.clear();
+        std::string line;
+        if (!have_line_) {
+            do {
+                if (!std::getline(in_, line)) return false;
+            } while (line.empty());
+            pending_ = line;
+            have_line_ = true;
+        }
+        if (format_ == 0) format_ = (pending_[0] == '>') ? 1 : (pending_[0] == '@') ? 2 : 3;
+        ++count_;
+        if (format_ == 3) {
+            seq = pending_;
+            name = "read" + std::to_string(count_);
+            have_line_ = false;
+        } else if (format_ == 2) {
+            name = header_name(pending_);
+            if (!std::getline(in_, seq)) return false;
+            std::getline(in_, line);  // +
+            std::getline(in_, line);  // qualities
+            have_line_ = false;
+        } else {
+            name = header_name(pending_);
+            have_line_ = false;
+            while (std::getline(in_, line)) {
+                if (!line.empty() && line[0] == '>') { pending_ = line; have_line_ = true; break; }
+                seq += line;
+            }
+        }
+        if (!seq.empty() && seq.back() == '\r') seq.pop_back();
+        for (auto& ch : seq) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return true;
+    }
+
+private:
+    static std::string header_name(const std::string& h) {
+        size_t end = h.find_first_of(" \t\r", 1);
+        return h.substr(1, end == std::string::npos ? std::string::npos : end - 1);
+    }
+    std::istream& in_;
+    std::string pending_;
+    bool have_line_ = false;
+    int format_ = 0;  // 1 FASTA, 2 FASTQ, 3 plain
+    size_t count_ = 0;
+};
+
+/** ms batch: load the index once, then compute matching statistics for every read. */
+static int run_batch(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "batch requires INDEX_PATH and READS\n";
+        return 1;
+    }
+    std::string idx_path = argv[0], reads_path = argv[1], out_path;
+    bool write_output = true;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
+        else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
+    }
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
+    auto opt = ms_serialize::read_index(idx_path);
+    if (!opt) {
+        std::cerr << "Failed to load index: " << idx_path << "\n";
+        return 1;
+    }
+    const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+
+    std::ifstream fin;
+    std::istream* in = &std::cin;
+    if (reads_path != "-") {
+        fin.open(reads_path);
+        if (!fin.good()) { std::cerr << "Failed to open reads: " << reads_path << "\n"; return 1; }
+        in = &fin;
+    }
+    std::ofstream fout;
+    std::ostream* out = &std::cout;
+    if (write_output && !out_path.empty()) {
+        fout.open(out_path);
+        if (!fout.good()) { std::cerr << "Failed to open output: " << out_path << "\n"; return 1; }
+        out = &fout;
+    }
+    std::ios::sync_with_stdio(false);
+
+    ReadStream reads(*in);
+    std::string name, seq, line;
+    size_t n_reads = 0, n_bases = 0;
+    double query_s = 0.0;
+    auto t_all = clock::now();
+    while (reads.next(name, seq)) {
+        auto tq = clock::now();
+        auto ms = ms_query(*opt, seq);
+        query_s += std::chrono::duration<double>(clock::now() - tq).count();
+        ++n_reads;
+        n_bases += seq.size();
+        if (!write_output) continue;
+        line.clear();
+        line += name;
+        line += '\t';
+        for (size_t i = 0; i < ms.size(); ++i) {
+            if (i > 0) line += ' ';
+            line += std::to_string(ms[i]);
+        }
+        line += '\n';
+        out->write(line.data(), static_cast<std::streamsize>(line.size()));
+    }
+    out->flush();
+    const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
+    std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases
+              << " index_load_s=" << load_s << " query_s=" << query_s
+              << " total_s=" << total_s
+              << " query_ns_per_base=" << (n_bases ? query_s * 1e9 / n_bases : 0.0) << "\n";
+    return 0;
 }
 
 /** Main entry point. */
@@ -169,6 +305,10 @@ int main(int argc, char** argv) {
         }
         std::cout << "]\n";
         return 0;
+    }
+
+    if (cmd == "batch") {
+        return run_batch(argc, argv);
     }
 
     if (cmd == "inspect") {

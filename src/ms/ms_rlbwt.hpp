@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <array>
 #include <tuple>
 #include <random>
 #include <stdexcept>
@@ -478,6 +479,7 @@ class MSIndexSpillLCP {
     ulint max_lcp_top_, max_lcp_min_sub_;
     ulint spill_align_;
     uchar spill_split_bits_;
+    std::array<bool, 256> occurs_{};  // occurs_[c]: byte c appears somewhere in the BWT
 
 public:
     using Position = typename IndexImpl::position;
@@ -493,7 +495,13 @@ public:
         , max_lcp_min_sub_(max_sub)
         , spill_align_(spill_align > 0 ? spill_align : 1)
         , spill_split_bits_(spill_split_bits)
-    {}
+    {
+        for (size_t i = 0; i < chars.size(); ++i)
+            if (lens[i] > 0) occurs_[chars[i]] = true;
+    }
+
+    /** True if byte c occurs in the indexed text. */
+    bool occurs(uchar c) const { return occurs_[c]; }
 
     ulint get_length(ulint i) const { return idx_.get_length(i); }
     ulint get_length(Position p) const { return idx_.get_length(p); }
@@ -648,6 +656,9 @@ inline std::optional<std::pair<typename Index::position, ulint>>
 reposition_with_lcp(Index& idx, ulint interval, ulint offset, uchar c) {
     using Position = typename Index::position;
     assert(idx.get_character(interval) != c);
+    // A character absent from the text can never be found by walking; say so
+    // at once instead of scanning the whole index.
+    if (!idx.occurs(c)) return std::nullopt;
     Position cur{interval, offset};
     const Position first_pos = idx.first();
     const Position last_pos = idx.last();
@@ -741,7 +752,13 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
         }
         // Case 2; note that reposition_with_lcp does the LF
         auto opt = reposition_with_lcp(idx, pos.interval, static_cast<ulint>(pos.offset), c);
-        if (!opt) return out;
+        if (!opt) {
+            // c does not occur in the text (for example N): no match can
+            // include this position, so the statistic is 0 and matching
+            // restarts from the current row.
+            out[i - 1] = match_len = 0;
+            continue;
+        }
         assert(opt->second != LCP_GAP);
         out[i - 1] = match_len = std::min(match_len, opt->second) + 1;
         pos = opt->first;
