@@ -9,6 +9,8 @@
 #include "ms_rlbwt.hpp"
 #include <iostream>
 #include <fstream>
+#include <set>
+#include <algorithm>
 
 namespace ms_inspect {
 
@@ -67,6 +69,66 @@ void run_inspect(MSIndexSpillLCP<false>& index) {
 
     std::cout << "  bytes per row (7 main-structure fields, not counting spillover): "
               << bytes_per_row << std::endl;
+    run_distribution(index);
+}
+
+/**
+ * Report how many interior (offset, value) pairs each run stores, and how the
+ * spillover bytes divide into distinct payloads versus alignment padding.
+ */
+void run_distribution(MSIndexSpillLCP<false>& index) {
+    const ulint r = index.move_runs();
+    const ulint max_top = index.max_lcp_top();
+    const ulint max_sub = index.max_lcp_min_sub();
+    std::vector<ulint> counts(r, 0);
+    size_t jumbo = 0, with_spill = 0;
+    // Distinct payloads, keyed by (array, byte offset), with their lengths.
+    std::set<std::pair<size_t, size_t>> seen;
+    size_t distinct_payload_bytes = 0;
+    for (ulint i = 0; i < r; ++i) {
+        ulint top = index.template get<LCPSpillRunCols::LCP_TOP>(i);
+        ulint sub = index.template get<LCPSpillRunCols::LCP_MIN_SUB>(i);
+        ulint so = index.template get<LCPSpillRunCols::LCP_SPILL>(i);
+        bool is_jumbo = (top == max_top && sub == max_sub);
+        if (is_jumbo) ++jumbo;
+        if (so == NO_SPILL) continue;
+        ++with_spill;
+        const auto& spill = index.spillover_for_row(i);
+        size_t start = index.spill_offset_bytes(so);
+        size_t p = start;
+        if (is_jumbo) { p = skip_uleb128(spill, p); p = skip_uleb128(spill, p); }
+        auto [n_int, np] = decode_uleb128(spill, p);
+        p = np;
+        for (ulint k = 0; k < n_int; ++k) { p = skip_uleb128(spill, p); p = skip_uleb128(spill, p); }
+        counts[i] = n_int;
+        size_t b = (index.spill_split_bits() > 0) ? (i & ((1ULL << index.spill_split_bits()) - 1)) : 0;
+        if (seen.insert({b, start}).second) distinct_payload_bytes += p - start;
+    }
+    std::vector<ulint> sorted = counts;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double q) { return sorted.empty() ? 0 : sorted[std::min(sorted.size() - 1, static_cast<size_t>(q * sorted.size()))]; };
+    ulint total = 0;
+    for (ulint c : counts) total += c;
+    const size_t spill_bytes = index.spillover_total_bytes();
+    std::cout << "Interior pairs per run\n";
+    std::cout << "  runs: " << r << ", jumbo: " << jumbo << ", with spillover: " << with_spill << "\n";
+    std::cout << "  pairs: " << total << " (" << (r ? (double)total / r : 0.0) << " per run)\n";
+    std::cout << "  percentiles p50/p90/p99/p99.9/max: " << pct(0.5) << "/" << pct(0.9) << "/"
+              << pct(0.99) << "/" << pct(0.999) << "/" << (sorted.empty() ? 0 : sorted.back()) << "\n";
+    const ulint edges[] = {0, 1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 1024};
+    std::cout << "  histogram (pairs: runs):";
+    ulint lo = 0;
+    for (ulint e : edges) {
+        size_t c = 0;
+        for (ulint v : counts) if (v >= lo && v <= e) ++c;
+        std::cout << " " << (lo == e ? std::to_string(e) : std::to_string(lo) + "-" + std::to_string(e)) << ":" << c;
+        lo = e + 1;
+    }
+    size_t c = 0;
+    for (ulint v : counts) if (v >= lo) ++c;
+    std::cout << " >" << (lo - 1) << ":" << c << "\n";
+    std::cout << "  spillover bytes: " << spill_bytes << " (distinct payloads " << distinct_payload_bytes
+              << ", padding and reserved " << (spill_bytes - distinct_payload_bytes) << ")\n";
 }
 
 /**

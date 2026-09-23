@@ -462,12 +462,14 @@ bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
 
     struct Config { const char* name; ms_io::BuildOptions opts; };
     std::vector<Config> configs;
-    auto add = [&](const char* name, bool coalesce, ulint align, uchar split_bits, ulint split_threshold) {
+    auto add = [&](const char* name, bool coalesce, ulint align, uchar split_bits, ulint split_threshold,
+                   bool minima_only = false) {
         ms_io::BuildOptions o;
         o.coalesce = coalesce;
         o.spill_align = align;
         o.spill_split_bits = split_bits;
         o.split_threshold = split_threshold;
+        o.minima_only = minima_only;
         configs.push_back({name, o});
     };
     add("base", false, 0, 0, SPLIT_THRESHOLD_NEVER);
@@ -477,6 +479,9 @@ bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
     add("coalesce+align4", true, 4, 0, SPLIT_THRESHOLD_NEVER);
     add("coalesce+align8+splitbits2", true, 8, 2, SPLIT_THRESHOLD_NEVER);
     add("coalesce+split1+align4", true, 4, 0, 1);
+    add("minima", false, 0, 0, SPLIT_THRESHOLD_NEVER, true);
+    add("minima+coalesce+align4", true, 4, 0, SPLIT_THRESHOLD_NEVER, true);
+    add("minima+coalesce+split1+align8+splitbits2", true, 8, 2, 1, true);
 
     for (const auto& cfg : configs) {
         auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, cfg.opts);

@@ -19,6 +19,9 @@ namespace ms_inspect {
  */
 void run_inspect(MSIndexSpillLCP<false>& index);
 
+/** Print the distribution of interior LCP pairs per run and spillover byte use. */
+void run_distribution(MSIndexSpillLCP<false>& index);
+
 /**
  * Dump spillover table to TSV: jumbo (T/F), num_interior, rest.
  * rest is "-" when num_interior=0, else "offset0,value0,offset1,value1,...".

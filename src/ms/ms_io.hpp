@@ -23,6 +23,7 @@ struct BuildOptions {
     bool coalesce = false;
     ulint spill_align = 0;
     uchar spill_split_bits = 0;
+    bool minima_only = false;
 };
 
 /**
@@ -40,10 +41,10 @@ build_ms_index_spill_from_tsv(const std::string& path, const BuildOptions& opts)
         return std::nullopt;
 
     try {
-        apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, opts.split_threshold);
+        apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, opts.split_threshold, opts.minima_only);
         auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] = build_spill_data(
             lcps_per_run, opts.percentile_k, opts.coalesce, false, opts.split_threshold,
-            opts.spill_align, opts.spill_split_bits);
+            opts.spill_align, opts.spill_split_bits, opts.minima_only);
         return MSIndexSpillLCP<StoreAbsolutePositions>(bwt_heads, bwt_run_lengths, run_data,
             std::move(spill_vectors), max_top, max_sub, opts.spill_align, opts.spill_split_bits);
     } catch (...) {

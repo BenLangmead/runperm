@@ -23,6 +23,7 @@ static void usage(const char* prog) {
               << "Main commands:\n"
               << "  build      TSV_PATH INDEX_PATH [--percentile K] [--split-threshold N]\n"
               << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
+              << "            [--minima-only]\n"
               << "              Build index from TSV.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
         bool coalesce = false;
         ulint spill_align = 0;
         uchar spill_split_bits = 0;
+        bool minima_only = false;
         for (int i = 2; i < argc; ++i) {
             if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) {
                 percentile_k = std::stod(argv[++i]);
@@ -121,6 +123,11 @@ int main(int argc, char** argv) {
                 spill_align = std::stoull(argv[++i]);
             } else if (strcmp(argv[i], "--spill-split-bits") == 0 && i + 1 < argc) {
                 spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
+            } else if (strcmp(argv[i], "--minima-only") == 0) {
+                minima_only = true;
+            } else {
+                std::cerr << "Unknown build option: " << argv[i] << "\n";
+                return 1;
             }
         }
         std::vector<uchar> bwt_heads;
@@ -130,9 +137,9 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to load TSV: " << tsv_path << "\n";
             return 1;
         }
-        apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, split_threshold);
+        apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, split_threshold, minima_only);
         auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
-            build_spill_data(lcps_per_run, percentile_k, coalesce, false /* coalesce_lcp_separately */, split_threshold, spill_align, spill_split_bits);
+            build_spill_data(lcps_per_run, percentile_k, coalesce, false /* coalesce_lcp_separately */, split_threshold, spill_align, spill_split_bits, minima_only);
         MSIndexSpillLCP<false> idx(bwt_heads, bwt_run_lengths, run_data, std::move(spill_vectors), max_top, max_sub, spill_align, spill_split_bits);
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
