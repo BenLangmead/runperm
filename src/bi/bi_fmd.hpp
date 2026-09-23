@@ -50,7 +50,7 @@ inline uchar complement(uchar c) {
 }
 
 // LF index type: RunPermLF with empty_data_columns for up()/down() run-walking
-using LFIndex = orbit::rlbwt::RunPermLF<orbit::empty_data_columns, false, false, orbit::nucleotide>;
+using LFIndex = orbit::rlbwt::lf_permutation<orbit::empty_data_columns, false, false, orbit::nucleotide>;
 using Position = LFIndex::position;
 
 /**
@@ -99,7 +99,7 @@ struct KmerTable {
 /**
  * A bidirectional BWT index for DNA sequences based on the move structure and
  * on the FMD Index.  Position-native: all navigation via Position, no flat
- * run_starts/run_chars.  Uses RunPermLF for up()/down() run-walking.
+ * run_starts/run_chars.  Uses lf_permutation for up()/down() run-walking.
  */
 class FMDIndex {
 public:

@@ -425,14 +425,14 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
 }
 
 enum class LCPRunCols { TOP_LCP, COUNT };
-template <bool SP> using MSIndexTopLCP = orbit::rlbwt::RunPermLF<LCPRunCols, true, SP>;
+template <bool SP> using MSIndexTopLCP = orbit::rlbwt::lf_permutation<LCPRunCols, true, SP>;
 
 /**
  * The main index class that combines the run permutation and spillover data.
  */
 template <bool StoreAbsolutePositions = false>
 class MSIndexSpillLCP {
-    using IndexImpl = orbit::rlbwt::RunPermLF<LCPSpillRunCols, true, StoreAbsolutePositions>;
+    using IndexImpl = orbit::rlbwt::lf_permutation<LCPSpillRunCols, true, StoreAbsolutePositions>;
     IndexImpl idx_;
     std::vector<SpilloverVector> spill_vectors_;
     ulint max_lcp_top_, max_lcp_min_sub_;
