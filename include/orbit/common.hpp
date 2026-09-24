@@ -1,6 +1,7 @@
 #ifndef _COMMON_HPP
 #define _COMMON_HPP
 #include <stddef.h>
+#include <cstdint>
 #include <utility>
 #include <vector>
 #include <array>
