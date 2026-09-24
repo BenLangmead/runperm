@@ -22,10 +22,11 @@
  *
  *  - LF over the BWT runs, runs-based (rows store lengths), with integrated
  *    columns per LF interval: PSI_INT and PSI_OFF, the FL point of the
- *    interval's head row, and PHI_INT and PHI_OFF, the phi point of that
- *    row's text position.  The FL point of a tail row is the one just before
- *    the next interval's head, and its phi point is one phi step from the
- *    next interval's head's phi point.
+ *    interval's tail row, and PHI_INT and PHI_OFF, the phi point of its head
+ *    row's text position.  The FL point of a head row is the one just after
+ *    the previous interval's tail, and the phi point of a tail row is one phi
+ *    step from the next interval's head's phi point.  So a reposition reads
+ *    both candidates' start points from rows its scan has already read.
  *  - FL over the F runs, runs-based, with no data columns.  Its character at
  *    a position is the first character of that row's suffix.
  *  - Optionally, phi over text positions, starts-based (rows store absolute
@@ -96,15 +97,16 @@ public:
         std::vector<typename LF::data_tuple> cols(lf_count);
         {
             // Merge the two partitions of the rows: for each LF interval,
-            // the FL interval holding its head row and the offset within it.
+            // the FL interval holding its tail row and the offset within it.
             ulint l_pos = 0, f_pos = 0, f_int = 0;
             const ulint f_count = fl_.intervals();
             for (ulint k = 0; k < lf_count; ++k) {
-                while (f_int < f_count && f_pos + fl_.get_length(f_int) <= l_pos)
+                l_pos += lf_enc.get_length(k);
+                const ulint tail = l_pos - 1;
+                while (f_int < f_count && f_pos + fl_.get_length(f_int) <= tail)
                     f_pos += fl_.get_length(f_int++);
                 cols[k][col(TmsLFCols::PSI_INT)] = f_int;
-                cols[k][col(TmsLFCols::PSI_OFF)] = l_pos - f_pos;
-                l_pos += lf_enc.get_length(k);
+                cols[k][col(TmsLFCols::PSI_OFF)] = tail - f_pos;
             }
         }
         if (run_tops) {
@@ -159,6 +161,11 @@ public:
     LFPos start_LF(LFPos p) const { return lf_.start_next(p); }
     LFPos finish_LF(LFPos p) const { return lf_.finish_next(p); }
     void prefetch(ulint i) const { lf_.prefetch(i); }
+    /** Prefetch LF rows lo to hi inclusive, once per cache line. */
+    void prefetch_rows(ulint lo, ulint hi) const {
+        for (ulint j = lo; j < hi; j += lf_row_stride_) lf_.prefetch(j);
+        lf_.prefetch(hi);
+    }
     LFPos first() { return lf_.first(); }
     LFPos last() { return lf_.last(); }
     LFPos up(LFPos p) { return lf_.up(p); }
@@ -166,30 +173,59 @@ public:
     ulint move_runs() const { return lf_.intervals(); }
     ulint domain() const { return lf_.domain(); }
 
-    /** FL point of the head row of LF interval k. */
-    FLPos psi_at_head(ulint k) const {
+    /** FL point of the tail row of LF interval k. */
+    FLPos psi_at_tail(ulint k) const {
         FLPos q;
         q.interval = lf_.template get<TmsLFCols::PSI_INT>(k);
         q.offset = lf_.template get<TmsLFCols::PSI_OFF>(k);
         return q;
     }
-    /** FL point of the tail row of LF interval k, which must not be the last. */
-    FLPos psi_at_tail(ulint k) const {
-        FLPos q = psi_at_head(k + 1);
-        if (q.offset > 0) {
-            --q.offset;
-        } else {
-            --q.interval;
-            q.offset = fl_.get_length(q.interval) - 1;
-        }
+    /**
+     * FL point of the head row of LF interval k, unresolved: its offset may
+     * run past its interval's end, and finish_psi or resolve_psi resolves it.
+     * Reads LF row k - 1 only.
+     */
+    FLPos psi_at_head_unresolved(ulint k) const {
+        if (k == 0) return FLPos{};
+        FLPos q = psi_at_tail(k - 1);
+        ++q.offset;
         return q;
     }
+    /** FL point of the head row of LF interval k. */
+    FLPos psi_at_head(ulint k) const { return resolve_psi(psi_at_head_unresolved(k)); }
 
     // FL side.
     uchar psi_character(FLPos q) { return fl_.get_character(q.interval); }
     FLPos psi(FLPos q) { return fl_.FL(q); }
     FLPos start_psi(FLPos q) const { return fl_.start_next(q); }
     FLPos finish_psi(FLPos q) const { return fl_.finish_next(q); }
+    /**
+     * One psi step on an FL point q, resolved or not: resolve it, set c to
+     * the first character of its suffix, and return the unresolved FL point
+     * of the next character.  When FL's rows fit in a word, each row is read
+     * with one load.
+     */
+    FLPos psi_step(FLPos q, uchar& c) {
+        if (!fl_rows_fit_word_) {
+            q = finish_psi(q);
+            c = psi_character(q);
+            return start_psi(q);
+        }
+        ulint w = fl_.row_bits(q.interval);
+        ulint len = fl_.length_of(w);
+        while (q.offset >= len) {
+            q.offset -= len;
+            w = fl_.row_bits(++q.interval);
+            len = fl_.length_of(w);
+        }
+        c = fl_.character_of(w);
+        FLPos next{};
+        next.interval = fl_.pointer_of(w);
+        next.offset = q.offset + fl_.offset_of(w);
+        return next;
+    }
+    /** Resolve an FL point whose offset may run past its interval's end. */
+    FLPos resolve_psi(FLPos q) const { return fl_.finish_next(q); }
     void prefetch_psi(ulint i) const { fl_.prefetch(i); }
     ulint psi_intervals() const { return fl_.intervals(); }
 
@@ -250,17 +286,27 @@ public:
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 2;
+    static constexpr uint32_t VERSION = 3;
 
     LF lf_;
     FL fl_;
     Phi phi_;
     bool has_phi_ = false;
     std::array<bool, 256> occurs_{};
+    // Rows between prefetches in prefetch_rows: the most whose starts span
+    // fewer than 512 bits, so every cache line of a range gets one.
+    ulint lf_row_stride_ = 1;
+    bool fl_rows_fit_word_ = false;
 
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
+    // Derived fields: the scan's prefetch stride, whole-row FL reads, and
+    // which characters occur.
     void compute_occurs() {
+        ulint row_bits = 0;
+        for (auto w : lf_.get_widths()) row_bits += w;
+        lf_row_stride_ = std::max<ulint>(1, 511 / std::max<ulint>(1, row_bits));
+        fl_rows_fit_word_ = fl_.row_fits_word();
         occurs_.fill(false);
         for (ulint i = 0; i < lf_.intervals(); ++i) occurs_[lf_.get_character(i)] = true;
     }
