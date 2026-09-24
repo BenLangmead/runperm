@@ -190,6 +190,10 @@ struct move_vector : public move_table_interface<move_vector<columns_t>, columns
     void prefetch(size_t i) const {
         vec.prefetch(i);
     }
+    /** Hint that rows lo to hi will be read soon. */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        vec.prefetch_rows(lo, hi);
+    }
 
     // Whole-row reads; see packed_matrix::get_row_bits.
     bool row_fits_word() const { return vec.row_fits_word(); }

@@ -193,6 +193,10 @@ public:
     void prefetch(size_t i) const {
         table.prefetch(i);
     }
+    /** Hint that the rows of intervals lo to hi will be read soon (move_vector tables). */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        table.prefetch_rows(lo, hi);
+    }
 
     // Whole-row reads, for tables that support them (move_vector); see
     // packed_matrix::get_row_bits.

@@ -23,6 +23,8 @@ public:
     // We read ulint at a time, this ensures we never need to read more than one ulint
     // should be 57 bits for 64 bit ulint and 8 bit word_t
     constexpr static uchar max_width = num_bits_type(ulint) - (num_bits_type(word_t) - 1);
+    // Bytes per cache line, the stride of prefetch_rows.
+    constexpr static size_t cache_line_bytes = 64;
 
     packed_matrix() = default;
     packed_matrix(const ulint rows, const std::array<uchar, num_cols>& widths) {
@@ -87,6 +89,18 @@ public:
         const word_t* first = &data[start / num_bits_type(word_t)];
         const word_t* last = &data[(start + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
         ORBIT_PREFETCH(first);
+        ORBIT_PREFETCH(last);
+    }
+
+    /**
+     * Hint that rows lo to hi, lo <= hi, will be read soon: prefetches each
+     * cache line from the first byte of row lo to the last byte a read of
+     * row hi touches, once per line.
+     */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        const word_t* p = &data[get_row_start(lo) / num_bits_type(word_t)];
+        const word_t* last = &data[(get_row_start(hi) + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
+        for (; p < last; p += cache_line_bytes) ORBIT_PREFETCH(p);
         ORBIT_PREFETCH(last);
     }
 

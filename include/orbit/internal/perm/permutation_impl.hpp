@@ -271,6 +271,17 @@ public:
         }
     }
 
+    /**
+     * Hint that the rows of intervals lo to hi, lo <= hi, will be read soon;
+     * each cache line is prefetched once.
+     */
+    void prefetch_rows(ulint lo, ulint hi) const {
+        move_structure.prefetch_rows(lo, hi);
+        if constexpr (!integrated_move_structure && num_run_cols > 0) {
+            this->data_cols.prefetch_rows(lo, hi);
+        }
+    }
+
     // Non-exponential search version of next()
     position next_linear(position position) {
         return move_structure.move(position);
