@@ -540,14 +540,19 @@ bool test_smem_detection() {
  * without repeats, with count c; on the fuzz texts they are also in
  * increasing row order and consecutive.  For SMEM_ONE, the position is one
  * of them.  Both are the same in every mode and for every k, and the SMEMs
- * are those tms_smems gives.
+ * are those tms_smems gives.  SMEM_ALL is also the same for every number of
+ * walks in flight in tms_report_smems_batch (0, which lists one SMEM at a
+ * time; 1; a few; and more than there are walks), and with max_listed N it
+ * lists the first N positions of the full list and keeps the count.
  */
 bool test_smem_report(const std::string& data_dir) {
     std::cout << "Testing SMEM reports against every occurrence" << std::endl;
     std::mt19937 rng(43);
     const auto inputs = batch_inputs(data_dir, rng);
     const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
-    size_t smems = 0, positions = 0;
+    size_t smems = 0, positions = 0, capped = 0;
+    // SMEMs with no rows above the toehold's, none below, and some on both sides.
+    size_t none_up = 0, none_down = 0, both = 0;
     for (const auto& in : inputs) {
         const std::string& T = in.text;
         // Row order is checked where the suffix array is at hand.
@@ -567,9 +572,53 @@ bool test_smem_report(const std::string& data_dir) {
                         tms_query_batch(idx, pats, k, len, mode, &pos);
                         for (int r = 0; r < 2; ++r) {
                             const TmsReport report = r ? TmsReport::SMEM_ALL : TmsReport::SMEM_ONE;
-                            std::vector<TmsSmemHits> hits(pats.size());
-                            for (size_t j = 0; j < pats.size(); ++j)
-                                tms_report_smems(idx, len[j], pos[j], min_len, report, hits[j]);
+                            std::vector<TmsSmemHits> hits;
+                            tms_report_smems_batch(idx, len, pos, min_len, report, 0, hits);
+                            if (report == TmsReport::SMEM_ALL) {
+                                for (size_t sk : {size_t(1), size_t(2), size_t(7), size_t(32), size_t(1) << 20}) {
+                                    std::vector<TmsSmemHits> other;
+                                    tms_report_smems_batch(idx, len, pos, min_len, report, sk, other);
+                                    for (size_t j = 0; j < pats.size(); ++j) {
+                                        std::string a, b;
+                                        tms_format_smems(hits[j], report, a);
+                                        tms_format_smems(other[j], report, b);
+                                        if (a != b) {
+                                            std::cout << "  FAILED: batched SMEM listing differs with " << sk << " walks" << std::endl;
+                                            assert(false && "SMEM positions must not depend on the walks in flight");
+                                            return false;
+                                        }
+                                    }
+                                }
+                                for (ulint cap : {0, 1, 2, 5})
+                                    for (size_t sk : {size_t(0), size_t(3), size_t(32)}) {
+                                        std::vector<TmsSmemHits> other;
+                                        tms_report_smems_batch(idx, len, pos, min_len, report, sk, other, cap);
+                                        for (size_t j = 0; j < pats.size(); ++j) {
+                                            const auto& full = hits[j];
+                                            const auto& part = other[j];
+                                            assert(part.smems.size() == full.smems.size());
+                                            size_t at_full = 0, at_part = 0;
+                                            for (size_t x = 0; x < full.smems.size(); ++x) {
+                                                const auto& f = full.smems[x];
+                                                const auto& g = part.smems[x];
+                                                const ulint want = std::min(f.count, cap);
+                                                bool ok = g.start == f.start && g.len == f.len && g.count == f.count &&
+                                                          g.listed == want;
+                                                for (ulint y = 0; ok && y < want; ++y)
+                                                    ok = part.pos[at_part + y] == full.pos[at_full + y];
+                                                if (!ok) {
+                                                    std::cout << "  FAILED: max_listed " << cap << " with " << sk << " walks" << std::endl;
+                                                    assert(false && "a capped listing must be the first positions in row order");
+                                                    return false;
+                                                }
+                                                capped += f.count > cap;
+                                                at_full += f.listed;
+                                                at_part += g.listed;
+                                            }
+                                            assert(at_part == part.pos.size());
+                                        }
+                                    }
+                            }
                             if (!first[r].empty()) {
                                 std::vector<std::string> a, b;
                                 for (size_t j = 0; j < pats.size(); ++j) {
@@ -596,8 +645,16 @@ bool test_smem_report(const std::string& data_dir) {
                                     const std::string sub = pats[j].substr(h.start, h.len);
                                     std::vector<ulint> all;
                                     for (size_t f = T.find(sub); f != std::string::npos; f = T.find(sub, f + 1)) all.push_back(f);
+                                    assert(h.listed == h.count);
                                     std::vector<ulint> got(hits[j].pos.begin() + at, hits[j].pos.begin() + at + h.count);
                                     at += h.count;
+                                    if (report == TmsReport::SMEM_ALL) {
+                                        const bool up = got.front() != pos[j][h.start];
+                                        const bool down = got.back() != pos[j][h.start];
+                                        none_up += !up;
+                                        none_down += !down;
+                                        both += up && down;
+                                    }
                                     bool ok;
                                     if (report == TmsReport::SMEM_ONE) {
                                         ok = h.count == 1 && std::binary_search(all.begin(), all.end(), got[0]);
@@ -630,7 +687,9 @@ bool test_smem_report(const std::string& data_dir) {
             }
         }
     }
-    std::cout << "  " << smems << " SMEMs and " << positions << " positions PASSED" << std::endl;
+    assert(none_up > 0 && none_down > 0 && both > 0 && capped > 0 && "the inputs must exercise every kind of walk");
+    std::cout << "  " << smems << " SMEMs and " << positions << " positions (" << none_up << " with none above, "
+              << none_down << " with none below, " << both << " with some on both sides) PASSED" << std::endl;
     return true;
 }
 

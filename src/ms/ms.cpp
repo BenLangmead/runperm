@@ -80,8 +80,10 @@ static void usage(const char* prog) {
               << "              occurs, and needs phi; smem-all gives each as i:L:c:p1,p2,...,\n"
               << "              with all c text positions in BWT row order, and needs phi and\n"
               << "              phi_inv.  --min-smem-len T keeps only SMEMs with L > T (default\n"
-              << "              0, all of them) in both SMEM reports.  Results do not depend on\n"
-              << "              the mode or K.\n"
+              << "              0, all of them) in both SMEM reports.  With smem-all, K also\n"
+              << "              sets how many of its phi and phi_inv walks list positions at\n"
+              << "              once (K = 0: one SMEM at a time).  Results do not depend on the\n"
+              << "              mode or K.\n"
               << "  tms-text   INDEX_PATH\n"
               << "              Print the indexed text, read back with LF.\n"
               << "  tms-inspect INDEX_PATH\n"
@@ -179,22 +181,26 @@ static ulint g_tms_min_smem_len = 0;
 static std::vector<std::vector<ulint>> g_tms_pos;
 static std::vector<TmsSmemHits> g_tms_hits;
 
-// With an SMEM report, the SMEMs are found as part of the query.
+// With an SMEM report, the SMEMs are found as part of the query.  smem_k
+// walks are in flight when smem-all lists positions (0 lists them one SMEM
+// at a time).
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k,
-                       std::vector<std::vector<ulint>>& out) {
+                       std::vector<std::vector<ulint>>& out, size_t smem_k) {
     const bool smems = g_tms_report != TmsReport::MS;
     tms_query_batch(idx, p, k, out, g_tms_mode, g_tms_positions || smems ? &g_tms_pos : nullptr);
     if (!smems) return;
-    g_tms_hits.resize(p.size());
-    for (size_t j = 0; j < p.size(); ++j)
-        tms_report_smems(idx, out[j], g_tms_pos[j], g_tms_min_smem_len, g_tms_report, g_tms_hits[j]);
+    tms_report_smems_batch(idx, out, g_tms_pos, g_tms_min_smem_len, g_tms_report, smem_k, g_tms_hits);
+}
+static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k,
+                       std::vector<std::vector<ulint>>& out) {
+    query_many(idx, p, k, out, k);
 }
 // One read at a time runs the batched engine with one read: it is faster
 // than tms_query, the plain psi reference, whereas ms_query is as fast as
-// ms's engine with one read.
+// ms's engine with one read.  smem-all lists positions one SMEM at a time.
 static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) {
     std::vector<std::vector<ulint>> len;
-    query_many(idx, {s}, 1, len);
+    query_many(idx, {s}, 1, len, 0);
     return std::move(len[0]);
 }
 
