@@ -537,9 +537,22 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (with_phi && !lcp_bin_path.empty()) {
-                // One little-endian 64-bit LCP per row; keep each run head's.
-                std::ifstream lin(lcp_bin_path, std::ios::binary);
+                // One little-endian 64-bit LCP per row, optionally after a
+                // 64-bit row count (msbench prep's form); keep each run head's.
+                std::ifstream lin(lcp_bin_path, std::ios::binary | std::ios::ate);
                 if (!lin.good()) { std::cerr << "cannot open " << lcp_bin_path << "\n"; return 1; }
+                ulint n = 0;
+                for (ulint l : lens) n += l;
+                const ulint bytes = static_cast<ulint>(lin.tellg());
+                lin.seekg(0);
+                if (bytes == 8 * (n + 1)) {
+                    uint64_t count = 0;
+                    lin.read(reinterpret_cast<char*>(&count), 8);
+                    if (count != n) { std::cerr << "lcp file count " << count << " is not n = " << n << "\n"; return 1; }
+                } else if (bytes != 8 * n) {
+                    std::cerr << "lcp file has " << bytes << " bytes; expected 8 per row for n = " << n << "\n";
+                    return 1;
+                }
                 std::vector<uint64_t> buf(1 << 20);
                 size_t have = 0, at = 0;
                 tops.reserve(heads.size());
