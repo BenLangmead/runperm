@@ -142,6 +142,16 @@ public:
         return alphabet_.unmap_char(static_cast<uchar>(
             base::move_structure.template extract<base::to_cols(base::base_columns::CHARACTER)>(bits)));
     }
+    /** The reader column index of the character column (see permutation_impl::get_reader). */
+    static constexpr size_t character_column() {
+        return static_cast<size_t>(base::to_cols(base::base_columns::CHARACTER));
+    }
+    /** The alphabet code of character c, or nullopt if c is not in the alphabet. */
+    std::optional<uchar> character_code(uchar c) {
+        for (size_t i = 0; i < static_cast<size_t>(alphabet_.size()); ++i)
+            if (alphabet_.unmap_char(static_cast<uchar>(i)) == c) return static_cast<uchar>(i);
+        return std::nullopt;
+    }
     uchar get_character(position pos) {
         return alphabet_.unmap_char(base::template get_base_column<base_columns::CHARACTER>(pos.interval));
     }

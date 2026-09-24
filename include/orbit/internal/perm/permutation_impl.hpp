@@ -248,6 +248,24 @@ public:
     }
 
     /**
+     * A reader of the move structure's packed rows (move_vector tables; see
+     * packed_matrix::reader), and the reader's column indices for the base
+     * columns and, when integrated, the data columns.
+     */
+    auto get_reader() const { return move_structure.get_reader(); }
+    static constexpr size_t pointer_column() { return static_cast<size_t>(to_cols(cols_traits::POINTER)); }
+    static constexpr size_t offset_column() { return static_cast<size_t>(to_cols(cols_traits::OFFSET)); }
+    static constexpr size_t length_column() {
+        static_assert(cols_traits::RELATIVE, "rows store lengths only with relative positions");
+        return static_cast<size_t>(to_cols(cols_traits::LENGTH));
+    }
+    template<data_columns col>
+    static constexpr size_t data_column() {
+        static_assert(integrated_move_structure, "data columns are in the row only when integrated");
+        return static_cast<size_t>(cols_traits::template data_column<col>());
+    }
+
+    /**
      * Whole-row reads, for a move_vector table whose rows fit in one word:
      * row_bits(i) reads interval i's row with one load, and the accessors
      * below take its columns out of the result.

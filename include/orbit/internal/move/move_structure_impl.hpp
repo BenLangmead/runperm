@@ -198,6 +198,9 @@ public:
         table.prefetch_rows(lo, hi);
     }
 
+    // A reader of the packed rows, for move_vector tables; see packed_matrix::reader.
+    auto get_reader() const { return table.get_reader(); }
+
     // Whole-row reads, for tables that support them (move_vector); see
     // packed_matrix::get_row_bits.
     bool row_fits_word() const { return table.row_fits_word(); }

@@ -195,6 +195,9 @@ struct move_vector : public move_table_interface<move_vector<columns_t>, columns
         vec.prefetch_rows(lo, hi);
     }
 
+    // A reader of the packed rows; see packed_matrix::reader.
+    auto get_reader() const { return vec.get_reader(); }
+
     // Whole-row reads; see packed_matrix::get_row_bits.
     bool row_fits_word() const { return vec.row_fits_word(); }
     ulint get_row_bits(size_t i) const { return vec.get_row_bits(i); }

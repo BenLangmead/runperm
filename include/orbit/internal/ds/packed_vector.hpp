@@ -67,6 +67,35 @@ public:
         return bits >> pos.offset;
     }
 
+    /**
+     * A copy of what reading columns needs: the buffer's address, the row
+     * width, and each column's bit offset and mask.  A reader kept in a local
+     * variable lets the compiler hold these in registers, where reads through
+     * the matrix reload them after any store that might alias them.  It is
+     * valid while the matrix is alive and not resized.  Rows are named by
+     * their first bit, row_start(row), so that several columns of one row
+     * share the multiplication.
+     */
+    struct reader {
+        const word_t* data;
+        size_t row_width;
+        std::array<uint16_t, num_cols> offsets;
+        std::array<ulint, num_cols> masks;
+
+        size_t row_start(size_t row) const { return row * row_width; }
+        template<size_t col>
+        ulint get_at(size_t start) const {
+            static_assert(col < num_cols, "Column out of bounds");
+            const size_t bit = start + offsets[col];
+            ulint bits = 0;
+            std::memcpy(&bits, &data[bit / num_bits_type(word_t)], sizeof(ulint));
+            return (bits >> (bit % num_bits_type(word_t))) & masks[col];
+        }
+        template<size_t col>
+        ulint get(size_t row) const { return get_at<col>(row_start(row)); }
+    };
+    reader get_reader() const { return reader{data.data(), row_width, offsets, masks_extract}; }
+
     /** Column col of a row read with get_row_bits. */
     template<size_t col>
     ulint extract(ulint row_bits) const {
