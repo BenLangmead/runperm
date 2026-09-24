@@ -217,8 +217,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     if (k == 0) k = 1;
     PhiPos init_ph{};
     if constexpr (Toehold) init_ph = idx.resolve_phi(idx.phi_at_head(0));
-    std::vector<Slot> slots;
-    slots.reserve(k);
+    std::vector<Slot> slots(k);
     size_t next = 0;
     auto start = [&](Slot& s) {
         while (next < patterns.size()) {
@@ -238,11 +237,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         }
         return false;
     };
-    for (size_t t = 0; t < k; ++t) {
-        Slot s{};
-        if (!start(s)) break;
-        slots.push_back(s);
-    }
+    // Slots [slots.data(), end) are in flight.
+    Slot* end = slots.data();
+    while (end < slots.data() + k && start(*end)) ++end;
     auto lower = [](const Side& x) { return x.done ? x.value : x.psi_on ? x.psi_lce : 0; };
     auto upper = [](const Side& x, ulint cap) { return x.done ? x.value : x.phi_on ? std::min(x.phi_min, cap) : cap; };
     auto setup = [&](Side& x, ulint dist, ulint cap) {
@@ -299,9 +296,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         if constexpr (Positions) s.ms_pos[s.i - 1] = s.ph.idx;
         s.state = STEP;
     };
-    while (!slots.empty()) {
-        for (size_t t = 0; t < slots.size();) {
-            Slot& s = slots[t];
+    while (end != slots.data()) {
+        for (Slot* sp = slots.data(); sp < end;) {
+            Slot& s = *sp;
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
             bool advanced = false;  // pat[i - 1] is done
             if (s.state == STEP) {
@@ -363,7 +360,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                             acc.prefetch_rows(s.hi + 1, hi);
                             s.hi = hi;
                         }
-                        ++t;
+                        ++sp;
                         continue;
                     }
                     const bool found_up = s.found_up, found_down = s.found_down;
@@ -458,12 +455,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     }
                 }
             }
-            if (!advanced || --s.i > 0 || start(s)) {
-                ++t;
-            } else {
-                s = slots.back();
-                slots.pop_back();
-            }
+            if (!advanced || --s.i > 0 || start(s)) ++sp;
+            else s = *--end;
         }
     }
 }
