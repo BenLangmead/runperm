@@ -297,7 +297,12 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     std::cerr << "stats: bases=" << tms_stats.bases << " repositions/base=" << double(tms_stats.repositions) / tms_stats.bases
               << " psi_steps/base=" << double(tms_stats.psi_steps) / tms_stats.bases
               << " scan_rows/rep=" << double(tms_stats.scan_rows) / tms_stats.repositions
-              << " len/rep=" << double(tms_stats.len_at_rep) / tms_stats.repositions << "\n";
+              << " len/rep=" << double(tms_stats.len_at_rep) / tms_stats.repositions
+              << " phi_steps/base=" << double(tms_stats.phi_steps) / tms_stats.bases
+              << " dist/rep=" << double(tms_stats.dist) / tms_stats.repositions
+              << " dist1_frac=" << double(tms_stats.dist1) / tms_stats.repositions
+              << " lce/rep=" << double(tms_stats.lce) / tms_stats.repositions
+              << " capped_frac=" << double(tms_stats.lce_capped) / tms_stats.repositions << "\n";
 #endif
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases

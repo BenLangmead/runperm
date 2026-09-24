@@ -26,7 +26,7 @@
 #include <vector>
 
 #ifdef TMS_STATS
-struct TmsStats { ulint bases = 0, repositions = 0, psi_steps = 0, scan_rows = 0, dist = 0, len_at_rep = 0; };
+struct TmsStats { ulint bases = 0, repositions = 0, psi_steps = 0, phi_steps = 0, scan_rows = 0, dist = 0, len_at_rep = 0, lce = 0, lce_capped = 0, dist1 = 0; };
 inline TmsStats tms_stats;
 #define TMS_COUNT(field, v) (tms_stats.field += (v))
 #else
@@ -229,6 +229,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const std::vector<std::string>& 
     };
     auto step_side = [&](Side& x, const char* rest, ulint cap) {
         if (x.psi_on) {
+            TMS_COUNT(psi_steps, 1);
             const FLPos q = idx.finish_psi(x.q);
             if (idx.psi_character(q) == static_cast<uchar>(rest[x.psi_lce]) && ++x.psi_lce < cap) {
                 x.q = idx.start_psi(q);
@@ -240,6 +241,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const std::vector<std::string>& 
             }
         }
         if (x.phi_on) {
+            TMS_COUNT(phi_steps, 1);
             const PhiPos p = idx.finish_phi(x.p);
             x.phi_min = std::min(x.phi_min, idx.plcp(p));
             if (x.phi_min == 0 || --x.phi_left == 0) {
@@ -254,6 +256,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const std::vector<std::string>& 
     // Record pat[i - 1]'s statistic, start the LF step from row `from` and
     // move the toehold one text position left with it.
     auto consume = [&](Slot& s, LFPos from) {
+        TMS_COUNT(bases, 1);
         s.ms[s.i - 1] = ++s.len;
         s.pos = idx.start_LF(from);
         idx.prefetch(s.pos.interval);
@@ -308,6 +311,10 @@ inline void tms_query_batch_impl(TmsIndex& idx, const std::vector<std::string>& 
                         if (idx.get_character(++s.d) == c) { found_down = true; break; }
                         dist_down += idx.get_length(s.d);
                     }
+                    TMS_COUNT(repositions, 1);
+                    TMS_COUNT(len_at_rep, cap);
+                    TMS_COUNT(dist, std::min(found_up ? dist_up : INF, found_down ? dist_down : INF));
+                    TMS_COUNT(dist1, (found_up && dist_up == 1) || (found_down && dist_down == 1));
                     s.up = Side{};
                     s.down = Side{};
                     s.up.lost = !found_up;
@@ -345,6 +352,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const std::vector<std::string>& 
                     else if (upper(s.up, cap) < lower(s.down)) s.up.lost = true;
                 }
                 if (!s.up.active() && !s.down.active()) {
+                    TMS_COUNT(lce, std::max(s.up.done ? s.up.value : 0, s.down.done ? s.down.value : 0));
+                    TMS_COUNT(lce_capped, (s.up.done && s.up.value == cap) || (s.down.done && s.down.value == cap));
                     LFPos from{};
                     if (s.up.done && (s.down.lost || s.up.value >= s.down.value)) {
                         from.interval = s.u + 1;
