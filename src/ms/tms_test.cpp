@@ -487,6 +487,42 @@ bool test_tms_batch(const std::string& data_dir) {
 
 namespace {
 
+// The most intervals a walker step fast-forwarded over in check_walker.
+ulint g_max_fast_forward = 0;
+
+/**
+ * A TmsIndex walker over a permutation with the given interval starts, next
+ * and lcp: locate finds the same interval as a plain binary search over the
+ * starts for every text position, and from there step gives the text
+ * position and LCP of next, twice in a row.
+ */
+template <typename Walker, typename StartOf, typename Next, typename Lcp>
+void check_walker(const Walker& wk, ulint n, StartOf start_of, ulint intervals, Next next, Lcp lcp) {
+    auto plain = [&](ulint x) {
+        ulint lo = 0, hi = intervals;
+        while (hi - lo > 1) {
+            const ulint mid = lo + (hi - lo) / 2;
+            (start_of(mid) <= x ? lo : hi) = mid;
+        }
+        return lo;
+    };
+    for (ulint x = 0; x < n; ++x) {
+        const auto p = wk.locate(x);
+        assert(p.interval == plain(x) && p.offset == x - start_of(p.interval) && p.idx == x);
+        assert(wk.lcp(p) == lcp(p));
+        auto q = wk.start_step(p);
+        auto a = p;
+        for (int s = 0; s < 2; ++s) {
+            const ulint from = q.interval;
+            ulint l;
+            const ulint y = wk.step(q, l);
+            a = next(a);
+            assert(y == a.idx && l == lcp(a) && "a walker step agrees with phi or phi_inv");
+            g_max_fast_forward = std::max(g_max_fast_forward, a.interval - from);
+        }
+    }
+}
+
 /**
  * TmsIndex's phi_inv maps SA[j] to SA[j + 1] (SA[n - 1] to SA[0]) and its
  * PLCPB is the LCP with the row below (0 for row n - 1); phi_at and
@@ -518,7 +554,23 @@ void check_phi_inv(const TextBwt& t, const TmsBuildOptions& o) {
             assert(x->plcpb(b) == (j + 1 < n ? t.lcp[j + 1] : 0) && "PLCPB is the LCP with the row below");
             assert(x->phi_inv(b).idx == t.sa[j + 1 < n ? j + 1 : 0] && "phi_inv(SA[j]) = SA[j + 1]");
         }
+        // The walkers, with start tables of several densities and none.
+        for (int shift : {-1, 0, 1, 3, 20}) {
+            x->build_start_tables(shift);
+            check_walker(x->phi_walker(), n, [&](ulint i) { return x->phi_start(i); }, x->phi_intervals(),
+                         [&](TmsIndex::PhiPos p) { return x->phi(p); }, [&](TmsIndex::PhiPos p) { return x->plcp(p); });
+            check_walker(x->phi_inv_walker(), n, [&](ulint i) { return x->phi_inv_start(i); }, x->phi_inv_intervals(),
+                         [&](TmsIndex::PhiInvPos p) { return x->phi_inv(p); },
+                         [&](TmsIndex::PhiInvPos p) { return x->plcpb(p); });
+        }
     }
+    // Loaded without phi_inv, phi has no start table.
+    std::stringstream again(ss.str());
+    TmsIndex phi_only;
+    phi_only.load(again, false);
+    assert(!phi_only.has_phi_inv() && phi_only.start_table_bytes() == 0);
+    check_walker(phi_only.phi_walker(), n, [&](ulint i) { return phi_only.phi_start(i); }, phi_only.phi_intervals(),
+                 [&](TmsIndex::PhiPos p) { return phi_only.phi(p); }, [&](TmsIndex::PhiPos p) { return phi_only.plcp(p); });
 }
 
 /**
@@ -560,7 +612,10 @@ bool test_phi_inv() {
         }
         ++count;
     }
-    std::cout << "  " << count << " texts PASSED" << std::endl;
+    // Some walker steps fast-forward over several intervals.
+    assert(g_max_fast_forward >= 4);
+    std::cout << "  " << count << " texts PASSED (walker steps fast-forward up to " << g_max_fast_forward
+              << " intervals)" << std::endl;
     return true;
 }
 

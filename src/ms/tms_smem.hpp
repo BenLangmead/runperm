@@ -63,19 +63,20 @@ inline std::vector<size_t> tms_smems(const std::vector<ulint>& ms, ulint min_len
  */
 inline ulint tms_interval_positions(TmsIndex& idx, ulint x, ulint len, std::vector<ulint>& out) {
     const size_t first = out.size();
+    // Append the positions of a walk from x while the LCP stays at least len.
+    auto walk = [&](const auto& wk) {
+        const auto p = wk.locate(x);
+        if (wk.lcp(p) < len) return;
+        auto q = wk.start_step(p);
+        ulint lcp;
+        do out.push_back(wk.step(q, lcp));
+        while (lcp >= len);
+    };
     // Up, collected bottom to top, then reversed.
-    auto p = idx.phi_at(x);
-    while (idx.plcp(p) >= len) {
-        p = idx.phi(p);
-        out.push_back(p.idx);
-    }
+    walk(idx.phi_walker());
     std::reverse(out.begin() + static_cast<std::ptrdiff_t>(first), out.end());
     out.push_back(x);
-    auto q = idx.phi_inv_at(x);
-    while (idx.plcpb(q) >= len) {
-        q = idx.phi_inv(q);
-        out.push_back(q.idx);
-    }
+    walk(idx.phi_inv_walker());
     return out.size() - first;
 }
 
@@ -131,15 +132,17 @@ struct Walks {
  * Run the up walks (phi, Down false) or the down walks (phi_inv, Down true)
  * of every SMEM in w, appending the positions each keeps to found.
  *
- * First, k walks at a time, locate each x among the interval starts by
- * binary search.  The k searches run in lockstep, one level per round, with
- * the same number of levels each, and each prefetches its next probe's
- * row.  Each search ends by reading the LCP at x and starting the walk's
- * first step, if the LCP is at least the SMEM's length.
+ * First, k walks at a time, locate each x among the interval starts: in
+ * three passes over the k, prefetch the start table entries that bound x's
+ * interval, read them and prefetch the rows between them, and binary search
+ * those rows.  Each search ends by reading the LCP at x and starting the
+ * walk's first step, if the LCP is at least the SMEM's length.
  *
- * Then walk, k at a time, round-robin: each visit finishes a step, reads
- * the LCP there, and starts and prefetches the next step while the LCP is
- * at least the length.  A slot whose walk ends takes the next walk with a
+ * Then walk, k at a time, round-robin: each visit takes a step with the
+ * walker, which also reads the LCP there and starts the next step, and
+ * prefetches the next step's row while the LCP is at least the length.  The
+ * prefetch covers the row's cache line and the next one, where most
+ * fast-forwards end.  A slot whose walk ends takes the next walk with a
  * step.
  *
  * An up walk keeps the max_listed positions nearest the top of the
@@ -151,46 +154,28 @@ template <bool Down>
 void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed, std::vector<ulint>& found) {
     using Pos = TmsIndex::PhiPos;
     static_assert(std::is_same_v<TmsIndex::PhiPos, TmsIndex::PhiInvPos>, "phi and phi_inv share a position type");
-    auto start_of = [&](ulint i) { if constexpr (Down) return idx.phi_inv_start(i); else return idx.phi_start(i); };
-    auto prefetch = [&](ulint i) { if constexpr (Down) idx.prefetch_phi_inv(i); else idx.prefetch_phi(i); };
-    const ulint intervals = Down ? idx.phi_inv_intervals() : idx.phi_intervals();
-    // A step prefetches its row and the row FF_AHEAD rows on.  Finishing
-    // the step reads the row and, when its offset runs past the interval,
-    // the rows after it (fast-forwarding); with rows under 16 bytes, the
-    // second prefetch covers the next cache line, where most fast-forwards
-    // end.  The two prefetches are written out where each step starts:
-    // gcc 13 at -O3 has been seen to drop both when a helper lambda holds
-    // them.
-    constexpr ulint FF_AHEAD = 5;
-    const ulint last = intervals - 1;
-    auto lcp = [&](Pos p) { if constexpr (Down) return idx.plcpb(p); else return idx.plcp(p); };
-    auto start = [&](Pos p) { if constexpr (Down) return idx.start_phi_inv(p); else return idx.start_phi(p); };
-    auto finish = [&](Pos p) { if constexpr (Down) return idx.finish_phi_inv(p); else return idx.finish_phi(p); };
+    const auto wk = [&] {
+        if constexpr (Down) return idx.phi_inv_walker();
+        else return idx.phi_walker();
+    }();
 
-    // Search.  base[t] is the last interval known to start at or before x,
-    // and x's interval is among the len intervals from there.
-    std::vector<ulint> base(std::min(k, w.size()));
-    for (size_t g = 0; g < w.size(); g += base.size()) {
-        const size_t m = std::min(base.size(), w.size() - g);
-        std::fill(base.begin(), base.begin() + static_cast<std::ptrdiff_t>(m), 0);
-        for (ulint len = intervals; len > 1;) {
-            const ulint half = len / 2;
-            len -= half;
-            const ulint ahead = len / 2;  // where the next level probes, from base
-            for (size_t t = 0; t < m; ++t) {
-                const ulint b = base[t], probe = b + half;
-                base[t] = start_of(probe) <= w[g + t].x ? probe : b;
-                prefetch(base[t] + ahead);
-            }
+    // Search, k at a time: prefetch each x's start table entries, then
+    // read them and prefetch the rows between them, then search those rows.
+    constexpr size_t MAX_LINES = 4;  // rows prefetched per search, in cache lines
+    std::vector<std::pair<ulint, ulint>> range(std::min(k, w.size()));
+    for (size_t g = 0; g < w.size(); g += range.size()) {
+        const size_t m = std::min(range.size(), w.size() - g);
+        for (size_t t = 0; t < m; ++t) wk.prefetch_table(w[g + t].x);
+        for (size_t t = 0; t < m; ++t) {
+            auto& [lo, hi] = range[t];
+            wk.range(w[g + t].x, lo, hi);
+            wk.prefetch_range(lo, hi, MAX_LINES);
         }
         for (size_t t = 0; t < m; ++t) {
             Walks& e = w[g + t];
-            Pos p;
-            p.interval = base[t];
-            p.offset = e.x - start_of(base[t]);
-            p.idx = e.x;
-            e.has_step = lcp(p) >= e.len;
-            if (e.has_step) e.first = start(p);
+            const Pos p = wk.locate(e.x, range[t].first, range[t].second);
+            e.has_step = wk.lcp(p) >= e.len;
+            if (e.has_step) e.first = wk.start_step(p);
         }
     }
 
@@ -225,8 +210,7 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
         s.smem = next++;
         const Walks& e = w[s.smem];
         s.p = e.first;
-        prefetch(s.p.interval);
-        prefetch(std::min(s.p.interval + FF_AHEAD, last));
+        wk.prefetch(s.p.interval);
         s.len = e.len;
         s.count = 0;
         s.buf.clear();
@@ -241,13 +225,12 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
     // Take s's pending step and start its next one.  Returns false once its
     // walk and every walk after it are done.
     auto visit = [&](Slot& s) {
-        const Pos p = finish(s.p);
+        ulint lcp;
+        const ulint x = wk.step(s.p, lcp);
         ++s.count;
-        if (s.buf.size() < s.budget) s.buf.push_back(p.idx);
-        if (lcp(p) >= s.len) {
-            s.p = start(p);
-            prefetch(s.p.interval);
-            prefetch(std::min(s.p.interval + FF_AHEAD, last));
+        if (s.buf.size() < s.budget) s.buf.push_back(x);
+        if (lcp >= s.len) {
+            wk.prefetch(s.p.interval);
             return true;
         }
         flush(s);
