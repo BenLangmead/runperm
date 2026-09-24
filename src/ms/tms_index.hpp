@@ -335,7 +335,7 @@ public:
 
         bool fits() const {
             return lf.template span_fits<ptr_col, off_col>() && lf.template span_fits<chr_col, psi_off_col>() &&
-                   fl.template span_fits<0, 3>();
+                   fl.template span_fits<0, 3>() && fl.offsets[0] == 0;
         }
         Row row(ulint i) const { return lf.row_start(i); }
         ulint length(Row r) const { return lf.template get_at<len_col>(r); }
@@ -364,22 +364,25 @@ public:
             q.offset = lf.template extract_span<chr_col, psi_off_col>(span);
             return q;
         }
+        /** Column col of an FL row read whole; its first column starts at bit 0. */
+        template <size_t col>
+        ulint fl_col(ulint w) const { return (w >> fl.offsets[col]) & fl.masks[col]; }
         /** As TmsIndex::psi_step, with c an alphabet code. */
         FLPos psi_step(FLPos q, uchar& c) const {
             ulint start = fl.row_start(q.interval);
             ulint w = fl.template get_span<0>(start);
-            ulint len = fl.template extract_span<0, fl_len_col>(w);
+            ulint len = w & fl.masks[fl_len_col];
             while (q.offset >= len) {
                 q.offset -= len;
                 ++q.interval;
                 start += fl.row_width;
                 w = fl.template get_span<0>(start);
-                len = fl.template extract_span<0, fl_len_col>(w);
+                len = w & fl.masks[fl_len_col];
             }
-            c = static_cast<uchar>(fl.template extract_span<0, fl_chr_col>(w));
+            c = static_cast<uchar>(fl_col<fl_chr_col>(w));
             FLPos next;
-            next.interval = fl.template extract_span<0, fl_ptr_col>(w);
-            next.offset = q.offset + fl.template extract_span<0, fl_off_col>(w);
+            next.interval = fl_col<fl_ptr_col>(w);
+            next.offset = q.offset + fl_col<fl_off_col>(w);
             return next;
         }
         void prefetch(ulint i) const { lf.prefetch(i); }
