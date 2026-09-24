@@ -89,23 +89,23 @@ public:
     TmsIndex(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
              const TmsBuildOptions& opts = TmsBuildOptions{}, const std::vector<ulint>* run_tops = nullptr) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+        // FL first, so that its encoding is freed before LF's is built.
+        fl_ = FL(Enc::fl_interval_encoding(heads, lens, opts.fl_split));
         Enc lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
         const ulint lf_count = lf_enc.intervals();
         std::vector<typename LF::data_tuple> cols(lf_count);
         {
-            Enc fl_enc = Enc::fl_interval_encoding(heads, lens, opts.fl_split);
             // Merge the two partitions of the rows: for each LF interval,
             // the FL interval holding its head row and the offset within it.
             ulint l_pos = 0, f_pos = 0, f_int = 0;
-            const ulint f_count = fl_enc.intervals();
+            const ulint f_count = fl_.intervals();
             for (ulint k = 0; k < lf_count; ++k) {
-                while (f_int < f_count && f_pos + fl_enc.get_length(f_int) <= l_pos)
-                    f_pos += fl_enc.get_length(f_int++);
+                while (f_int < f_count && f_pos + fl_.get_length(f_int) <= l_pos)
+                    f_pos += fl_.get_length(f_int++);
                 cols[k][col(TmsLFCols::PSI_INT)] = f_int;
                 cols[k][col(TmsLFCols::PSI_OFF)] = l_pos - f_pos;
                 l_pos += lf_enc.get_length(k);
             }
-            fl_ = FL(fl_enc);
         }
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
