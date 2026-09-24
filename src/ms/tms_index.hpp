@@ -130,6 +130,7 @@ public:
         }
         lf_ = LF(lf_enc, cols);
         compute_occurs();
+        if (has_phi_inv_) build_start_tables();
     }
 
     /** Write the index in Orbit's packed serialization, host byte order. */
@@ -169,6 +170,7 @@ public:
         if (has_phi_inv_) phi_inv_.load(in);
         if (!in.good()) throw std::runtime_error("truncated tms index");
         compute_occurs();
+        if (has_phi_inv_) build_start_tables();
     }
 
     bool has_phi() const { return has_phi_; }
@@ -281,7 +283,7 @@ public:
     ulint phi_intervals() const { return phi_.intervals(); }
     /** The first text position of phi interval i. */
     ulint phi_start(ulint i) const { return phi_.get_start(i); }
-    /** The phi point of text position x, by binary search over interval starts. */
+    /** The phi point of text position x, by binary search over interval starts narrowed by the start table. */
     PhiPos phi_at(ulint x) const { return phi_walker().locate(x); }
 
     // phi_inv side, like the phi side.
@@ -298,9 +300,77 @@ public:
     ulint phi_inv_start(ulint i) const { return phi_inv_.get_start(i); }
 
     /**
+     * A table over the high bits of text positions that narrows the search
+     * for a text position's phi or phi_inv interval: entry b holds the
+     * interval of text position b << shift, so the interval of x lies
+     * between entries x >> shift and (x >> shift) + 1.  The last entry, past
+     * every bucket, holds the last interval.  Built from the interval starts,
+     * not stored in the index.
+     */
+    class StartTable {
+    public:
+        using Rows = orbit::packed_matrix<1>;
+
+        StartTable() = default;
+        /** The table of a starts-based permutation with 2^shift positions per entry. */
+        template <typename Perm>
+        StartTable(const Perm& perm, unsigned shift) : shift_(shift), built_(true) {
+            const ulint n = perm.domain(), last = perm.intervals() - 1;
+            const ulint buckets = ((n - 1) >> shift) + 1;
+            rows_ = Rows(buckets + 1, {std::max<uchar>(1, orbit::bit_width(last))});
+            // Interval i gets the buckets whose first position lies in it.
+            const auto rd = perm.get_reader();
+            ulint b = 0;
+            for (ulint i = 0; i <= last; ++i) {
+                const ulint end = i < last ? rd.template get<Perm::start_column()>(i + 1) : n;
+                for (const ulint to = ((end - 1) >> shift) + 1; b < to; ++b) rows_.template set<0>(b, i);
+            }
+            rows_.template set<0>(buckets, last);
+        }
+        bool empty() const { return !built_; }
+        unsigned shift() const { return shift_; }
+        /** Bytes the table takes. */
+        size_t bytes() const { return built_ ? rows_.data_size() : 0; }
+        const Rows& rows() const { return rows_; }
+
+    private:
+        unsigned shift_ = 0;
+        bool built_ = false;
+        Rows rows_{};  // zero-initialized, so that an unbuilt table's reader is well defined
+    };
+
+    /**
+     * The table shift for a permutation over n text positions with the given
+     * intervals: the smallest whose entries cover, on average, at least
+     * START_TABLE_DENSITY intervals each.
+     */
+    static unsigned start_table_shift(ulint n, ulint intervals) {
+        unsigned s = 0;
+        while ((ulint(1) << s) * intervals < START_TABLE_DENSITY * n && s < 62) ++s;
+        return s;
+    }
+    static constexpr ulint START_TABLE_DENSITY = 4;
+
+    /**
+     * Build the start tables of phi and phi_inv, which phi_at, phi_inv_at and
+     * the walkers' locate use, with 2^shift text positions per entry;
+     * shift = -1 picks start_table_shift.  load() builds them when it reads
+     * phi_inv, and so does the constructor that builds phi_inv.
+     */
+    void build_start_tables(int shift = -1) {
+        auto pick = [&](const auto& perm) {
+            return shift < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(shift);
+        };
+        if (has_phi_) phi_table_ = StartTable(phi_, pick(phi_));
+        if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_));
+    }
+    /** Bytes the start tables take. */
+    size_t start_table_bytes() const { return phi_table_.bytes() + phi_inv_table_.bytes(); }
+
+    /**
      * Steps of phi or phi_inv walks, and locating text positions in them,
-     * from a local copy of what reading the rows needs (see
-     * packed_matrix::reader).  A step reads its row's start, the next
+     * from local copies of what reading the rows and the start table needs
+     * (see packed_matrix::reader).  A step reads its row's start, the next
      * row's start, and the pointer, offset and LCP columns, the last three
      * with one load when they fit in one.  It fast-forwards one interval at
      * a time.  Valid while the index is alive and unchanged.
@@ -308,6 +378,7 @@ public:
     template <typename Perm, auto LcpCol>
     class TextWalker {
         using Reader = decltype(std::declval<const Perm&>().get_reader());
+        using TableReader = decltype(std::declval<const StartTable::Rows&>().get_reader());
         static constexpr size_t START = Perm::start_column(), PTR = Perm::pointer_column(),
                                 OFF = Perm::offset_column(), LCP = Perm::template data_column<LcpCol>();
         static_assert(PTR + 1 == OFF && OFF + 1 == LCP, "a step reads the pointer, offset and LCP columns together");
@@ -315,8 +386,9 @@ public:
     public:
         using Pos = typename Perm::position;
 
-        explicit TextWalker(const Perm& perm)
-            : rd_(perm.get_reader()), last_(perm.intervals() - 1), n_(perm.domain()),
+        TextWalker(const Perm& perm, const StartTable& table)
+            : rd_(perm.get_reader()), tr_(table.rows().get_reader()), last_(perm.intervals() - 1),
+              n_(perm.domain()), shift_(table.shift()), has_table_(!table.empty()),
               span_(rd_.template span_fits<PTR, LCP>()) {}
 
         /** Hint that interval i's row, and the rows in the next cache line, will be read soon. */
@@ -324,6 +396,28 @@ public:
             const auto* a = rd_.data + rd_.row_start(i) / 8;
             ORBIT_PREFETCH(a);
             ORBIT_PREFETCH(a + 64);
+        }
+        /** Hint that the start table entries for text position x will be read soon. */
+        void prefetch_table(ulint x) const {
+            if (has_table_) tr_.prefetch(x >> shift_);
+        }
+        /** Intervals lo and hi such that x's interval lies between them. */
+        void range(ulint x, ulint& lo, ulint& hi) const {
+            if (!has_table_) {
+                lo = 0;
+                hi = last_;
+                return;
+            }
+            const ulint b = x >> shift_;
+            lo = tr_.template get<0>(b);
+            hi = tr_.template get<0>(b + 1);
+        }
+        /** Hint that the rows of intervals lo to hi will be read soon, at most max_lines cache lines. */
+        void prefetch_range(ulint lo, ulint hi, size_t max_lines) const {
+            const size_t a = rd_.row_start(lo) / 8, b = rd_.row_start(hi) / 8;
+            const auto* p = rd_.data + a;
+            const auto* end = rd_.data + std::min<size_t>(b + 16, a + 64 * max_lines);
+            for (; p < end; p += 64) ORBIT_PREFETCH(p);
         }
         /** The resolved point of text position x, whose interval lies between lo and hi. */
         Pos locate(ulint x, ulint lo, ulint hi) const {
@@ -340,7 +434,11 @@ public:
             return p;
         }
         /** The resolved point of text position x. */
-        Pos locate(ulint x) const { return locate(x, 0, last_); }
+        Pos locate(ulint x) const {
+            ulint lo, hi;
+            range(x, lo, hi);
+            return locate(x, lo, hi);
+        }
         /** The LCP column at a resolved point, minus its offset: PLCP or PLCPB there. */
         ulint lcp(Pos p) const { return rd_.template get<LCP>(p.interval) - p.offset; }
         /** The unresolved point one step on from a resolved point. */
@@ -394,15 +492,17 @@ public:
 
     private:
         Reader rd_;
+        TableReader tr_;
         ulint last_, n_;
-        bool span_;
+        unsigned shift_;
+        bool has_table_, span_;
 
         ulint start(ulint i) const { return rd_.template get<START>(i); }
     };
     using PhiWalker = TextWalker<Phi, TmsPhiCols::PLCP>;
     using PhiInvWalker = TextWalker<PhiInv, TmsPhiInvCols::PLCPB>;
-    PhiWalker phi_walker() const { return PhiWalker(phi_); }
-    PhiInvWalker phi_inv_walker() const { return PhiInvWalker(phi_inv_); }
+    PhiWalker phi_walker() const { return PhiWalker(phi_, phi_table_); }
+    PhiInvWalker phi_inv_walker() const { return PhiInvWalker(phi_inv_, phi_inv_table_); }
 
     const LF& lf() const { return lf_; }
     const FL& fl() const { return fl_; }
@@ -447,6 +547,8 @@ private:
     Phi phi_;
     PhiInv phi_inv_;
     bool has_phi_ = false, has_phi_inv_ = false;
+    // Start tables of phi and phi_inv, built when phi_inv is present.
+    StartTable phi_table_, phi_inv_table_;
     std::array<bool, 256> occurs_{};
     // Rows between prefetches in prefetch_rows: the most whose starts span
     // fewer than 512 bits, so every cache line of a range gets one.

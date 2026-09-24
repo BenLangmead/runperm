@@ -132,11 +132,11 @@ struct Walks {
  * Run the up walks (phi, Down false) or the down walks (phi_inv, Down true)
  * of every SMEM in w, appending the positions each keeps to found.
  *
- * First, k walks at a time, locate each x among the interval starts by
- * binary search.  The k searches run in lockstep, one level per round, with
- * the same number of levels each, and each prefetches its next probe's
- * row.  Each search ends by reading the LCP at x and starting the walk's
- * first step, if the LCP is at least the SMEM's length.
+ * First, k walks at a time, locate each x among the interval starts: in
+ * three passes over the k, prefetch the start table entries that bound x's
+ * interval, read them and prefetch the rows between them, and binary search
+ * those rows.  Each search ends by reading the LCP at x and starting the
+ * walk's first step, if the LCP is at least the SMEM's length.
  *
  * Then walk, k at a time, round-robin: each visit takes a step with the
  * walker, which also reads the LCP there and starts the next step, and
@@ -158,32 +158,22 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
         if constexpr (Down) return idx.phi_inv_walker();
         else return idx.phi_walker();
     }();
-    auto start_of = [&](ulint i) { if constexpr (Down) return idx.phi_inv_start(i); else return idx.phi_start(i); };
-    auto prefetch = [&](ulint i) { if constexpr (Down) idx.prefetch_phi_inv(i); else idx.prefetch_phi(i); };
-    const ulint intervals = Down ? idx.phi_inv_intervals() : idx.phi_intervals();
 
-    // Search.  base[t] is the last interval known to start at or before x,
-    // and x's interval is among the len intervals from there.
-    std::vector<ulint> base(std::min(k, w.size()));
-    for (size_t g = 0; g < w.size(); g += base.size()) {
-        const size_t m = std::min(base.size(), w.size() - g);
-        std::fill(base.begin(), base.begin() + static_cast<std::ptrdiff_t>(m), 0);
-        for (ulint len = intervals; len > 1;) {
-            const ulint half = len / 2;
-            len -= half;
-            const ulint ahead = len / 2;  // where the next level probes, from base
-            for (size_t t = 0; t < m; ++t) {
-                const ulint b = base[t], probe = b + half;
-                base[t] = start_of(probe) <= w[g + t].x ? probe : b;
-                prefetch(base[t] + ahead);
-            }
+    // Search, k at a time: prefetch each x's start table entries, then
+    // read them and prefetch the rows between them, then search those rows.
+    constexpr size_t MAX_LINES = 4;  // rows prefetched per search, in cache lines
+    std::vector<std::pair<ulint, ulint>> range(std::min(k, w.size()));
+    for (size_t g = 0; g < w.size(); g += range.size()) {
+        const size_t m = std::min(range.size(), w.size() - g);
+        for (size_t t = 0; t < m; ++t) wk.prefetch_table(w[g + t].x);
+        for (size_t t = 0; t < m; ++t) {
+            auto& [lo, hi] = range[t];
+            wk.range(w[g + t].x, lo, hi);
+            wk.prefetch_range(lo, hi, MAX_LINES);
         }
         for (size_t t = 0; t < m; ++t) {
             Walks& e = w[g + t];
-            Pos p;
-            p.interval = base[t];
-            p.offset = e.x - start_of(base[t]);
-            p.idx = e.x;
+            const Pos p = wk.locate(e.x, range[t].first, range[t].second);
             e.has_step = wk.lcp(p) >= e.len;
             if (e.has_step) e.first = wk.start_step(p);
         }
