@@ -13,6 +13,10 @@ ms: $(MS_SRCS) $(MS_HDRS)
 debug: CXXFLAGS += -O0 -g
 debug: ms
 
+# Microbenchmark of LF and psi step chains on a tms index
+tms_chain_bench: tms_chain_bench.cpp $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp
+
 .PHONY: test all clean debug
 test: ms
 	./ms test ../../data
@@ -20,4 +24,4 @@ test: ms
 all: ms
 
 clean:
-	rm -f ms
+	rm -f ms tms_chain_bench

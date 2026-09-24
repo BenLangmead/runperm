@@ -15,6 +15,7 @@
 #include "tms_index.hpp"
 #include "tms_query.hpp"
 #include "tms_test.hpp"
+#include "perf_counters.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -238,6 +239,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     std::string name, seq, line;
     size_t n_reads = 0, n_bases = 0;
     double query_s = 0.0;
+    PerfCounters perf;
     auto t_all = clock::now();
     // With --positions, a second tab-separated field holds the positions
     // (-1 for none).
@@ -264,7 +266,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         // One read at a time with ms_query.
         while (reads.next(name, seq)) {
             auto tq = clock::now();
+            perf.start();
             auto ms = query_one(*opt, seq);
+            perf.stop();
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             ++n_reads;
             n_bases += seq.size();
@@ -286,7 +290,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             }
             if (seqs.empty()) break;
             auto tq = clock::now();
+            perf.start();
             query_many(*opt, seqs, interleave, results);
+            perf.stop();
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             n_reads += seqs.size();
             if (write_output)
@@ -303,8 +309,12 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
               << " dist/rep=" << double(tms_stats.dist) / tms_stats.repositions
               << " dist1_frac=" << double(tms_stats.dist1) / tms_stats.repositions
               << " lce/rep=" << double(tms_stats.lce) / tms_stats.repositions
-              << " capped_frac=" << double(tms_stats.lce_capped) / tms_stats.repositions << "\n";
+              << " capped_frac=" << double(tms_stats.lce_capped) / tms_stats.repositions
+              << " scan_visits/rep=" << double(tms_stats.scan_visits) / tms_stats.repositions
+              << " lf_ff/step=" << double(tms_stats.lf_ff) / tms_stats.lf_steps
+              << " walk_visits/base=" << double(tms_stats.walk_visits) / tms_stats.bases << "\n";
 #endif
+    perf.report(std::cerr, n_bases);
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases
               << " index_load_s=" << load_s << " query_s=" << query_s
