@@ -282,11 +282,11 @@ public:
     /** The first text position of phi interval i. */
     ulint phi_start(ulint i) const { return phi_.get_start(i); }
     /** The phi point of text position x, by binary search over interval starts. */
-    PhiPos phi_at(ulint x) const { return locate<PhiPos>(phi_, x); }
+    PhiPos phi_at(ulint x) const { return phi_walker().locate(x); }
 
     // phi_inv side, like the phi side.
-    /** The phi_inv point of text position x, by binary search over interval starts. */
-    PhiInvPos phi_inv_at(ulint x) const { return locate<PhiInvPos>(phi_inv_, x); }
+    /** The phi_inv point of text position x, as phi_at. */
+    PhiInvPos phi_inv_at(ulint x) const { return phi_inv_walker().locate(x); }
     PhiInvPos phi_inv(PhiInvPos p) { return phi_inv_.phi_inv(p); }
     PhiInvPos start_phi_inv(PhiInvPos p) const { return phi_inv_.start_next(p); }
     PhiInvPos finish_phi_inv(PhiInvPos p) const { return phi_inv_.finish_next(p); }
@@ -296,6 +296,113 @@ public:
     ulint phi_inv_intervals() const { return phi_inv_.intervals(); }
     /** The first text position of phi_inv interval i. */
     ulint phi_inv_start(ulint i) const { return phi_inv_.get_start(i); }
+
+    /**
+     * Steps of phi or phi_inv walks, and locating text positions in them,
+     * from a local copy of what reading the rows needs (see
+     * packed_matrix::reader).  A step reads its row's start, the next
+     * row's start, and the pointer, offset and LCP columns, the last three
+     * with one load when they fit in one.  It fast-forwards one interval at
+     * a time.  Valid while the index is alive and unchanged.
+     */
+    template <typename Perm, auto LcpCol>
+    class TextWalker {
+        using Reader = decltype(std::declval<const Perm&>().get_reader());
+        static constexpr size_t START = Perm::start_column(), PTR = Perm::pointer_column(),
+                                OFF = Perm::offset_column(), LCP = Perm::template data_column<LcpCol>();
+        static_assert(PTR + 1 == OFF && OFF + 1 == LCP, "a step reads the pointer, offset and LCP columns together");
+
+    public:
+        using Pos = typename Perm::position;
+
+        explicit TextWalker(const Perm& perm)
+            : rd_(perm.get_reader()), last_(perm.intervals() - 1), n_(perm.domain()),
+              span_(rd_.template span_fits<PTR, LCP>()) {}
+
+        /** Hint that interval i's row, and the rows in the next cache line, will be read soon. */
+        void prefetch(ulint i) const {
+            const auto* a = rd_.data + rd_.row_start(i) / 8;
+            ORBIT_PREFETCH(a);
+            ORBIT_PREFETCH(a + 64);
+        }
+        /** The resolved point of text position x, whose interval lies between lo and hi. */
+        Pos locate(ulint x, ulint lo, ulint hi) const {
+            ulint base = lo, len = hi - lo + 1;
+            while (len > 1) {
+                const ulint half = len / 2;
+                base = start(base + half) <= x ? base + half : base;
+                len -= half;
+            }
+            Pos p;
+            p.interval = base;
+            p.offset = x - start(base);
+            p.idx = x;
+            return p;
+        }
+        /** The resolved point of text position x. */
+        Pos locate(ulint x) const { return locate(x, 0, last_); }
+        /** The LCP column at a resolved point, minus its offset: PLCP or PLCPB there. */
+        ulint lcp(Pos p) const { return rd_.template get<LCP>(p.interval) - p.offset; }
+        /** The unresolved point one step on from a resolved point. */
+        Pos start_step(Pos p) const {
+            const size_t row = rd_.row_start(p.interval);
+            Pos q;
+            q.interval = rd_.template get_at<PTR>(row);
+            q.offset = rd_.template get_at<OFF>(row) + p.offset;
+            q.idx = 0;
+            return q;
+        }
+        /**
+         * One step of a walk.  p is unresolved, from start_step or a
+         * previous step.  Resolves it, sets lcp to the LCP there (PLCP or
+         * PLCPB) and returns its text position; p becomes the unresolved
+         * point one step on.
+         */
+        ulint step(Pos& p, ulint& lcp) const {
+            ulint i = p.interval;
+            size_t row = rd_.row_start(i);
+            ulint first = rd_.template get_at<START>(row);
+            const ulint x = first + p.offset;
+            // Row last + 1 lies in the matrix's padding, so reading its
+            // start is safe; the value is replaced by n.
+            ulint next = rd_.template get_at<START>(row + rd_.row_width);
+            if (i == last_) next = n_;
+            while (x >= next) {
+                ++i;
+                row += rd_.row_width;
+                first = next;
+                next = rd_.template get_at<START>(row + rd_.row_width);
+                if (i == last_) next = n_;
+            }
+            const ulint off = x - first;
+            ulint ptr, poff, l;
+            if (span_) {
+                const ulint s = rd_.template get_span<PTR>(row);
+                ptr = rd_.template extract_span<PTR, PTR>(s);
+                poff = rd_.template extract_span<PTR, OFF>(s);
+                l = rd_.template extract_span<PTR, LCP>(s);
+            } else {
+                ptr = rd_.template get_at<PTR>(row);
+                poff = rd_.template get_at<OFF>(row);
+                l = rd_.template get_at<LCP>(row);
+            }
+            lcp = l - off;
+            p.interval = ptr;
+            p.offset = poff + off;
+            return x;
+        }
+
+    private:
+        Reader rd_;
+        ulint last_, n_;
+        bool span_;
+
+        ulint start(ulint i) const { return rd_.template get<START>(i); }
+    };
+    using PhiWalker = TextWalker<Phi, TmsPhiCols::PLCP>;
+    using PhiInvWalker = TextWalker<PhiInv, TmsPhiInvCols::PLCPB>;
+    PhiWalker phi_walker() const { return PhiWalker(phi_); }
+    PhiInvWalker phi_inv_walker() const { return PhiInvWalker(phi_inv_); }
 
     const LF& lf() const { return lf_; }
     const FL& fl() const { return fl_; }
@@ -357,22 +464,6 @@ private:
         fl_rows_fit_word_ = fl_.row_fits_word();
         occurs_.fill(false);
         for (ulint i = 0; i < lf_.intervals(); ++i) occurs_[lf_.get_character(i)] = true;
-    }
-
-    /** The point of text position x in a starts-based permutation. */
-    template <typename Pos, typename Perm>
-    static Pos locate(const Perm& perm, ulint x) {
-        ulint lo = 0, hi = perm.intervals();  // perm.get_start(lo) <= x < perm.get_start(hi)
-        while (hi - lo > 1) {
-            const ulint mid = lo + (hi - lo) / 2;
-            if (perm.get_start(mid) <= x) lo = mid;
-            else hi = mid;
-        }
-        Pos p;
-        p.interval = lo;
-        p.offset = x - perm.get_start(lo);
-        p.idx = x;
-        return p;
     }
 
     /**
