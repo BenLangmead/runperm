@@ -7,6 +7,7 @@
 #include "tms_test.hpp"
 #include "tms_index.hpp"
 #include "tms_query.hpp"
+#include "tms_smem.hpp"
 #include "ms_rlbwt.hpp"
 #include "tsv.hpp"
 #include <algorithm>
@@ -223,6 +224,47 @@ std::vector<TmsBuildOptions> split_variants() {
     return {a, b, c, d};
 }
 
+/** An RLBWT with each run's top LCP and the text it came from. */
+struct Input { std::vector<uchar> heads; std::vector<ulint> lens, tops; std::string text; };
+
+/** The fuzz texts and, if its LF is a single cycle, minishred. */
+std::vector<Input> batch_inputs(const std::string& data_dir, std::mt19937& rng) {
+    std::vector<Input> inputs;
+    for (const auto& s : fuzz_texts(rng)) {
+        TextBwt t = make_text_bwt(s);
+        Input in{t.heads, t.lens, {}, t.str};
+        for (const auto& l : t.lcps_per_run) in.tops.push_back(l[0]);
+        inputs.push_back(std::move(in));
+    }
+    {
+        std::vector<uchar> heads;
+        std::vector<ulint> lens;
+        std::vector<std::vector<ulint>> lcps;
+        if (tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", heads, lens, lcps)) {
+            Input in{heads, lens, {}, {}};
+            for (const auto& l : lcps) in.tops.push_back(l[0]);
+            try {
+                TmsIndex probe(heads, lens, TmsBuildOptions{}, &in.tops);
+                auto pos = probe.first();
+                // Row 0 holds text position n - 1, so the s-th row LF visits
+                // from it has BWT character T[n - 2 - s].
+                const ulint n = probe.domain();
+                std::string T(n, ' ');
+                for (ulint st = 0; st < n; ++st) {
+                    const uchar c = probe.get_character(pos.interval);
+                    T[(2 * n - 2 - st) % n] = c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : static_cast<char>(c);
+                    pos = probe.LF_step(pos);
+                }
+                in.text = T;
+                inputs.push_back(std::move(in));
+            } catch (const std::exception& e) {
+                std::cout << "  minishred skipped: " << e.what() << std::endl;
+            }
+        }
+    }
+    return inputs;
+}
+
 }  // namespace
 
 bool test_orbit_structures() {
@@ -323,41 +365,8 @@ bool test_tms_vs_ms_minishred(const std::string& data_dir) {
  */
 bool test_tms_batch(const std::string& data_dir) {
     std::cout << "Testing tms_query_batch in every mode against tms_query" << std::endl;
-    struct Input { std::vector<uchar> heads; std::vector<ulint> lens, tops; std::string text; };
-    std::vector<Input> inputs;
     std::mt19937 rng(41);
-    for (const auto& s : fuzz_texts(rng)) {
-        TextBwt t = make_text_bwt(s);
-        Input in{t.heads, t.lens, {}, t.str};
-        for (const auto& l : t.lcps_per_run) in.tops.push_back(l[0]);
-        inputs.push_back(std::move(in));
-    }
-    {
-        std::vector<uchar> heads;
-        std::vector<ulint> lens;
-        std::vector<std::vector<ulint>> lcps;
-        if (tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", heads, lens, lcps)) {
-            Input in{heads, lens, {}, {}};
-            for (const auto& l : lcps) in.tops.push_back(l[0]);
-            try {
-                TmsIndex probe(heads, lens, TmsBuildOptions{}, &in.tops);
-                auto pos = probe.first();
-                // Row 0 holds text position n - 1, so the s-th row LF visits
-                // from it has BWT character T[n - 2 - s].
-                const ulint n = probe.domain();
-                std::string T(n, ' ');
-                for (ulint st = 0; st < n; ++st) {
-                    const uchar c = probe.get_character(pos.interval);
-                    T[(2 * n - 2 - st) % n] = c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : static_cast<char>(c);
-                    pos = probe.LF_step(pos);
-                }
-                in.text = T;
-                inputs.push_back(std::move(in));
-            } catch (const std::exception& e) {
-                std::cout << "  minishred skipped: " << e.what() << std::endl;
-            }
-        }
-    }
+    const auto inputs = batch_inputs(data_dir, rng);
     const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
     size_t checked = 0, positions = 0;
     for (const auto& in : inputs) {
@@ -417,6 +426,214 @@ bool test_tms_batch(const std::string& data_dir) {
     return true;
 }
 
+namespace {
+
+/**
+ * TmsIndex's phi_inv maps SA[j] to SA[j + 1] (SA[n - 1] to SA[0]) and its
+ * PLCPB is the LCP with the row below (0 for row n - 1); phi_at and
+ * phi_inv_at locate every text position; both survive serialization.
+ * Unsplit, phi_inv has the intervals Orbit's rlbwt_to_phi_inv gives.
+ */
+void check_phi_inv(const TextBwt& t, const TmsBuildOptions& o) {
+    const ulint n = t.text.size();
+    std::vector<ulint> tops;
+    for (const auto& l : t.lcps_per_run) tops.push_back(l[0]);
+    TmsIndex idx(t.heads, t.lens, o, &tops);
+    assert(idx.has_phi_inv());
+    std::stringstream ss;
+    idx.serialize(ss);
+    TmsIndex loaded;
+    loaded.load(ss);
+    assert(loaded.has_phi_inv());
+    if (o.phi_split == orbit::NO_SPLITTING)
+        assert(idx.phi_inv_intervals() == orbit::rlbwt::rlbwt_to_phi_inv(t.heads, t.lens, orbit::NO_SPLITTING).intervals());
+    for (TmsIndex* x : {&idx, &loaded}) {
+        for (ulint p = 0; p < n; ++p) {
+            const ulint j = t.isa[p];
+            auto a = x->phi_at(p);
+            assert(a.idx == p);
+            assert(x->plcp(a) == t.lcp[j] && "PLCP at a located phi point");
+            assert(x->phi(a).idx == t.sa[j == 0 ? n - 1 : j - 1]);
+            auto b = x->phi_inv_at(p);
+            assert(b.idx == p);
+            assert(x->plcpb(b) == (j + 1 < n ? t.lcp[j + 1] : 0) && "PLCPB is the LCP with the row below");
+            assert(x->phi_inv(b).idx == t.sa[j + 1 < n ? j + 1 : 0] && "phi_inv(SA[j]) = SA[j + 1]");
+        }
+    }
+}
+
+/**
+ * SMEMs of P against T by brute force: every substring that occurs and
+ * extends in neither direction (a maximal exact match), minus those inside
+ * another.  Returns (start, length) pairs sorted by start.
+ */
+std::vector<std::pair<size_t, size_t>> naive_smems(const std::string& T, const std::string& P) {
+    const size_t m = P.size();
+    auto occurs = [&](size_t a, size_t b) { return T.find(P.substr(a, b - a)) != std::string::npos; };
+    std::vector<std::pair<size_t, size_t>> mems;
+    for (size_t a = 0; a < m; ++a)
+        for (size_t b = a + 1; b <= m; ++b) {
+            if (!occurs(a, b)) break;
+            if ((b == m || !occurs(a, b + 1)) && (a == 0 || !occurs(a - 1, b))) mems.push_back({a, b - a});
+        }
+    std::vector<std::pair<size_t, size_t>> out;
+    for (const auto& x : mems) {
+        bool inside = false;
+        for (const auto& y : mems)
+            if (y != x && y.first <= x.first && x.first + x.second <= y.first + y.second) inside = true;
+        if (!inside) out.push_back(x);
+    }
+    return out;
+}
+
+}  // namespace
+
+bool test_phi_inv() {
+    std::cout << "Testing phi_inv and PLCPB in TmsIndex" << std::endl;
+    std::mt19937 rng(7);
+    size_t count = 0;
+    for (const auto& s : fuzz_texts(rng)) {
+        TextBwt t = make_text_bwt(s);
+        for (const auto& sp : {orbit::NO_SPLITTING, orbit::split_params{}, orbit::split_params(std::nullopt, 2)}) {
+            TmsBuildOptions o;
+            o.phi_split = sp;
+            check_phi_inv(t, o);
+        }
+        ++count;
+    }
+    std::cout << "  " << count << " texts PASSED" << std::endl;
+    return true;
+}
+
+bool test_smem_detection() {
+    std::cout << "Testing SMEM detection from matching statistics against brute force" << std::endl;
+    std::mt19937 rng(29);
+    size_t checked = 0;
+    for (const auto& s : fuzz_texts(rng)) {
+        const std::string T = s + "$";
+        auto pats = fuzz_patterns(T, rng, 40);
+        for (auto& P : pats) {
+            if (P.size() > 60) P.resize(60);
+            const auto ms = naive_ms(T, P);
+            const auto want = naive_smems(T, P);
+            for (ulint min_len : {0, 1, 3, 10}) {
+                std::vector<std::pair<size_t, size_t>> got, want_min;
+                for (size_t i : tms_smems(ms, min_len)) got.push_back({i, ms[i]});
+                for (const auto& x : want)
+                    if (x.second > min_len) want_min.push_back(x);
+                if (got != want_min) {
+                    std::cout << "  FAILED: pattern " << P << " min_len " << min_len << std::endl;
+                    assert(false && "tms_smems must match brute-force SMEMs");
+                    return false;
+                }
+                checked += got.size();
+            }
+        }
+    }
+    std::cout << "  " << checked << " SMEMs PASSED" << std::endl;
+    return true;
+}
+
+/**
+ * tms_report_smems on the fuzz texts and minishred: for SMEM_ALL, each
+ * SMEM's positions are exactly the start positions of P[i .. i + L) in T,
+ * without repeats, with count c; on the fuzz texts they are also in
+ * increasing row order and consecutive.  For SMEM_ONE, the position is one
+ * of them.  Both are the same in every mode and for every k, and the SMEMs
+ * are those tms_smems gives.
+ */
+bool test_smem_report(const std::string& data_dir) {
+    std::cout << "Testing SMEM reports against every occurrence" << std::endl;
+    std::mt19937 rng(43);
+    const auto inputs = batch_inputs(data_dir, rng);
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    size_t smems = 0, positions = 0;
+    for (const auto& in : inputs) {
+        const std::string& T = in.text;
+        // Row order is checked where the suffix array is at hand.
+        std::vector<ulint> isa;
+        if (T.size() < 5000) {
+            TextBwt t = make_text_bwt(T.substr(0, T.size() - 1));
+            isa = t.isa;
+        }
+        auto pats = fuzz_patterns(T, rng, in.text.size() > 5000 ? 60 : 100);
+        for (const auto& o : split_variants()) {
+            TmsIndex idx(in.heads, in.lens, o, &in.tops);
+            for (ulint min_len : {0, 5}) {
+                std::vector<std::vector<TmsSmemHits>> first[2];
+                for (TmsMode mode : modes) {
+                    for (size_t k : {1, 32}) {
+                        std::vector<std::vector<ulint>> len, pos;
+                        tms_query_batch(idx, pats, k, len, mode, &pos);
+                        for (int r = 0; r < 2; ++r) {
+                            const TmsReport report = r ? TmsReport::SMEM_ALL : TmsReport::SMEM_ONE;
+                            std::vector<TmsSmemHits> hits(pats.size());
+                            for (size_t j = 0; j < pats.size(); ++j)
+                                tms_report_smems(idx, len[j], pos[j], min_len, report, hits[j]);
+                            if (!first[r].empty()) {
+                                std::vector<std::string> a, b;
+                                for (size_t j = 0; j < pats.size(); ++j) {
+                                    a.emplace_back();
+                                    b.emplace_back();
+                                    tms_format_smems(hits[j], report, a.back());
+                                    tms_format_smems(first[r][0][j], report, b.back());
+                                }
+                                if (a != b) {
+                                    std::cout << "  FAILED: SMEMs differ in mode " << int(mode) << ", k " << k << std::endl;
+                                    assert(false && "SMEM reports must not depend on mode or k");
+                                    return false;
+                                }
+                                continue;
+                            }
+                            first[r].push_back(hits);
+                            for (size_t j = 0; j < pats.size(); ++j) {
+                                const auto starts = tms_smems(len[j], min_len);
+                                assert(starts.size() == hits[j].smems.size());
+                                size_t at = 0;
+                                for (size_t x = 0; x < starts.size(); ++x) {
+                                    const auto& h = hits[j].smems[x];
+                                    assert(h.start == starts[x] && h.len == len[j][h.start]);
+                                    const std::string sub = pats[j].substr(h.start, h.len);
+                                    std::vector<ulint> all;
+                                    for (size_t f = T.find(sub); f != std::string::npos; f = T.find(sub, f + 1)) all.push_back(f);
+                                    std::vector<ulint> got(hits[j].pos.begin() + at, hits[j].pos.begin() + at + h.count);
+                                    at += h.count;
+                                    bool ok;
+                                    if (report == TmsReport::SMEM_ONE) {
+                                        ok = h.count == 1 && std::binary_search(all.begin(), all.end(), got[0]);
+                                    } else {
+                                        if (!isa.empty())
+                                            for (size_t y = 1; y < got.size(); ++y)
+                                                if (isa[got[y]] != isa[got[y - 1]] + 1) {
+                                                    std::cout << "  FAILED: positions not in row order" << std::endl;
+                                                    assert(false && "positions must be in row order");
+                                                    return false;
+                                                }
+                                        std::vector<ulint> sorted = got;
+                                        std::sort(sorted.begin(), sorted.end());
+                                        ok = h.count == got.size() && sorted == all;
+                                    }
+                                    if (!ok) {
+                                        std::cout << "  FAILED: pattern " << pats[j] << " SMEM " << h.start << ":" << h.len
+                                                  << " has " << h.count << " positions, text has " << all.size() << std::endl;
+                                        assert(false && "SMEM positions must be the occurrences");
+                                        return false;
+                                    }
+                                    ++smems;
+                                    positions += got.size();
+                                }
+                                assert(at == hits[j].pos.size());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::cout << "  " << smems << " SMEMs and " << positions << " positions PASSED" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -426,6 +643,12 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_tms_vs_ms_minishred(data_dir)) all_ran = false;
     std::cout << std::endl;
     test_tms_batch(data_dir);
+    std::cout << std::endl;
+    test_phi_inv();
+    std::cout << std::endl;
+    test_smem_detection();
+    std::cout << std::endl;
+    test_smem_report(data_dir);
     std::cout << std::endl;
     std::cout << (all_ran ? "All tms_test checks PASSED" : "SOME TMS TESTS NOT RUN") << std::endl;
     return all_ran;
