@@ -2,7 +2,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -I../../include -I. -O3
 
-MS_SRCS = ms.cpp tsv.cpp ms_io.cpp ms_test.cpp inspect.cpp
+MS_SRCS = ms.cpp tsv.cpp ms_io.cpp ms_test.cpp inspect.cpp tms_test.cpp
 
 MS_HDRS = $(wildcard *.hpp) $(shell find ../../include -name '*.hpp')
 

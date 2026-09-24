@@ -12,6 +12,9 @@
 #include "inspect.hpp"
 #include "ms_test.hpp"
 #include "rlbwt_io.hpp"
+#include "tms_index.hpp"
+#include "tms_query.hpp"
+#include "tms_test.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -20,6 +23,7 @@
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <optional>
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -45,6 +49,17 @@ static void usage(const char* prog) {
               << "              (default 32); K = 0 queries one read at a time without\n"
               << "              prefetching.  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
+              << "  tms-build  HEADS LENS INDEX_PATH [--lf-split B] [--fl-split B]\n"
+              << "              Build a tms index (LF and psi, no LCP input) from an RLBWT.\n"
+              << "              --lf-split and --fl-split set Orbit's balancing factor for\n"
+              << "              that structure (0 = no splitting; defaults: LF 0, FL Orbit's\n"
+              << "              default length capping and balancing).\n"
+              << "  tms-build-tsv TSV_PATH INDEX_PATH [--lf-split B] [--fl-split B]\n"
+              << "              Same, taking the runs from a TSV.\n"
+              << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
+              << "              As batch, with a tms index.\n"
+              << "  tms-inspect INDEX_PATH\n"
+              << "              Print the structures' sizes and column widths.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
               << "              Inspect index and optionally output spillover TSV.\n"
               << "  lcp-list   TSV_PATH\n"
@@ -120,8 +135,36 @@ private:
     size_t count_ = 0;
 };
 
-/** ms batch: load the index once, then compute matching statistics for every read. */
-static int run_batch(int argc, char** argv) {
+static std::vector<ulint> query_one(MSIndexSpillLCP<false>& idx, const std::string& s) { return ms_query(idx, s); }
+static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::string>& p, size_t k,
+                       std::vector<std::vector<ulint>>& out) {
+    ms_query_batch(idx, p, k, out);
+}
+static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) { return tms_query(idx, s); }
+static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k,
+                       std::vector<std::vector<ulint>>& out) {
+    tms_query_batch(idx, p, k, out);
+}
+
+static std::optional<TmsIndex> read_tms_index(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) return std::nullopt;
+    TmsIndex idx;
+    try {
+        idx.load(in);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return std::nullopt;
+    }
+    return idx;
+}
+
+/**
+ * ms batch and tms-batch: load the index once, then compute matching
+ * statistics for every read.
+ */
+template <typename Index>
+static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const std::string&)) {
     if (argc < 2) {
         std::cerr << "batch requires INDEX_PATH and READS\n";
         return 1;
@@ -138,7 +181,7 @@ static int run_batch(int argc, char** argv) {
     }
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
-    auto opt = ms_serialize::read_index(idx_path);
+    auto opt = read(idx_path);
     if (!opt) {
         std::cerr << "Failed to load index: " << idx_path << "\n";
         return 1;
@@ -181,7 +224,7 @@ static int run_batch(int argc, char** argv) {
         // One read at a time with ms_query.
         while (reads.next(name, seq)) {
             auto tq = clock::now();
-            auto ms = ms_query(*opt, seq);
+            auto ms = query_one(*opt, seq);
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             ++n_reads;
             n_bases += seq.size();
@@ -203,7 +246,7 @@ static int run_batch(int argc, char** argv) {
             }
             if (seqs.empty()) break;
             auto tq = clock::now();
-            ms_query_batch(*opt, seqs, interleave, results);
+            query_many(*opt, seqs, interleave, results);
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             n_reads += seqs.size();
             if (write_output)
@@ -232,7 +275,10 @@ int main(int argc, char** argv) {
 
     if (cmd == "test") {
         std::string data_dir = (argc > 0 && argv[0][0] != '-') ? argv[0] : "./data";
-        return ms_test::run_all_tests(data_dir) ? 0 : 1;
+        const bool ms_ok = ms_test::run_all_tests(data_dir);
+        std::cout << std::endl;
+        const bool tms_ok = tms_test::run_all_tests(data_dir);
+        return (ms_ok && tms_ok) ? 0 : 1;
     }
 
     if (cmd == "discover") {
@@ -391,7 +437,75 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "batch") {
-        return run_batch(argc, argv);
+        return run_batch<MSIndexSpillLCP<false>>(argc, argv, ms_serialize::read_index);
+    }
+
+    if (cmd == "tms-batch") {
+        return run_batch<TmsIndex>(argc, argv, read_tms_index);
+    }
+
+    if (cmd == "tms-build" || cmd == "tms-build-tsv") {
+        const bool from_tsv = cmd == "tms-build-tsv";
+        const int npos = from_tsv ? 2 : 3;
+        if (argc < npos) {
+            std::cerr << cmd << (from_tsv ? " requires TSV_PATH and INDEX_PATH\n" : " requires HEADS, LENS and INDEX_PATH\n");
+            return 1;
+        }
+        TmsBuildOptions opts;
+        auto split_arg = [](const char* v) {
+            const ulint b = std::stoull(v);
+            return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
+        };
+        for (int i = npos; i < argc; ++i) {
+            if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) opts.lf_split = split_arg(argv[++i]);
+            else if (strcmp(argv[i], "--fl-split") == 0 && i + 1 < argc) opts.fl_split = split_arg(argv[++i]);
+            else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
+        }
+        using clock = std::chrono::steady_clock;
+        auto t0 = clock::now();
+        std::vector<uchar> heads;
+        std::vector<ulint> lens;
+        if (from_tsv) {
+            std::vector<std::vector<ulint>> lcps;
+            if (!tsv::load_tsv(argv[0], heads, lens, lcps)) {
+                std::cerr << "Failed to load TSV: " << argv[0] << "\n";
+                return 1;
+            }
+        } else {
+            std::string err;
+            if (!rlbwt_io::load_rlbwt(argv[0], argv[1], heads, lens, err)) {
+                std::cerr << "Failed to load RLBWT: " << err << "\n";
+                return 1;
+            }
+        }
+        const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+        auto t1 = clock::now();
+        TmsIndex idx(heads, lens, opts);
+        const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
+        const std::string idx_path = argv[npos - 1];
+        std::ofstream out(idx_path, std::ios::binary);
+        const size_t bytes = out.good() ? idx.serialize(out) : 0;
+        if (!out.good()) {
+            std::cerr << "Failed to write index: " << idx_path << "\n";
+            return 1;
+        }
+        idx.describe(std::cout);
+        std::cout << "Built tms index: " << idx_path << " (runs=" << heads.size() << ", bytes=" << bytes
+                  << ", load_s=" << load_s << ", build_s=" << build_s << ")\n";
+        return 0;
+    }
+
+    if (cmd == "tms-inspect") {
+        if (argc < 1) { std::cerr << "tms-inspect requires INDEX_PATH\n"; return 1; }
+        auto opt = read_tms_index(argv[0]);
+        if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
+        opt->describe(std::cout);
+        return 0;
+    }
+
+    if (cmd == "tms-test") {
+        std::string data_dir = (argc > 0 && argv[0][0] != '-') ? argv[0] : "./data";
+        return tms_test::run_all_tests(data_dir) ? 0 : 1;
     }
 
     if (cmd == "inspect") {
