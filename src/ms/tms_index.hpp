@@ -184,11 +184,8 @@ public:
     LFPos start_LF(LFPos p) const { return lf_.start_next(p); }
     LFPos finish_LF(LFPos p) const { return lf_.finish_next(p); }
     void prefetch(ulint i) const { lf_.prefetch(i); }
-    /** Prefetch LF rows lo to hi inclusive, once per cache line. */
-    void prefetch_rows(ulint lo, ulint hi) const {
-        for (ulint j = lo; j < hi; j += lf_row_stride_) lf_.prefetch(j);
-        lf_.prefetch(hi);
-    }
+    /** Prefetch LF rows lo to hi inclusive, lo <= hi, once per cache line. */
+    void prefetch_rows(ulint lo, ulint hi) const { lf_.prefetch_rows(lo, hi); }
     LFPos first() { return lf_.first(); }
     LFPos last() { return lf_.last(); }
     LFPos up(LFPos p) { return lf_.up(p); }
@@ -341,19 +338,12 @@ private:
     PhiInv phi_inv_;
     bool has_phi_ = false, has_phi_inv_ = false;
     std::array<bool, 256> occurs_{};
-    // Rows between prefetches in prefetch_rows: the most whose starts span
-    // fewer than 512 bits, so every cache line of a range gets one.
-    ulint lf_row_stride_ = 1;
     bool fl_rows_fit_word_ = false;
 
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
-    // Derived fields: the scan's prefetch stride, whole-row FL reads, and
-    // which characters occur.
+    // Derived fields: whole-row FL reads, and which characters occur.
     void compute_occurs() {
-        ulint row_bits = 0;
-        for (auto w : lf_.get_widths()) row_bits += w;
-        lf_row_stride_ = std::max<ulint>(1, 511 / std::max<ulint>(1, row_bits));
         fl_rows_fit_word_ = fl_.row_fits_word();
         occurs_.fill(false);
         for (ulint i = 0; i < lf_.intervals(); ++i) occurs_[lf_.get_character(i)] = true;
