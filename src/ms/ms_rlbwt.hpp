@@ -604,6 +604,15 @@ public:
     uchar get_character(ulint i) { return idx_.get_character(i); }
     uchar get_character(Position p) { return idx_.get_character(p); }
     Position LF(Position p) { return idx_.LF(p); }
+    /**
+     * LF in two halves (see Orbit's start_next and finish_next):
+     * finish_LF(start_LF(p)) equals LF(p), and start_LF reads only p's row,
+     * so the landing row can be prefetched in between.
+     */
+    Position start_LF(Position p) const { return idx_.start_next(p); }
+    Position finish_LF(Position p) const { return idx_.finish_next(p); }
+    /** Hint that the row of interval i will be read soon. */
+    void prefetch(ulint i) const { idx_.prefetch(i); }
     Position first() { return idx_.first(); }
     Position last() { return idx_.last(); }
     ulint move_runs() const { return idx_.intervals(); }
@@ -744,12 +753,14 @@ inline ulint range_min_to_bottom(const MSIndexSpillLCP<SP>& idx, ulint interval,
 }
 
 /**
- * Reposition with LCP: find the next position and LCP value for the given
- * character.
+ * Find the row to reposition to for character c: the nearest run above or
+ * below (interval, offset) whose character is c, choosing the side with the
+ * larger range-minimum LCP.  Returns that position (before the LF step) and
+ * the LCP bound, or nullopt if c does not occur in the text.
  */
 template <typename Index>
 inline std::optional<std::pair<typename Index::position, ulint>>
-reposition_with_lcp(Index& idx, ulint interval, ulint offset, uchar c) {
+reposition_target(Index& idx, ulint interval, ulint offset, uchar c) {
     using Position = typename Index::position;
     assert(idx.get_character(interval) != c);
     // A character absent from the text can never be found by walking; say so
@@ -822,7 +833,19 @@ reposition_with_lcp(Index& idx, ulint interval, ulint offset, uchar c) {
         out_pos = pos_down;
         match_len = eff_min_down;
     }
-    return std::make_pair(idx.LF(out_pos), match_len);
+    return std::make_pair(out_pos, match_len);
+}
+
+/**
+ * Reposition with LCP: find the next position and LCP value for the given
+ * character.  The position is the LF image of reposition_target's row.
+ */
+template <typename Index>
+inline std::optional<std::pair<typename Index::position, ulint>>
+reposition_with_lcp(Index& idx, ulint interval, ulint offset, uchar c) {
+    auto t = reposition_target(idx, interval, offset, c);
+    if (t) t->first = idx.LF(t->first);
+    return t;
 }
 
 /**
@@ -860,6 +883,76 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
         pos = opt->first;
     }
     return out;
+}
+
+/**
+ * Matching statistics for many patterns at once, giving the same results as
+ * ms_query on each.  Up to k patterns are in flight.  Each LF step is split
+ * so that after computing a pattern's landing interval the loop prefetches
+ * that row and moves on to the next pattern, which lets the row reads of
+ * different patterns overlap instead of waiting on one another.  Repositions
+ * run to completion when they occur; only their final LF step is deferred.
+ * out[j] receives the statistics for patterns[j].
+ */
+template <bool SP>
+inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
+                           std::vector<std::vector<ulint>>& out) {
+    using Position = typename MSIndexSpillLCP<SP>::position;
+    struct Slot {
+        const char* pat;       // the pattern being matched
+        ulint* ms;             // its output array
+        size_t i;              // pattern[i - 1] is the next character to match
+        Position pos;          // unresolved position from start_LF, or a resolved one
+        ulint match_len;
+    };
+    out.resize(patterns.size());
+    if (k == 0) k = 1;
+    std::vector<Slot> slots;
+    slots.reserve(k);
+    size_t next = 0;
+    // Start the next nonempty pattern; returns false when none are left.
+    auto start = [&](Slot& s) {
+        while (next < patterns.size()) {
+            const size_t j = next++;
+            out[j].assign(patterns[j].size(), 0);
+            if (patterns[j].empty()) continue;
+            s = Slot{patterns[j].data(), out[j].data(), patterns[j].size(), idx.first(), 0};
+            return true;
+        }
+        return false;
+    };
+    for (size_t t = 0; t < k; ++t) {
+        Slot s{};
+        if (!start(s)) break;
+        slots.push_back(s);
+    }
+    while (!slots.empty()) {
+        for (size_t t = 0; t < slots.size();) {
+            Slot& s = slots[t];
+            Position pos = idx.finish_LF(s.pos);
+            const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
+            if (idx.get_character(pos.interval) == c) {
+                s.ms[s.i - 1] = ++s.match_len;
+                s.pos = idx.start_LF(pos);
+            } else if (auto opt = reposition_target(idx, pos.interval, static_cast<ulint>(pos.offset), c)) {
+                assert(opt->second != LCP_GAP);
+                s.ms[s.i - 1] = s.match_len = std::min(s.match_len, opt->second) + 1;
+                s.pos = idx.start_LF(opt->first);
+            } else {
+                // c does not occur in the text: the statistic is 0 and
+                // matching restarts from the current row.
+                s.ms[s.i - 1] = s.match_len = 0;
+                s.pos = pos;
+            }
+            idx.prefetch(s.pos.interval);
+            if (--s.i > 0 || start(s)) {
+                ++t;
+            } else {
+                s = slots.back();
+                slots.pop_back();
+            }
+        }
+    }
 }
 
 /**

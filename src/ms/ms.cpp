@@ -36,12 +36,15 @@ static void usage(const char* prog) {
               << "              fixed-width little-endian lengths) and a TeraLCP -ominima file.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
-              << "  batch      INDEX_PATH READS [-o OUT] [--no-output]\n"
+              << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "              Load the index once and compute matching statistics for every\n"
               << "              read in READS (FASTA, FASTQ, or one sequence per line; - for\n"
               << "              stdin).  Writes one line per read: name, tab, space-separated\n"
-              << "              values.  --no-output skips writing (for timing).  A summary\n"
-              << "              with query time per base goes to stderr.\n"
+              << "              values.  --no-output skips writing (for timing).  --interleave K\n"
+              << "              keeps K reads in flight, prefetching each one's next row\n"
+              << "              (default 32); K = 0 queries one read at a time without\n"
+              << "              prefetching.  Results do not depend on K.  A summary with\n"
+              << "              query time per base goes to stderr.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
               << "              Inspect index and optionally output spillover TSV.\n"
               << "  lcp-list   TSV_PATH\n"
@@ -125,9 +128,12 @@ static int run_batch(int argc, char** argv) {
     }
     std::string idx_path = argv[0], reads_path = argv[1], out_path;
     bool write_output = true;
+    size_t interleave = 32;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
+        else if (strcmp(argv[i], "--interleave") == 0 && i + 1 < argc)
+            interleave = static_cast<size_t>(std::stoull(argv[++i]));
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
     }
     using clock = std::chrono::steady_clock;
@@ -160,15 +166,9 @@ static int run_batch(int argc, char** argv) {
     size_t n_reads = 0, n_bases = 0;
     double query_s = 0.0;
     auto t_all = clock::now();
-    while (reads.next(name, seq)) {
-        auto tq = clock::now();
-        auto ms = ms_query(*opt, seq);
-        query_s += std::chrono::duration<double>(clock::now() - tq).count();
-        ++n_reads;
-        n_bases += seq.size();
-        if (!write_output) continue;
+    auto write_ms = [&](const std::string& nm, const std::vector<ulint>& ms) {
         line.clear();
-        line += name;
+        line += nm;
         line += '\t';
         for (size_t i = 0; i < ms.size(); ++i) {
             if (i > 0) line += ' ';
@@ -176,6 +176,39 @@ static int run_batch(int argc, char** argv) {
         }
         line += '\n';
         out->write(line.data(), static_cast<std::streamsize>(line.size()));
+    };
+    if (interleave == 0) {
+        // One read at a time with ms_query.
+        while (reads.next(name, seq)) {
+            auto tq = clock::now();
+            auto ms = ms_query(*opt, seq);
+            query_s += std::chrono::duration<double>(clock::now() - tq).count();
+            ++n_reads;
+            n_bases += seq.size();
+            if (write_output) write_ms(name, ms);
+        }
+    } else {
+        // Blocks of reads with ms_query_batch, interleave reads in flight.
+        const size_t block = std::max<size_t>(4096, 64 * interleave);
+        std::vector<std::string> names, seqs;
+        std::vector<std::vector<ulint>> results;
+        bool more = true;
+        while (more) {
+            names.clear();
+            seqs.clear();
+            while (seqs.size() < block && (more = reads.next(name, seq))) {
+                names.push_back(name);
+                seqs.push_back(seq);
+                n_bases += seq.size();
+            }
+            if (seqs.empty()) break;
+            auto tq = clock::now();
+            ms_query_batch(*opt, seqs, interleave, results);
+            query_s += std::chrono::duration<double>(clock::now() - tq).count();
+            n_reads += seqs.size();
+            if (write_output)
+                for (size_t j = 0; j < seqs.size(); ++j) write_ms(names[j], results[j]);
+        }
     }
     out->flush();
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();

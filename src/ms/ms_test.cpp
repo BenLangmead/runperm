@@ -604,6 +604,67 @@ bool test_index_file_roundtrip(const std::string& data_dir) {
 }
 
 /**
+ * Check that ms_query_batch gives exactly what ms_query gives on each
+ * pattern, for several numbers of patterns in flight, with relative and
+ * absolute positions.  The patterns vary in length (including empty and
+ * single-character ones) and error rate, and some contain N, so they
+ * exercise case 1 steps, repositions, restarts and slot refills.
+ */
+template <bool SP>
+static bool check_ms_query_batch(const std::string& path, const std::string& T, const ms_io::BuildOptions& o,
+                                 const char* name) {
+    auto idx = ms_io::build_ms_index_spill_from_tsv<SP>(path, o);
+    if (!idx) return false;
+    std::mt19937 rng(31);
+    std::uniform_int_distribution<size_t> len_dist(0, 200);
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    const double rates[] = {0.0, 0.01, 0.05, 0.3, 1.0};
+    std::vector<std::string> patterns;
+    for (int k = 0; k < 400; ++k) {
+        const size_t len = (k % 50 == 0) ? 0 : (k % 50 == 1) ? 1 : len_dist(rng);
+        std::uniform_int_distribution<size_t> start_dist(0, T.size() - len);
+        std::string P = T.substr(start_dist(rng), len);
+        const double rate = rates[k % 5];
+        for (auto& c : P)
+            if (unif(rng) < rate) c = "ACGT"[rng() % 4];
+        if (k % 7 == 0 && !P.empty()) P[rng() % P.size()] = 'N';
+        patterns.push_back(std::move(P));
+    }
+    std::vector<std::vector<ulint>> want;
+    for (const auto& P : patterns) want.push_back(ms_query(*idx, P));
+    for (size_t k : {1, 2, 3, 4, 7, 16, 64, 1000}) {
+        std::vector<std::vector<ulint>> got;
+        ms_query_batch(*idx, patterns, k, got);
+        if (got != want) {
+            std::cout << "  FAILED for " << name << (SP ? " (absolute)" : "") << " with " << k << " in flight"
+                      << std::endl;
+            assert(false && "ms_query_batch must match ms_query");
+            return false;
+        }
+    }
+    std::cout << "  " << name << (SP ? " (absolute)" : "") << " PASSED" << std::endl;
+    return true;
+}
+
+bool test_ms_query_batch(const std::string& data_dir) {
+    std::cout << "Testing ms_query_batch against ms_query" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    ms_io::BuildOptions base;
+    ms_io::BuildOptions rec;
+    rec.minima_only = true; rec.percentile_k = 0.9; rec.coalesce = true; rec.spill_split_bits = 6;
+    auto text_idx = ms_io::build_ms_index_spill_from_tsv<false>(path, base);
+    if (!text_idx) {
+        std::cout << "  DID NOT RUN" << std::endl;
+        return false;
+    }
+    const std::string T = reconstruct_text(*text_idx);
+    check_ms_query_batch<false>(path, T, base, "base");
+    check_ms_query_batch<false>(path, T, rec, "recommended");
+    check_ms_query_batch<true>(path, T, rec, "recommended");
+    return true;
+}
+
+/**
  * Compare two indexes by running ms_query on many extract_errory_string patterns
  * and asserting identical matching statistics. Uses extractor for pattern generation.
  */
@@ -789,6 +850,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_rlbwt_input_path(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_index_file_roundtrip(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!test_ms_query_batch(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (all_ran) {
         std::cout << "All ms_test checks PASSED" << std::endl;
