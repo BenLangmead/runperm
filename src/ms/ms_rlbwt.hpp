@@ -613,6 +613,14 @@ public:
     Position finish_LF(Position p) const { return idx_.finish_next(p); }
     /** Hint that the row of interval i will be read soon. */
     void prefetch(ulint i) const { idx_.prefetch(i); }
+    /** Hint that the spillover record of row i, if it has one, will be read soon.  Reads row i. */
+    void prefetch_spill(ulint i) const {
+        const ulint so = get<LCPSpillRunCols::LCP_SPILL>(i);
+        if (so == NO_SPILL) return;
+        const uchar* p = spillover_for_row(i).data() + spill_offset_bytes(so);
+        ORBIT_PREFETCH(p);
+        ORBIT_PREFETCH(p + 64);
+    }
     Position first() { return idx_.first(); }
     Position last() { return idx_.last(); }
     ulint move_runs() const { return idx_.intervals(); }
@@ -753,10 +761,59 @@ inline ulint range_min_to_bottom(const MSIndexSpillLCP<SP>& idx, ulint interval,
 }
 
 /**
+ * Minimum LCP values a reposition crosses inside its starting run, as a pair:
+ * first, going up from offset, the values at offsets [0, offset] including
+ * the top boundary; second, going down, the values at offsets past offset.
+ * Equal to (range_min(..., true), range_min(..., false)) but decodes the
+ * run's spillover record once.
+ */
+template <bool SP>
+inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ulint interval, ulint offset) {
+    ulint up = LCP_GAP, down = LCP_GAP;
+    const ulint top = idx.template get<LCPSpillRunCols::LCP_TOP>(interval);
+    const ulint sub = idx.template get<LCPSpillRunCols::LCP_MIN_SUB>(interval);
+    const ulint so = idx.template get<LCPSpillRunCols::LCP_SPILL>(interval);
+    const bool jumbo = (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub());
+    size_t p;
+    const auto& spill = idx.spillover_for_row(interval);
+    if (jumbo && so != NO_SPILL) {
+        p = idx.spill_offset_bytes(so);
+        auto [tv, np] = decode_uleb128(spill, p);
+        p = skip_uleb128(spill, np);
+        up = tv;
+    } else {
+        if (top != LCP_GAP) up = top;
+        if (so == NO_SPILL) return {up, down};
+        p = idx.spill_offset_bytes(so);
+    }
+    auto [n, np] = decode_uleb128(spill, p);
+    p = np;
+    const ulint run_len = idx.get_length(interval);
+    for (ulint k = 0; k < n && k <= run_len; ++k) {
+        if (p >= spill.size()) break;
+        auto [o, no] = decode_uleb128(spill, p);
+        auto [v, nv] = decode_uleb128(spill, no);
+        p = nv;
+        if (v == LCP_GAP) continue;
+        if (o <= offset) up = std::min(up, v);
+        else down = std::min(down, v);
+    }
+    return {up, down};
+}
+
+/**
  * Find the row to reposition to for character c: the nearest run above or
  * below (interval, offset) whose character is c, choosing the side with the
  * larger range-minimum LCP.  Returns that position (before the LF step) and
- * the LCP bound, or nullopt if c does not occur in the text.
+ * the LCP bound, or nullopt if c does not occur in the text.  The walks stop
+ * at the first and last runs rather than wrapping.
+ *
+ * Going up to the last row of run u crosses the LCP values of the starting
+ * run from its top down to offset and every value of the runs strictly
+ * between, including their tops.  Going down to the first row of run d
+ * crosses the starting run's values below offset, every value of the runs
+ * in between, and d's top.  A run's row minimum includes its top, so the
+ * runs in between need only row_min_lcp.
  */
 template <typename Index>
 inline std::optional<std::pair<typename Index::position, ulint>>
@@ -766,74 +823,40 @@ reposition_target(Index& idx, ulint interval, ulint offset, uchar c) {
     // A character absent from the text can never be found by walking; say so
     // at once instead of scanning the whole index.
     if (!idx.occurs(c)) return std::nullopt;
-    Position cur{interval, offset};
-    const Position first_pos = idx.first();
-    const Position last_pos = idx.last();
-    const ulint max_walk = idx.domain();
-
-    // Reposition up
-    ulint min_up = LCP_GAP;
-    Position pos_up = cur;
-    bool found_up = false;
-    for (ulint k = 0; k < max_walk; ++k) {
-        if (idx.get_character(pos_up.interval) == c) {
-            // Arrived at destination row
-            ulint lcp_arrive = range_min(idx, pos_up.interval, pos_up.offset, false);
-            if (lcp_arrive != LCP_GAP) min_up = std::min(min_up, lcp_arrive);
-            found_up = true;
-            break;
-        }
-        ulint lcp_val = k ? row_min_lcp(idx, pos_up.interval) :
-                            range_min(idx, pos_up.interval, pos_up.offset, true);
-        if (lcp_val != LCP_GAP) min_up = std::min(min_up, lcp_val);
-        pos_up = idx.up(pos_up);
-        if (pos_up.interval == last_pos.interval && pos_up.offset == last_pos.offset) break; /* wrapped */
+    const ulint last_run = idx.move_runs() - 1;
+    ulint u = interval, d = interval;
+    bool found_up = false, found_down = false;
+    while (u > 0) {
+        if (idx.get_character(--u) == c) { found_up = true; break; }
     }
-
-    // Reposition down
-    ulint min_down = LCP_GAP;
-    Position pos_down = cur;
-    bool found_down = false;
-    for (ulint k = 0; k < max_walk; ++k) {
-        if (idx.get_character(pos_down.interval) == c) {
-            // Arrived at destination row
-            ulint lcp_arrive = range_min(idx, pos_down.interval, pos_down.offset, true);
-            if (lcp_arrive != LCP_GAP) min_down = std::min(min_down, lcp_arrive);
-            found_down = true;
-            break;
-        }
-        ulint lcp_val = k ? row_min_lcp(idx, pos_down.interval) :
-                            range_min(idx, pos_down.interval, pos_down.offset, false);
-        if (lcp_val != LCP_GAP) min_down = std::min(min_down, lcp_val);
-        pos_down = idx.down(pos_down);
-        if (pos_down.interval == first_pos.interval && pos_down.offset == first_pos.offset) break; /* wrapped */
-        ulint lcp_boundary = boundary_lcp(idx, pos_down.interval);
-        if (lcp_boundary != LCP_GAP) min_down = std::min(min_down, lcp_boundary);
+    while (d < last_run) {
+        if (idx.get_character(++d) == c) { found_down = true; break; }
     }
-
     if (!found_up && !found_down) return std::nullopt;
+
+    auto [min_up, min_down] = range_min_both(idx, interval, offset);
+    auto fold = [](ulint& m, ulint v) { if (v != LCP_GAP) m = std::min(m, v); };
+    if (found_up)
+        for (ulint j = u + 1; j < interval; ++j) fold(min_up, row_min_lcp(idx, j));
+    if (found_down) {
+        for (ulint j = interval + 1; j < d; ++j) fold(min_down, row_min_lcp(idx, j));
+        fold(min_down, boundary_lcp(idx, d));
+    }
 
     /* For comparison and match_len: treat LCP_GAP as high (no cap); use domain as sentinel */
     const ulint eff_high = idx.domain();
-    ulint eff_min_up = (min_up != LCP_GAP) ? min_up : eff_high;
-    ulint eff_min_down = (min_down != LCP_GAP) ? min_down : eff_high;
-
-    ulint match_len = 0;
-    Position out_pos;
-    if (!found_up) {
-        out_pos = pos_down;
-        match_len = eff_min_down;
-    } else if (!found_down) {
-        out_pos = pos_up;
-        match_len = eff_min_up;
-    } else if (eff_min_up >= eff_min_down) {
-        out_pos = pos_up;
-        match_len = eff_min_up;
-    } else {
-        out_pos = pos_down;
-        match_len = eff_min_down;
+    const ulint eff_min_up = (min_up != LCP_GAP) ? min_up : eff_high;
+    const ulint eff_min_down = (min_down != LCP_GAP) ? min_down : eff_high;
+    const bool go_up = found_up && (!found_down || eff_min_up >= eff_min_down);
+    // up and down fill in the offset (and absolute position, if stored) of
+    // the row next to the one given.
+    Position from{};
+    if (go_up) {
+        from.interval = u + 1;
+        return std::make_pair(idx.up(from), eff_min_up);
     }
-    return std::make_pair(out_pos, match_len);
+    from.interval = d - 1;
+    return std::make_pair(idx.down(from), eff_min_down);
 }
 
 /**
@@ -890,9 +913,11 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
  * ms_query on each.  Up to k patterns are in flight.  Each LF step is split
  * so that after computing a pattern's landing interval the loop prefetches
  * that row and moves on to the next pattern, which lets the row reads of
- * different patterns overlap instead of waiting on one another.  Repositions
- * run to completion when they occur; only their final LF step is deferred.
- * out[j] receives the statistics for patterns[j].
+ * different patterns overlap instead of waiting on one another.  A reposition
+ * takes two visits: the first prefetches the rows around the current one
+ * and the current row's spillover record, and the second runs
+ * reposition_target and starts its LF step.  out[j] receives the statistics
+ * for patterns[j].
  */
 template <bool SP>
 inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
@@ -904,7 +929,13 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
         size_t i;              // pattern[i - 1] is the next character to match
         Position pos;          // unresolved position from start_LF, or a resolved one
         ulint match_len;
+        bool repositioning;    // pos is resolved and the next visit repositions for pattern[i - 1]
     };
+    // Rows prefetched on each side of the current row before a reposition.
+    // Most repositions stop within this many rows; a wider window costs more
+    // in prefetch instructions than it saves.
+    constexpr ulint rep_window = 8;
+    const ulint last_run = idx.move_runs() - 1;
     out.resize(patterns.size());
     if (k == 0) k = 1;
     std::vector<Slot> slots;
@@ -916,7 +947,7 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
             const size_t j = next++;
             out[j].assign(patterns[j].size(), 0);
             if (patterns[j].empty()) continue;
-            s = Slot{patterns[j].data(), out[j].data(), patterns[j].size(), idx.first(), 0};
+            s = Slot{patterns[j].data(), out[j].data(), patterns[j].size(), idx.first(), 0, false};
             return true;
         }
         return false;
@@ -929,20 +960,36 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
     while (!slots.empty()) {
         for (size_t t = 0; t < slots.size();) {
             Slot& s = slots[t];
-            Position pos = idx.finish_LF(s.pos);
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
-            if (idx.get_character(pos.interval) == c) {
-                s.ms[s.i - 1] = ++s.match_len;
-                s.pos = idx.start_LF(pos);
-            } else if (auto opt = reposition_target(idx, pos.interval, static_cast<ulint>(pos.offset), c)) {
-                assert(opt->second != LCP_GAP);
+            if (s.repositioning) {
+                auto opt = reposition_target(idx, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
+                assert(opt && opt->second != LCP_GAP);
                 s.ms[s.i - 1] = s.match_len = std::min(s.match_len, opt->second) + 1;
                 s.pos = idx.start_LF(opt->first);
+                s.repositioning = false;
             } else {
-                // c does not occur in the text: the statistic is 0 and
-                // matching restarts from the current row.
-                s.ms[s.i - 1] = s.match_len = 0;
-                s.pos = pos;
+                Position pos = idx.finish_LF(s.pos);
+                if (idx.get_character(pos.interval) == c) {
+                    s.ms[s.i - 1] = ++s.match_len;
+                    s.pos = idx.start_LF(pos);
+                } else if (!idx.occurs(c)) {
+                    // c does not occur in the text: the statistic is 0 and
+                    // matching restarts from the current row.
+                    s.ms[s.i - 1] = s.match_len = 0;
+                    s.pos = pos;
+                } else {
+                    // Prefetch what the reposition reads first and do it on
+                    // the next visit; this character is not consumed yet.
+                    const ulint cur = pos.interval;
+                    const ulint lo = cur > rep_window ? cur - rep_window : 0;
+                    const ulint hi = std::min(cur + rep_window, last_run);
+                    for (ulint j = lo; j <= hi; ++j) idx.prefetch(j);
+                    idx.prefetch_spill(cur);
+                    s.pos = pos;
+                    s.repositioning = true;
+                    ++t;
+                    continue;
+                }
             }
             idx.prefetch(s.pos.interval);
             if (--s.i > 0 || start(s)) {

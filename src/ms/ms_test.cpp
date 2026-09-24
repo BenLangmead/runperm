@@ -615,6 +615,14 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
                                  const char* name) {
     auto idx = ms_io::build_ms_index_spill_from_tsv<SP>(path, o);
     if (!idx) return false;
+    for (ulint i = 0; i < idx->move_runs(); ++i)
+        for (ulint off = 0; off < idx->get_length(i); ++off)
+            if (range_min_both(*idx, i, off) !=
+                std::make_pair(range_min(*idx, i, off, true), range_min(*idx, i, off, false))) {
+                std::cout << "  FAILED: range_min_both differs from range_min for " << name << std::endl;
+                assert(false && "range_min_both must match range_min");
+                return false;
+            }
     std::mt19937 rng(31);
     std::uniform_int_distribution<size_t> len_dist(0, 200);
     std::uniform_real_distribution<double> unif(0.0, 1.0);
