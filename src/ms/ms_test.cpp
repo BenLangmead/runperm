@@ -615,14 +615,36 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
                                  const char* name) {
     auto idx = ms_io::build_ms_index_spill_from_tsv<SP>(path, o);
     if (!idx) return false;
-    for (ulint i = 0; i < idx->move_runs(); ++i)
-        for (ulint off = 0; off < idx->get_length(i); ++off)
-            if (range_min_both(*idx, i, off) !=
-                std::make_pair(range_min(*idx, i, off, true), range_min(*idx, i, off, false))) {
-                std::cout << "  FAILED: range_min_both differs from range_min for " << name << std::endl;
-                assert(false && "range_min_both must match range_min");
-                return false;
-            }
+    using Index = MSIndexSpillLCP<SP>;
+    // Every column read through the packed row access, when the index has
+    // one, must agree with the index's own column reads.
+    const auto cols = idx->column_access();
+    for (ulint i = 0; i < idx->move_runs(); ++i) {
+        const ulint len = idx->get_length(i);
+        bool ok = true;
+        if constexpr (Index::packed_access_supported) {
+            const auto acc = idx->packed_access();
+            const auto r = acc.row(i);
+            const auto pos = idx->start_LF(typename Index::position{i, 0});
+            ok = acc.code(r) == idx->code(idx->get_character(i)) && acc.length(r) == len &&
+                 acc.pointer(r) == pos.interval && acc.offset(r) == pos.offset &&
+                 acc.template col<LCPSpillRunCols::LCP_TOP>(r) == idx->template get<LCPSpillRunCols::LCP_TOP>(i) &&
+                 acc.template col<LCPSpillRunCols::LCP_MIN_SUB>(r) == idx->template get<LCPSpillRunCols::LCP_MIN_SUB>(i) &&
+                 acc.template col<LCPSpillRunCols::LCP_SPILL>(r) == idx->template get<LCPSpillRunCols::LCP_SPILL>(i) &&
+                 boundary_lcp(*idx, acc, r, i) == boundary_lcp(*idx, i) &&
+                 row_min_lcp(*idx, acc, r, i) == row_min_lcp(*idx, i);
+            for (ulint off = 0; ok && off < len; ++off)
+                ok = range_min_both(*idx, acc, r, i, off) == range_min_both(*idx, i, off);
+        }
+        for (ulint off = 0; ok && off < len; ++off)
+            ok = range_min_both(*idx, cols, i, i, off) ==
+                 std::make_pair(range_min(*idx, i, off, true), range_min(*idx, i, off, false));
+        if (!ok) {
+            std::cout << "  FAILED: row access or range_min_both disagrees with column reads for " << name << std::endl;
+            assert(false && "row access and range_min_both must match column reads and range_min");
+            return false;
+        }
+    }
     std::mt19937 rng(31);
     std::uniform_int_distribution<size_t> len_dist(0, 200);
     std::uniform_real_distribution<double> unif(0.0, 1.0);
@@ -641,9 +663,10 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
     std::vector<std::vector<ulint>> want;
     for (const auto& P : patterns) want.push_back(ms_query(*idx, P));
     for (size_t k : {1, 2, 3, 4, 7, 16, 64, 1000}) {
-        std::vector<std::vector<ulint>> got;
+        std::vector<std::vector<ulint>> got, got_narrow;
         ms_query_batch(*idx, patterns, k, got);
-        if (got != want) {
+        ms_query_batch_impl(*idx, idx->column_access(), patterns, k, got_narrow);
+        if (got != want || got_narrow != want) {
             std::cout << "  FAILED for " << name << (SP ? " (absolute)" : "") << " with " << k << " in flight"
                       << std::endl;
             assert(false && "ms_query_batch must match ms_query");
