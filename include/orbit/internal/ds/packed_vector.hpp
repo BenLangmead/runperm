@@ -95,6 +95,11 @@ public:
         }
         template<size_t col>
         ulint get(size_t row) const { return get_at<col>(row_start(row)); }
+        /** As packed_matrix::prefetch and prefetch_rows. */
+        void prefetch(size_t row) const { prefetch_span(data, row_start(row), row_start(row) + row_width); }
+        void prefetch_rows(size_t lo, size_t hi) const {
+            prefetch_lines(data, row_start(lo), row_start(hi) + row_width);
+        }
 
         /** Whether columns first to last, first <= last, fit in one get_span. */
         template<size_t first, size_t last>
@@ -140,13 +145,7 @@ public:
      * but testing for that costs more in mispredicted branches than the
      * second prefetch does.
      */
-    void prefetch(size_t row) const {
-        const size_t start = get_row_start(row);
-        const word_t* first = &data[start / num_bits_type(word_t)];
-        const word_t* last = &data[(start + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
-        ORBIT_PREFETCH(first);
-        ORBIT_PREFETCH(last);
-    }
+    void prefetch(size_t row) const { prefetch_span(data.data(), get_row_start(row), get_row_start(row) + row_width); }
 
     /**
      * Hint that rows lo to hi, lo <= hi, will be read soon: prefetches each
@@ -154,10 +153,7 @@ public:
      * row hi touches, once per line.
      */
     void prefetch_rows(size_t lo, size_t hi) const {
-        const word_t* p = &data[get_row_start(lo) / num_bits_type(word_t)];
-        const word_t* last = &data[(get_row_start(hi) + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
-        for (; p < last; p += cache_line_bytes) ORBIT_PREFETCH(p);
-        ORBIT_PREFETCH(last);
+        prefetch_lines(data.data(), get_row_start(lo), get_row_start(hi) + row_width);
     }
 
     template<size_t col>
@@ -275,6 +271,20 @@ private:
         row_width = bit_pos;
         vector_width = num_rows * row_width;
         data.resize(data_size());
+    }
+
+    // Prefetch the lines holding the first byte of bit start and the last
+    // byte a whole-word read of a column ending before bit end touches.
+    static void prefetch_span(const word_t* data, size_t start, size_t end) {
+        ORBIT_PREFETCH(&data[start / num_bits_type(word_t)]);
+        ORBIT_PREFETCH(&data[end / num_bits_type(word_t) + sizeof(ulint) - 1]);
+    }
+    // Prefetch every line from bit start's byte to that same last byte.
+    static void prefetch_lines(const word_t* data, size_t start, size_t end) {
+        const word_t* p = &data[start / num_bits_type(word_t)];
+        const word_t* last = &data[end / num_bits_type(word_t) + sizeof(ulint) - 1];
+        for (; p < last; p += cache_line_bytes) ORBIT_PREFETCH(p);
+        ORBIT_PREFETCH(last);
     }
 
     struct bit_pos {
