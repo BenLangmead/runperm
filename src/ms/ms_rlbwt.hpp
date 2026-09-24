@@ -35,6 +35,7 @@
 #include <tuple>
 #include <random>
 #include <stdexcept>
+#include <type_traits>
 
 using uchar = orbit::uchar;
 using ulint = orbit::ulint;
@@ -521,10 +522,20 @@ class MSIndexSpillLCP {
     ulint spill_align_ = 1;
     uchar spill_split_bits_ = 0;
     std::array<bool, 256> occurs_{};  // occurs_[c]: byte c appears somewhere in the BWT
+    std::array<uchar, 256> code_{};   // code_[c]: alphabet code of byte c if it occurs, else no_code
 
+    void compute_codes() {
+        for (size_t c = 0; c < 256; ++c) {
+            code_[c] = no_code;
+            if (!occurs_[c]) continue;
+            const auto k = idx_.character_code(static_cast<uchar>(c));
+            if (k) code_[c] = *k;
+        }
+    }
     void compute_occurs() {
         occurs_.fill(false);
         for (ulint i = 0; i < idx_.intervals(); ++i) occurs_[idx_.get_character(i)] = true;
+        compute_codes();
     }
 
 public:
@@ -544,6 +555,7 @@ public:
     {
         for (size_t i = 0; i < chars.size(); ++i)
             if (lens[i] > 0) occurs_[chars[i]] = true;
+        compute_codes();
     }
 
     /** An empty index, to be filled by load(). */
@@ -613,10 +625,14 @@ public:
     Position finish_LF(Position p) const { return idx_.finish_next(p); }
     /** Hint that the row of interval i will be read soon. */
     void prefetch(ulint i) const { idx_.prefetch(i); }
-    /** Hint that the spillover record of row i, if it has one, will be read soon.  Reads row i. */
-    void prefetch_spill(ulint i) const {
-        const ulint so = get<LCPSpillRunCols::LCP_SPILL>(i);
-        if (so == NO_SPILL) return;
+    /** Hint that the rows of intervals lo to hi, lo <= hi, will be read soon. */
+    void prefetch_rows(ulint lo, ulint hi) const { idx_.prefetch_rows(lo, hi); }
+    /**
+     * Hint that the spillover record of row i will be read soon, given its
+     * LCP_SPILL column so.  A row without a record prefetches the start of its
+     * spillover array, which is cheaper than testing for it.
+     */
+    void prefetch_spill(ulint i, ulint so) const {
         const uchar* p = spillover_for_row(i).data() + spill_offset_bytes(so);
         ORBIT_PREFETCH(p);
         ORBIT_PREFETCH(p + 64);
@@ -632,6 +648,69 @@ public:
     ulint get(ulint i) const { return idx_.template get<Col>(i); }
     template <LCPSpillRunCols Col>
     ulint get(Position p) const { return idx_.template get<Col>(p); }
+
+    /** The alphabet code of byte c, or no_code if c does not occur in the text. */
+    uchar code(uchar c) const { return code_[c]; }
+    static constexpr uchar no_code = 0xFF;
+
+    /**
+     * Row access through a local copy of the packed layout (see Orbit's
+     * packed_matrix::reader), for relative positions.  A row is named by its
+     * first bit, row(i).  Its character, LCP_TOP and LCP_MIN_SUB columns are
+     * adjacent and read together with one load, tail(r), as are its pointer
+     * and offset; fits() says whether the index's column widths allow that.
+     */
+    struct PackedAccess {
+        decltype(std::declval<const IndexImpl&>().get_reader()) rows;
+        static constexpr size_t len_col = IndexImpl::length_column();
+        static constexpr size_t ptr_col = IndexImpl::pointer_column();
+        static constexpr size_t off_col = IndexImpl::offset_column();
+        static constexpr size_t chr_col = IndexImpl::character_column();
+        static constexpr size_t top_col = IndexImpl::template data_column<LCPSpillRunCols::LCP_TOP>();
+        static constexpr size_t sub_col = IndexImpl::template data_column<LCPSpillRunCols::LCP_MIN_SUB>();
+        static constexpr size_t spill_col = IndexImpl::template data_column<LCPSpillRunCols::LCP_SPILL>();
+        static_assert(ptr_col < off_col && chr_col < top_col && top_col < sub_col, "unexpected column order");
+        using Handle = ulint;
+        using Tail = ulint;
+        bool fits() const {
+            return rows.template span_fits<ptr_col, off_col>() && rows.template span_fits<chr_col, sub_col>();
+        }
+        Handle row(ulint i) const { return rows.row_start(i); }
+        void prefetch(ulint i) const { rows.prefetch(i); }
+        void prefetch_rows(ulint lo, ulint hi) const { rows.prefetch_rows(lo, hi); }
+        ulint length(Handle r) const { return rows.template get_at<len_col>(r); }
+        /** The pointer and offset columns. */
+        std::pair<ulint, ulint> pointer_offset(Handle r) const {
+            const ulint span = rows.template get_span<ptr_col>(r);
+            return {rows.template extract_span<ptr_col, ptr_col>(span), rows.template extract_span<ptr_col, off_col>(span)};
+        }
+        Tail tail(Handle r) const { return rows.template get_span<chr_col>(r); }
+        uchar code(Tail t) const { return static_cast<uchar>(rows.template extract_span<chr_col, chr_col>(t)); }
+        ulint top(Tail t) const { return rows.template extract_span<chr_col, top_col>(t); }
+        ulint sub(Tail t) const { return rows.template extract_span<chr_col, sub_col>(t); }
+        ulint spill(Handle r) const { return rows.template get_at<spill_col>(r); }
+    };
+    /** Row access through the index's own column reads, for any index. */
+    struct ColumnAccess {
+        MSIndexSpillLCP* idx;  // get_character is not const in Orbit
+        using Handle = ulint;
+        using Tail = ulint;
+        Handle row(ulint i) const { return i; }
+        void prefetch(ulint i) const { idx->prefetch(i); }
+        void prefetch_rows(ulint lo, ulint hi) const { idx->prefetch_rows(lo, hi); }
+        ulint length(Handle i) const { return idx->get_length(i); }
+        Tail tail(Handle i) const { return i; }
+        uchar code(Tail i) const { return idx->code(idx->get_character(i)); }
+        ulint top(Tail i) const { return idx->template get<LCPSpillRunCols::LCP_TOP>(i); }
+        ulint sub(Tail i) const { return idx->template get<LCPSpillRunCols::LCP_MIN_SUB>(i); }
+        ulint spill(Handle i) const { return idx->template get<LCPSpillRunCols::LCP_SPILL>(i); }
+    };
+    static constexpr bool packed_access_supported = !StoreAbsolutePositions;
+    PackedAccess packed_access() const {
+        static_assert(packed_access_supported, "packed access needs relative positions");
+        return PackedAccess{idx_.get_reader()};
+    }
+    ColumnAccess column_access() const { return ColumnAccess{const_cast<MSIndexSpillLCP*>(this)}; }
 
     /** Spillover array for row i (uses X LSBs of i when spill_split_bits>0). */
     const SpilloverVector& spillover_for_row(ulint i) const {
@@ -650,9 +729,9 @@ public:
     ulint max_lcp_min_sub() const { return max_lcp_min_sub_; }
     ulint spill_align() const { return spill_align_; }
     uchar spill_split_bits() const { return spill_split_bits_; }
-    /** Convert stored spill_off to byte offset (multiply by spill_align). */
+    /** Convert stored spill_off to byte offset (multiply by spill_align); NO_SPILL gives 0. */
     size_t spill_offset_bytes(ulint so) const {
-        if (so == NO_SPILL) return 0;
+        static_assert(NO_SPILL == 0, "NO_SPILL must scale to offset 0");
         return static_cast<size_t>(so) * spill_align_;
     }
 
@@ -664,43 +743,52 @@ public:
 };
 
 /**
- * Compute the top LCP value for a run.
+ * The top LCP value of run i, whose row is r, with tail t, in the row access
+ * acc (see MSIndexSpillLCP::PackedAccess).
  */
-template <bool SP>
-inline ulint boundary_lcp(const MSIndexSpillLCP<SP>& idx, ulint i) {
-    ulint top = idx.template get<LCPSpillRunCols::LCP_TOP>(i);
-    ulint sub = idx.template get<LCPSpillRunCols::LCP_MIN_SUB>(i);
-    bool jumbo = (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub());
-    if (jumbo) {
-        ulint so = idx.template get<LCPSpillRunCols::LCP_SPILL>(i);
+template <bool SP, class Access>
+inline ulint boundary_lcp(const MSIndexSpillLCP<SP>& idx, const Access& acc, typename Access::Handle r,
+                          typename Access::Tail t, ulint i) {
+    const ulint top = acc.top(t);
+    const ulint sub = acc.sub(t);
+    if (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub()) {
+        // Jumbo row: the value is the first of its spillover record.
+        const ulint so = acc.spill(r);
         assert(so != NO_SPILL);
-        const auto& spill = idx.spillover_for_row(i);
-        size_t p = idx.spill_offset_bytes(so);
-        auto [v, _] = decode_uleb128(spill, p);
-        return v;
+        return decode_uleb128(idx.spillover_for_row(i), idx.spill_offset_bytes(so)).first;
     }
     return top;
 }
 
-/**
- * Compute the minimum LCP value in the row.
- */
+/** Compute the top LCP value for a run. */
 template <bool SP>
-inline ulint row_min_lcp(const MSIndexSpillLCP<SP>& idx, ulint i) {
-    ulint top = idx.template get<LCPSpillRunCols::LCP_TOP>(i);
-    ulint sub = idx.template get<LCPSpillRunCols::LCP_MIN_SUB>(i);
-    bool jumbo = (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub());
-    if (jumbo) {
-        ulint so = idx.template get<LCPSpillRunCols::LCP_SPILL>(i);
+inline ulint boundary_lcp(const MSIndexSpillLCP<SP>& idx, ulint i) {
+    return boundary_lcp(idx, idx.column_access(), i, i, i);
+}
+
+/**
+ * The minimum LCP value of run i, whose row is r, with tail t, in the row
+ * access acc.
+ */
+template <bool SP, class Access>
+inline ulint row_min_lcp(const MSIndexSpillLCP<SP>& idx, const Access& acc, typename Access::Handle r,
+                         typename Access::Tail t, ulint i) {
+    const ulint top = acc.top(t);
+    const ulint sub = acc.sub(t);
+    if (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub()) {
+        // Jumbo row: the value is the second of its spillover record.
+        const ulint so = acc.spill(r);
         assert(so != NO_SPILL);
         const auto& spill = idx.spillover_for_row(i);
-        size_t p = idx.spill_offset_bytes(so);
-        p = skip_uleb128(spill, p);
-        // Grab the min LCP
-        auto [m, _] = decode_uleb128(spill, p);
-        return m;
+        return decode_uleb128(spill, skip_uleb128(spill, idx.spill_offset_bytes(so))).first;
     }
     return top - sub;
+}
+
+/** Compute the minimum LCP value in the row. */
+template <bool SP>
+inline ulint row_min_lcp(const MSIndexSpillLCP<SP>& idx, ulint i) {
+    return row_min_lcp(idx, idx.column_access(), i, i, i);
 }
 
 /**
@@ -765,14 +853,16 @@ inline ulint range_min_to_bottom(const MSIndexSpillLCP<SP>& idx, ulint interval,
  * first, going up from offset, the values at offsets [0, offset] including
  * the top boundary; second, going down, the values at offsets past offset.
  * Equal to (range_min(..., true), range_min(..., false)) but decodes the
- * run's spillover record once.
+ * run's spillover record once.  r is the run's row in the row access acc.
  */
-template <bool SP>
-inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ulint interval, ulint offset) {
+template <bool SP, class Access>
+inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, const Access& acc, typename Access::Handle r,
+                                              ulint interval, ulint offset) {
     ulint up = LCP_GAP, down = LCP_GAP;
-    const ulint top = idx.template get<LCPSpillRunCols::LCP_TOP>(interval);
-    const ulint sub = idx.template get<LCPSpillRunCols::LCP_MIN_SUB>(interval);
-    const ulint so = idx.template get<LCPSpillRunCols::LCP_SPILL>(interval);
+    const auto t = acc.tail(r);
+    const ulint top = acc.top(t);
+    const ulint sub = acc.sub(t);
+    const ulint so = acc.spill(r);
     const bool jumbo = (top == idx.max_lcp_top() && sub == idx.max_lcp_min_sub());
     size_t p;
     const auto& spill = idx.spillover_for_row(interval);
@@ -788,7 +878,7 @@ inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ul
     }
     auto [n, np] = decode_uleb128(spill, p);
     p = np;
-    const ulint run_len = idx.get_length(interval);
+    const ulint run_len = acc.length(r);
     for (ulint k = 0; k < n && k <= run_len; ++k) {
         if (p >= spill.size()) break;
         auto [o, no] = decode_uleb128(spill, p);
@@ -799,6 +889,11 @@ inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ul
         else down = std::min(down, v);
     }
     return {up, down};
+}
+
+template <bool SP>
+inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ulint interval, ulint offset) {
+    return range_min_both(idx, idx.column_access(), interval, interval, offset);
 }
 
 /**
@@ -813,35 +908,43 @@ inline std::pair<ulint, ulint> range_min_both(const MSIndexSpillLCP<SP>& idx, ul
  * between, including their tops.  Going down to the first row of run d
  * crosses the starting run's values below offset, every value of the runs
  * in between, and d's top.  A run's row minimum includes its top, so the
- * runs in between need only row_min_lcp.
+ * runs in between need only row_min_lcp.  Each walk reads a run's row once,
+ * for its character and, unless it is the target, its row minimum, through
+ * the row access acc (see MSIndexSpillLCP::PackedAccess).
  */
-template <typename Index>
-inline std::optional<std::pair<typename Index::position, ulint>>
-reposition_target(Index& idx, ulint interval, ulint offset, uchar c) {
-    using Position = typename Index::position;
+template <bool SP, class Access>
+inline std::optional<std::pair<typename MSIndexSpillLCP<SP>::position, ulint>>
+reposition_target_impl(MSIndexSpillLCP<SP>& idx, const Access acc, ulint interval, ulint offset, uchar c) {
+    using Position = typename MSIndexSpillLCP<SP>::position;
     assert(idx.get_character(interval) != c);
     // A character absent from the text can never be found by walking; say so
     // at once instead of scanning the whole index.
     if (!idx.occurs(c)) return std::nullopt;
     const ulint last_run = idx.move_runs() - 1;
+    // The starting run's spillover record is read first, so that a cache
+    // miss on it overlaps the walks.  LCP_GAP is above every LCP value, so
+    // std::min skips it.
+    auto [min_up, min_down] = range_min_both(idx, acc, acc.row(interval), interval, offset);
+    const uchar code = idx.code(c);
     ulint u = interval, d = interval;
     bool found_up = false, found_down = false;
     while (u > 0) {
-        if (idx.get_character(--u) == c) { found_up = true; break; }
+        const auto r = acc.row(--u);
+        const auto t = acc.tail(r);
+        if (acc.code(t) == code) { found_up = true; break; }
+        min_up = std::min(min_up, row_min_lcp(idx, acc, r, t, u));
     }
     while (d < last_run) {
-        if (idx.get_character(++d) == c) { found_down = true; break; }
+        const auto r = acc.row(++d);
+        const auto t = acc.tail(r);
+        if (acc.code(t) == code) {
+            found_down = true;
+            min_down = std::min(min_down, boundary_lcp(idx, acc, r, t, d));
+            break;
+        }
+        min_down = std::min(min_down, row_min_lcp(idx, acc, r, t, d));
     }
     if (!found_up && !found_down) return std::nullopt;
-
-    auto [min_up, min_down] = range_min_both(idx, interval, offset);
-    auto fold = [](ulint& m, ulint v) { if (v != LCP_GAP) m = std::min(m, v); };
-    if (found_up)
-        for (ulint j = u + 1; j < interval; ++j) fold(min_up, row_min_lcp(idx, j));
-    if (found_down) {
-        for (ulint j = interval + 1; j < d; ++j) fold(min_down, row_min_lcp(idx, j));
-        fold(min_down, boundary_lcp(idx, d));
-    }
 
     /* For comparison and match_len: treat LCP_GAP as high (no cap); use domain as sentinel */
     const ulint eff_high = idx.domain();
@@ -857,6 +960,17 @@ reposition_target(Index& idx, ulint interval, ulint offset, uchar c) {
     }
     from.interval = d - 1;
     return std::make_pair(idx.down(from), eff_min_down);
+}
+
+/**
+ * reposition_target for one read at a time, as in ms_query.  It reads
+ * columns through the index rather than through packed access: with nothing
+ * prefetched, more of the walks' cache misses overlap that way.
+ */
+template <bool SP>
+inline std::optional<std::pair<typename MSIndexSpillLCP<SP>::position, ulint>>
+reposition_target(MSIndexSpillLCP<SP>& idx, ulint interval, ulint offset, uchar c) {
+    return reposition_target_impl(idx, idx.column_access(), interval, offset, c);
 }
 
 /**
@@ -916,12 +1030,15 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
  * different patterns overlap instead of waiting on one another.  A reposition
  * takes two visits: the first prefetches the rows around the current one
  * and the current row's spillover record, and the second runs
- * reposition_target and starts its LF step.  out[j] receives the statistics
- * for patterns[j].
+ * reposition_target and starts its LF step.  Rows are read through the row
+ * access acc (see MSIndexSpillLCP::PackedAccess); with packed access, a
+ * visit resolves the LF step and reads the landing row's columns itself.
+ * out[j] receives the statistics for patterns[j].
  */
-template <bool SP>
-inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
-                           std::vector<std::vector<ulint>>& out) {
+template <bool SP, class Access>
+inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, const std::vector<std::string>& patterns,
+                                size_t k, std::vector<std::vector<ulint>>& out) {
+    constexpr bool packed = std::is_same_v<Access, typename MSIndexSpillLCP<SP>::PackedAccess>;
     using Position = typename MSIndexSpillLCP<SP>::position;
     struct Slot {
         const char* pat;       // the pattern being matched
@@ -938,8 +1055,11 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
     const ulint last_run = idx.move_runs() - 1;
     out.resize(patterns.size());
     if (k == 0) k = 1;
-    std::vector<Slot> slots;
-    slots.reserve(k);
+    // The alphabet codes of all bytes, kept local so that stores to the
+    // output cannot force them to be reloaded.
+    std::array<uchar, 256> codes;
+    for (size_t c = 0; c < 256; ++c) codes[c] = idx.code(static_cast<uchar>(c));
+    std::vector<Slot> slots(k);
     size_t next = 0;
     // Start the next nonempty pattern; returns false when none are left.
     auto start = [&](Slot& s) {
@@ -952,27 +1072,46 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
         }
         return false;
     };
-    for (size_t t = 0; t < k; ++t) {
-        Slot s{};
-        if (!start(s)) break;
-        slots.push_back(s);
-    }
-    while (!slots.empty()) {
-        for (size_t t = 0; t < slots.size();) {
-            Slot& s = slots[t];
+    // Slots [slots.data(), end) are in flight.
+    Slot* end = slots.data();
+    while (end < slots.data() + k && start(*end)) ++end;
+    while (end != slots.data()) {
+        for (Slot* sp = slots.data(); sp < end;) {
+            Slot& s = *sp;
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
             if (s.repositioning) {
-                auto opt = reposition_target(idx, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
+                auto opt = reposition_target_impl(idx, acc, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
                 assert(opt && opt->second != LCP_GAP);
                 s.ms[s.i - 1] = s.match_len = std::min(s.match_len, opt->second) + 1;
                 s.pos = idx.start_LF(opt->first);
                 s.repositioning = false;
             } else {
-                Position pos = idx.finish_LF(s.pos);
-                if (idx.get_character(pos.interval) == c) {
+                // Resolve the pending LF step and read the landing row.
+                Position pos;
+                typename Access::Handle r;
+                if constexpr (packed) {
+                    ulint i = s.pos.interval, o = s.pos.offset;
+                    r = acc.row(i);
+                    for (ulint len = acc.length(r); o >= len; len = acc.length(r)) {
+                        o -= len;
+                        r = acc.row(++i);
+                    }
+                    pos.interval = i;
+                    pos.offset = o;
+                } else {
+                    pos = idx.finish_LF(s.pos);
+                    r = acc.row(pos.interval);
+                }
+                if (acc.code(acc.tail(r)) == codes[c]) {
                     s.ms[s.i - 1] = ++s.match_len;
-                    s.pos = idx.start_LF(pos);
-                } else if (!idx.occurs(c)) {
+                    if constexpr (packed) {
+                        const auto [ptr, off] = acc.pointer_offset(r);
+                        s.pos.interval = ptr;
+                        s.pos.offset = pos.offset + off;
+                    } else {
+                        s.pos = idx.start_LF(pos);
+                    }
+                } else if (codes[c] == MSIndexSpillLCP<SP>::no_code) {
                     // c does not occur in the text: the statistic is 0 and
                     // matching restarts from the current row.
                     s.ms[s.i - 1] = s.match_len = 0;
@@ -983,23 +1122,29 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
                     const ulint cur = pos.interval;
                     const ulint lo = cur > rep_window ? cur - rep_window : 0;
                     const ulint hi = std::min(cur + rep_window, last_run);
-                    for (ulint j = lo; j <= hi; ++j) idx.prefetch(j);
-                    idx.prefetch_spill(cur);
+                    acc.prefetch_rows(lo, hi);
+                    idx.prefetch_spill(cur, acc.spill(r));
                     s.pos = pos;
                     s.repositioning = true;
-                    ++t;
+                    ++sp;
                     continue;
                 }
             }
-            idx.prefetch(s.pos.interval);
-            if (--s.i > 0 || start(s)) {
-                ++t;
-            } else {
-                s = slots.back();
-                slots.pop_back();
-            }
+            acc.prefetch(s.pos.interval);
+            if (--s.i > 0 || start(s)) ++sp;
+            else s = *--end;
         }
     }
+}
+
+template <bool SP>
+inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
+                           std::vector<std::vector<ulint>>& out) {
+    if constexpr (MSIndexSpillLCP<SP>::packed_access_supported) {
+        const auto acc = idx.packed_access();
+        if (acc.fits()) return ms_query_batch_impl(idx, acc, patterns, k, out);
+    }
+    ms_query_batch_impl(idx, idx.column_access(), patterns, k, out);
 }
 
 /**

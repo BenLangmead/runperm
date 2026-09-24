@@ -23,6 +23,8 @@ public:
     // We read ulint at a time, this ensures we never need to read more than one ulint
     // should be 57 bits for 64 bit ulint and 8 bit word_t
     constexpr static uchar max_width = num_bits_type(ulint) - (num_bits_type(word_t) - 1);
+    // Bytes per cache line, the stride of prefetch_rows.
+    constexpr static size_t cache_line_bytes = 64;
 
     packed_matrix() = default;
     packed_matrix(const ulint rows, const std::array<uchar, num_cols>& widths) {
@@ -65,6 +67,67 @@ public:
         return bits >> pos.offset;
     }
 
+    /**
+     * A copy of what reading columns needs: the buffer's address, the row
+     * width, and each column's bit offset and mask.  A reader kept in a local
+     * variable lets the compiler hold these in registers, where reads through
+     * the matrix reload them after any store that might alias them.  It is
+     * valid while the matrix is alive and not resized.  Rows are named by
+     * their first bit, row_start(row), so that several columns of one row
+     * share the multiplication.  Adjacent columns first to last can also be
+     * read together with one load, get_span, when span_fits says they fit.
+     */
+    struct reader {
+        const word_t* data;
+        size_t row_width;
+        std::array<uint16_t, num_cols> offsets;
+        std::array<ulint, num_cols> masks;
+        std::array<uchar, num_cols> widths;
+
+        size_t row_start(size_t row) const { return row * row_width; }
+        template<size_t col>
+        ulint get_at(size_t start) const {
+            static_assert(col < num_cols, "Column out of bounds");
+            const size_t bit = start + offsets[col];
+            ulint bits = 0;
+            std::memcpy(&bits, &data[bit / num_bits_type(word_t)], sizeof(ulint));
+            return (bits >> (bit % num_bits_type(word_t))) & masks[col];
+        }
+        template<size_t col>
+        ulint get(size_t row) const { return get_at<col>(row_start(row)); }
+        /** As packed_matrix::prefetch and prefetch_rows. */
+        void prefetch(size_t row) const { prefetch_span(data, row_start(row), row_start(row) + row_width); }
+        void prefetch_rows(size_t lo, size_t hi) const {
+            prefetch_lines(data, row_start(lo), row_start(hi) + row_width);
+        }
+
+        /** Whether columns first to last, first <= last, fit in one get_span. */
+        template<size_t first, size_t last>
+        bool span_fits() const {
+            static_assert(first <= last && last < num_cols, "Column span out of bounds");
+            return offsets[last] + widths[last] - offsets[first] <= max_width;
+        }
+        /**
+         * The bits of columns first onward of the row starting at bit start,
+         * column first lowest, read with one load.  Bits above the columns
+         * span_fits allowed are unspecified; extract_span takes a column out.
+         */
+        template<size_t first>
+        ulint get_span(size_t start) const {
+            const size_t bit = start + offsets[first];
+            ulint bits = 0;
+            std::memcpy(&bits, &data[bit / num_bits_type(word_t)], sizeof(ulint));
+            return bits >> (bit % num_bits_type(word_t));
+        }
+        /** Column col of a span read with get_span<first>. */
+        template<size_t first, size_t col>
+        ulint extract_span(ulint span) const {
+            static_assert(first <= col && col < num_cols, "Column out of span");
+            return (span >> (offsets[col] - offsets[first])) & masks[col];
+        }
+    };
+    reader get_reader() const { return reader{data.data(), row_width, offsets, masks_extract, widths}; }
+
     /** Column col of a row read with get_row_bits. */
     template<size_t col>
     ulint extract(ulint row_bits) const {
@@ -82,12 +145,15 @@ public:
      * but testing for that costs more in mispredicted branches than the
      * second prefetch does.
      */
-    void prefetch(size_t row) const {
-        const size_t start = get_row_start(row);
-        const word_t* first = &data[start / num_bits_type(word_t)];
-        const word_t* last = &data[(start + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
-        ORBIT_PREFETCH(first);
-        ORBIT_PREFETCH(last);
+    void prefetch(size_t row) const { prefetch_span(data.data(), get_row_start(row), get_row_start(row) + row_width); }
+
+    /**
+     * Hint that rows lo to hi, lo <= hi, will be read soon: prefetches each
+     * cache line from the first byte of row lo to the last byte a read of
+     * row hi touches, once per line.
+     */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        prefetch_lines(data.data(), get_row_start(lo), get_row_start(hi) + row_width);
     }
 
     template<size_t col>
@@ -205,6 +271,20 @@ private:
         row_width = bit_pos;
         vector_width = num_rows * row_width;
         data.resize(data_size());
+    }
+
+    // Prefetch the lines holding the first byte of bit start and the last
+    // byte a whole-word read of a column ending before bit end touches.
+    static void prefetch_span(const word_t* data, size_t start, size_t end) {
+        ORBIT_PREFETCH(&data[start / num_bits_type(word_t)]);
+        ORBIT_PREFETCH(&data[end / num_bits_type(word_t) + sizeof(ulint) - 1]);
+    }
+    // Prefetch every line from bit start's byte to that same last byte.
+    static void prefetch_lines(const word_t* data, size_t start, size_t end) {
+        const word_t* p = &data[start / num_bits_type(word_t)];
+        const word_t* last = &data[end / num_bits_type(word_t) + sizeof(ulint) - 1];
+        for (; p < last; p += cache_line_bytes) ORBIT_PREFETCH(p);
+        ORBIT_PREFETCH(last);
     }
 
     struct bit_pos {
