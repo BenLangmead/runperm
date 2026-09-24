@@ -676,6 +676,8 @@ public:
             return rows.template span_fits<ptr_col, off_col>() && rows.template span_fits<chr_col, sub_col>();
         }
         Handle row(ulint i) const { return rows.row_start(i); }
+        void prefetch(ulint i) const { rows.prefetch(i); }
+        void prefetch_rows(ulint lo, ulint hi) const { rows.prefetch_rows(lo, hi); }
         ulint length(Handle r) const { return rows.template get_at<len_col>(r); }
         /** The pointer and offset columns. */
         std::pair<ulint, ulint> pointer_offset(Handle r) const {
@@ -694,6 +696,8 @@ public:
         using Handle = ulint;
         using Tail = ulint;
         Handle row(ulint i) const { return i; }
+        void prefetch(ulint i) const { idx->prefetch(i); }
+        void prefetch_rows(ulint lo, ulint hi) const { idx->prefetch_rows(lo, hi); }
         ulint length(Handle i) const { return idx->get_length(i); }
         Tail tail(Handle i) const { return i; }
         uchar code(Tail i) const { return idx->code(idx->get_character(i)); }
@@ -1051,8 +1055,11 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
     const ulint last_run = idx.move_runs() - 1;
     out.resize(patterns.size());
     if (k == 0) k = 1;
-    std::vector<Slot> slots;
-    slots.reserve(k);
+    // The alphabet codes of all bytes, kept local so that stores to the
+    // output cannot force them to be reloaded.
+    std::array<uchar, 256> codes;
+    for (size_t c = 0; c < 256; ++c) codes[c] = idx.code(static_cast<uchar>(c));
+    std::vector<Slot> slots(k);
     size_t next = 0;
     // Start the next nonempty pattern; returns false when none are left.
     auto start = [&](Slot& s) {
@@ -1065,14 +1072,12 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
         }
         return false;
     };
-    for (size_t t = 0; t < k; ++t) {
-        Slot s{};
-        if (!start(s)) break;
-        slots.push_back(s);
-    }
-    while (!slots.empty()) {
-        for (size_t t = 0; t < slots.size();) {
-            Slot& s = slots[t];
+    // Slots [slots.data(), end) are in flight.
+    Slot* end = slots.data();
+    while (end < slots.data() + k && start(*end)) ++end;
+    while (end != slots.data()) {
+        for (Slot* sp = slots.data(); sp < end;) {
+            Slot& s = *sp;
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
             if (s.repositioning) {
                 auto opt = reposition_target_impl(idx, acc, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
@@ -1097,7 +1102,7 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                     pos = idx.finish_LF(s.pos);
                     r = acc.row(pos.interval);
                 }
-                if (acc.code(acc.tail(r)) == idx.code(c)) {
+                if (acc.code(acc.tail(r)) == codes[c]) {
                     s.ms[s.i - 1] = ++s.match_len;
                     if constexpr (packed) {
                         const auto [ptr, off] = acc.pointer_offset(r);
@@ -1106,7 +1111,7 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                     } else {
                         s.pos = idx.start_LF(pos);
                     }
-                } else if (!idx.occurs(c)) {
+                } else if (codes[c] == MSIndexSpillLCP<SP>::no_code) {
                     // c does not occur in the text: the statistic is 0 and
                     // matching restarts from the current row.
                     s.ms[s.i - 1] = s.match_len = 0;
@@ -1117,21 +1122,17 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                     const ulint cur = pos.interval;
                     const ulint lo = cur > rep_window ? cur - rep_window : 0;
                     const ulint hi = std::min(cur + rep_window, last_run);
-                    idx.prefetch_rows(lo, hi);
+                    acc.prefetch_rows(lo, hi);
                     idx.prefetch_spill(cur, acc.spill(r));
                     s.pos = pos;
                     s.repositioning = true;
-                    ++t;
+                    ++sp;
                     continue;
                 }
             }
-            idx.prefetch(s.pos.interval);
-            if (--s.i > 0 || start(s)) {
-                ++t;
-            } else {
-                s = slots.back();
-                slots.pop_back();
-            }
+            acc.prefetch(s.pos.interval);
+            if (--s.i > 0 || start(s)) ++sp;
+            else s = *--end;
         }
     }
 }
