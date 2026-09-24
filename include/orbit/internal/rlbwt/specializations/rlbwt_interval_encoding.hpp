@@ -32,19 +32,38 @@ public:
         return enc;
     }
 
+    // F runs are the BWT runs stably sorted by character, so BWT run i with
+    // character c is F run C_head[c] + (number of earlier runs of c), where
+    // C_head[c] counts the runs of smaller characters.  One pass fills packed
+    // arrays of the F run lengths and of each BWT run's F run.
     static rlbwt_interval_encoding_impl fl_interval_encoding(const std::vector<uchar>& rlbwt_heads, const std::vector<ulint>& rlbwt_run_lengths, const split_params& sp = split_params()) {
         assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
 
         rlbwt_interval_encoding_impl enc;
 
-        auto [head_counts, F_lens_and_origin_run, n, max_length] = get_FL_head_counts(rlbwt_heads, rlbwt_run_lengths);
-        enc.set_initial_values(n, rlbwt_heads.size(), max_length, sp);
+        auto [head_counts, n, max_length] = get_LF_head_counts(rlbwt_heads, rlbwt_run_lengths);
+        const size_t r = rlbwt_heads.size();
+        enc.set_initial_values(n, r, max_length, sp);
 
-        auto [F_heads, F_lens, F_img_rank_inv] = get_FL_runs_and_img_rank_inv(rlbwt_heads.size(), F_lens_and_origin_run);
-        enc.init_img_rank_inv(F_lens, F_img_rank_inv);
-
-        enc.alphabet_ = alphabet_t(head_counts);
-        enc.init_heads(F_heads, F_lens);
+        std::vector<size_t> next_f(head_counts.size(), 0);
+        std::vector<uchar> F_heads(r);
+        for (size_t c = 0, seen = 0; c < head_counts.size(); ++c) {
+            next_f[c] = seen;
+            std::fill(F_heads.begin() + seen, F_heads.begin() + seen + head_counts[c], static_cast<uchar>(c));
+            seen += head_counts[c];
+        }
+        {
+            int_vector_t F_lens(r, bit_width(max_length));
+            int_vector_t F_img_rank_inv(r, bit_width(r - 1));
+            for (size_t i = 0; i < r; ++i) {
+                const size_t f = next_f[rlbwt_heads[i]]++;
+                F_lens.set(f, rlbwt_run_lengths[i]);
+                F_img_rank_inv.set(i, f);
+            }
+            enc.init_img_rank_inv(F_lens, F_img_rank_inv);
+            enc.alphabet_ = alphabet_t(head_counts);
+            enc.init_heads(F_heads, F_lens);
+        }
         return enc;
     }
 
