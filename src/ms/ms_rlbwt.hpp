@@ -613,6 +613,8 @@ public:
     Position finish_LF(Position p) const { return idx_.finish_next(p); }
     /** Hint that the row of interval i will be read soon. */
     void prefetch(ulint i) const { idx_.prefetch(i); }
+    /** Hint that the rows of intervals lo to hi, lo <= hi, will be read soon. */
+    void prefetch_rows(ulint lo, ulint hi) const { idx_.prefetch_rows(lo, hi); }
     /** Hint that the spillover record of row i, if it has one, will be read soon.  Reads row i. */
     void prefetch_spill(ulint i) const {
         const ulint so = get<LCPSpillRunCols::LCP_SPILL>(i);
@@ -983,7 +985,7 @@ inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::stri
                     const ulint cur = pos.interval;
                     const ulint lo = cur > rep_window ? cur - rep_window : 0;
                     const ulint hi = std::min(cur + rep_window, last_run);
-                    for (ulint j = lo; j <= hi; ++j) idx.prefetch(j);
+                    idx.prefetch_rows(lo, hi);
                     idx.prefetch_spill(cur);
                     s.pos = pos;
                     s.repositioning = true;
