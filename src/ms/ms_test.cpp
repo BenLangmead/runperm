@@ -624,15 +624,17 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
         bool ok = true;
         if constexpr (Index::packed_access_supported) {
             const auto acc = idx->packed_access();
+            assert(acc.fits() && "the test indexes' columns fit packed access");
             const auto r = acc.row(i);
+            const auto t = acc.tail(r);
             const auto pos = idx->start_LF(typename Index::position{i, 0});
-            ok = acc.code(r) == idx->code(idx->get_character(i)) && acc.length(r) == len &&
-                 acc.pointer(r) == pos.interval && acc.offset(r) == pos.offset &&
-                 acc.template col<LCPSpillRunCols::LCP_TOP>(r) == idx->template get<LCPSpillRunCols::LCP_TOP>(i) &&
-                 acc.template col<LCPSpillRunCols::LCP_MIN_SUB>(r) == idx->template get<LCPSpillRunCols::LCP_MIN_SUB>(i) &&
-                 acc.template col<LCPSpillRunCols::LCP_SPILL>(r) == idx->template get<LCPSpillRunCols::LCP_SPILL>(i) &&
-                 boundary_lcp(*idx, acc, r, i) == boundary_lcp(*idx, i) &&
-                 row_min_lcp(*idx, acc, r, i) == row_min_lcp(*idx, i);
+            ok = acc.code(t) == idx->code(idx->get_character(i)) && acc.length(r) == len &&
+                 acc.pointer_offset(r) == std::make_pair(ulint(pos.interval), ulint(pos.offset)) &&
+                 acc.top(t) == idx->template get<LCPSpillRunCols::LCP_TOP>(i) &&
+                 acc.sub(t) == idx->template get<LCPSpillRunCols::LCP_MIN_SUB>(i) &&
+                 acc.spill(r) == idx->template get<LCPSpillRunCols::LCP_SPILL>(i) &&
+                 boundary_lcp(*idx, acc, r, t, i) == boundary_lcp(*idx, i) &&
+                 row_min_lcp(*idx, acc, r, t, i) == row_min_lcp(*idx, i);
             for (ulint off = 0; ok && off < len; ++off)
                 ok = range_min_both(*idx, acc, r, i, off) == range_min_both(*idx, i, off);
         }
