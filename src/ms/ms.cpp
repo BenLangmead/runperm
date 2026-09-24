@@ -70,6 +70,7 @@ static void usage(const char* prog) {
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
+              << "            [--max-smem-positions N]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; the others need phi).  --positions\n"
               << "              adds a field with an occurrence position for each value (-1\n"
@@ -80,10 +81,12 @@ static void usage(const char* prog) {
               << "              occurs, and needs phi; smem-all gives each as i:L:c:p1,p2,...,\n"
               << "              with all c text positions in BWT row order, and needs phi and\n"
               << "              phi_inv.  --min-smem-len T keeps only SMEMs with L > T (default\n"
-              << "              0, all of them) in both SMEM reports.  With smem-all, K also\n"
-              << "              sets how many of its phi and phi_inv walks list positions at\n"
-              << "              once (K = 0: one SMEM at a time).  Results do not depend on the\n"
-              << "              mode or K.\n"
+              << "              0, all of them) in both SMEM reports.  --max-smem-positions N\n"
+              << "              makes smem-all list at most N positions per SMEM, the first N in\n"
+              << "              BWT row order, while c still counts all of them (default: list\n"
+              << "              all).  With smem-all, K also sets how many of its phi and\n"
+              << "              phi_inv walks list positions at once (K = 0: one SMEM at a\n"
+              << "              time).  Results do not depend on the mode or K.\n"
               << "  tms-text   INDEX_PATH\n"
               << "              Print the indexed text, read back with LF.\n"
               << "  tms-inspect INDEX_PATH\n"
@@ -178,6 +181,7 @@ static TmsMode g_tms_mode = TmsMode::PSI;
 static bool g_tms_positions = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
+static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
 static std::vector<std::vector<ulint>> g_tms_pos;
 static std::vector<TmsSmemHits> g_tms_hits;
 
@@ -189,7 +193,8 @@ static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t 
     const bool smems = g_tms_report != TmsReport::MS;
     tms_query_batch(idx, p, k, out, g_tms_mode, g_tms_positions || smems ? &g_tms_pos : nullptr);
     if (!smems) return;
-    tms_report_smems_batch(idx, out, g_tms_pos, g_tms_min_smem_len, g_tms_report, smem_k, g_tms_hits);
+    tms_report_smems_batch(idx, out, g_tms_pos, g_tms_min_smem_len, g_tms_report, smem_k, g_tms_hits,
+                           g_tms_max_smem_positions);
 }
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k,
                        std::vector<std::vector<ulint>>& out) {
@@ -253,6 +258,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         }
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--min-smem-len") == 0 && i + 1 < argc)
             g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
+            g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
     }
     using clock = std::chrono::steady_clock;
