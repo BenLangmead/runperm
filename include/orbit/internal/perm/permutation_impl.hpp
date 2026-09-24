@@ -409,7 +409,14 @@ public:
     ulint get_length(position position) const {
         return get_length(position.interval);
     }
-    
+
+    // With absolute positions, the first position of an interval; the
+    // domain for interval == intervals().
+    template<bool abs = store_absolute_positions, std::enable_if_t<abs, int> = 0>
+    ulint get_start(ulint interval) const {
+        return move_structure.get_start(interval);
+    }
+
     split_params get_split_params() const {
         return split_params_;
     }
