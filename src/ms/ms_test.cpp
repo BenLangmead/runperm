@@ -8,6 +8,7 @@
 #include "ms_test.hpp"
 #include "ms_rlbwt.hpp"
 #include "ms_io.hpp"
+#include "serialize.hpp"
 #include "tsv.hpp"
 #include "rlbwt_io.hpp"
 #include <cstdio>
@@ -566,6 +567,43 @@ bool test_rlbwt_input_path(const std::string& data_dir) {
 }
 
 /**
+ * Save an index, load it back, and check that it matches the original: same
+ * column widths, spillover size and matching statistics.
+ */
+bool test_index_file_roundtrip(const std::string& data_dir) {
+    std::cout << "Testing index file save/load" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    ms_io::BuildOptions o;
+    o.minima_only = true; o.percentile_k = 0.9; o.coalesce = true; o.spill_split_bits = 6;
+    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+    if (!idx) {
+        std::cout << "  DID NOT RUN" << std::endl;
+        return false;
+    }
+    const std::string p = data_dir + "/.ms_test.idx";
+    assert(ms_serialize::write_index(p, *idx));
+    auto l = ms_serialize::read_index(p);
+    std::remove(p.c_str());
+    assert(l && "saved index must load");
+    assert(l->get_widths() == idx->get_widths());
+    assert(l->move_runs() == idx->move_runs() && l->domain() == idx->domain());
+    assert(l->spillover_total_bytes() == idx->spillover_total_bytes());
+    assert(l->max_lcp_top() == idx->max_lcp_top() && l->max_lcp_min_sub() == idx->max_lcp_min_sub());
+    const std::string T = reconstruct_text(*idx);
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<size_t> start_dist(0, T.size() - 100);
+    for (int k = 0; k < 100; ++k) {
+        std::string P = T.substr(start_dist(rng), 100);
+        for (size_t j = k % 13; j < P.size(); j += 13) P[j] = "ACGT"[(j + k) % 4];
+        if (k % 4 == 0) P[30] = 'N';
+        auto want = ms_query(*idx, P);
+        assert(ms_query(*l, P) == want && "loaded index must answer identically");
+    }
+    std::cout << "  PASSED" << std::endl;
+    return true;
+}
+
+/**
  * Compare two indexes by running ms_query on many extract_errory_string patterns
  * and asserting identical matching statistics. Uses extractor for pattern generation.
  */
@@ -749,6 +787,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_ms_query_vs_naive_mutated(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_rlbwt_input_path(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!test_index_file_roundtrip(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (all_ran) {
         std::cout << "All ms_test checks PASSED" << std::endl;
