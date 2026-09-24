@@ -23,7 +23,12 @@
 #define ORBIT_PREFETCH(addr) ((void)(addr))
 #endif
 
+
 namespace orbit {
+
+// Cache line size assumed when deciding whether two addresses need separate
+// prefetches.
+constexpr std::size_t CACHE_LINE_BYTES = 64;
 
 typedef unsigned char uchar;
 typedef unsigned long int ulint;

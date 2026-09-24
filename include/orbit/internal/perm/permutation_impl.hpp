@@ -247,6 +247,20 @@ public:
         }
     }
 
+    /**
+     * Whole-row reads, for a move_vector table whose rows fit in one word:
+     * row_bits(i) reads interval i's row with one load, and the accessors
+     * below take its columns out of the result.
+     */
+    bool row_fits_word() const { return move_structure.row_fits_word(); }
+    ulint row_bits(ulint interval) const { return move_structure.get_row_bits(interval); }
+    ulint length_of(ulint bits) const {
+        static_assert(cols_traits::RELATIVE, "rows store lengths only with relative positions");
+        return move_structure.template extract<to_cols(cols_traits::LENGTH)>(bits);
+    }
+    ulint pointer_of(ulint bits) const { return move_structure.template extract<to_cols(cols_traits::POINTER)>(bits); }
+    ulint offset_of(ulint bits) const { return move_structure.template extract<to_cols(cols_traits::OFFSET)>(bits); }
+
     /** Hint that the row of the given interval will be read soon. */
     void prefetch(ulint interval) const {
         move_structure.prefetch(interval);

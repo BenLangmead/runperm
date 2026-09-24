@@ -194,6 +194,13 @@ public:
         table.prefetch(i);
     }
 
+    // Whole-row reads, for tables that support them (move_vector); see
+    // packed_matrix::get_row_bits.
+    bool row_fits_word() const { return table.row_fits_word(); }
+    ulint get_row_bits(size_t i) const { return table.get_row_bits(i); }
+    template<columns col>
+    ulint extract(ulint row_bits) const { return table.template extract<col>(row_bits); }
+
     position move_exponential(position pos) const {
         if constexpr (cols_traits::RELATIVE) {
             return move(pos);

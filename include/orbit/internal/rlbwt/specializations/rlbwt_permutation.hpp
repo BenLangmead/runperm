@@ -137,6 +137,11 @@ public:
     uchar get_character(ulint interval) {
         return alphabet_.unmap_char(base::template get_base_column<base_columns::CHARACTER>(interval));
     }
+    /** The character of a row read with row_bits. */
+    uchar character_of(ulint bits) {
+        return alphabet_.unmap_char(static_cast<uchar>(
+            base::move_structure.template extract<base::to_cols(base::base_columns::CHARACTER)>(bits)));
+    }
     uchar get_character(position pos) {
         return alphabet_.unmap_char(base::template get_base_column<base_columns::CHARACTER>(pos.interval));
     }

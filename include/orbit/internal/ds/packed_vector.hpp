@@ -49,14 +49,44 @@ public:
         return extract_bits(bits, pos.offset, masks_extract[col]);
     } 
 
+    /** Whether get_row_bits can read a whole row with one load. */
+    bool row_fits_word() const { return row_width <= max_width; }
+
     /**
-     * Hint that row will be read soon.  A row can straddle a cache line, so
-     * this prefetches the bytes holding its first and last bits.
+     * The bits of a row, its first column lowest, read with one unaligned
+     * load; only when row_fits_word().  Bits above the row are unspecified,
+     * and extract() takes a column out of the result.
+     */
+    ulint get_row_bits(size_t row) const {
+        assert(row < num_rows && row_fits_word());
+        bit_pos pos(get_row_start(row));
+        ulint bits = 0;
+        std::memcpy(&bits, &data[pos.chunk], sizeof(ulint));
+        return bits >> pos.offset;
+    }
+
+    /** Column col of a row read with get_row_bits. */
+    template<size_t col>
+    ulint extract(ulint row_bits) const {
+        static_assert(col < num_cols, "Column out of bounds");
+        return extract_bits(row_bits, static_cast<uchar>(offsets[col]), masks_extract[col]);
+    }
+
+    /**
+     * Hint that row will be read soon.  get() reads a whole ulint from the
+     * byte where a column starts, so a row's reads span from its first byte
+     * to sizeof(ulint) - 1 bytes past the start of its last column.  This
+     * prefetches the line holding the first byte, and the line holding the
+     * last byte only when it is a different one, since every prefetch that
+     * misses competes for the core's few outstanding misses.
      */
     void prefetch(size_t row) const {
         const size_t start = get_row_start(row);
-        ORBIT_PREFETCH(&data[start / num_bits_type(word_t)]);
-        ORBIT_PREFETCH(&data[(start + row_width - 1) / num_bits_type(word_t)]);
+        const word_t* first = &data[start / num_bits_type(word_t)];
+        const word_t* last = &data[(start + offsets[num_cols - 1]) / num_bits_type(word_t) + sizeof(ulint) - 1];
+        ORBIT_PREFETCH(first);
+        if ((reinterpret_cast<uintptr_t>(first) ^ reinterpret_cast<uintptr_t>(last)) >= CACHE_LINE_BYTES)
+            ORBIT_PREFETCH(last);
     }
 
     template<size_t col>
@@ -220,6 +250,11 @@ public:
     template<columns col>
     void set(size_t row, ulint val) {
         base::template set<static_cast<size_t>(col)>(row, val);
+    }
+
+    template<columns col>
+    ulint extract(ulint row_bits) const {
+        return base::template extract<static_cast<size_t>(col)>(row_bits);
     }
 };
 

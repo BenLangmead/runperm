@@ -191,6 +191,12 @@ struct move_vector : public move_table_interface<move_vector<columns_t>, columns
         vec.prefetch(i);
     }
 
+    // Whole-row reads; see packed_matrix::get_row_bits.
+    bool row_fits_word() const { return vec.row_fits_word(); }
+    ulint get_row_bits(size_t i) const { return vec.get_row_bits(i); }
+    template <columns col>
+    ulint extract(ulint row_bits) const { return vec.template extract<col>(row_bits); }
+
     const std::array<uchar, num_cols>& get_widths() const {
         return vec.get_widths();
     }
