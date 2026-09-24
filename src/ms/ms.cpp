@@ -51,10 +51,11 @@ static void usage(const char* prog) {
               << "              prefetching.  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--minima FILE] [--lf-split B] [--fl-split B]\n"
-              << "            [--phi-split B]\n"
+              << "            [--phi-split B] [--lcp-bin FILE]\n"
               << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
               << "              input, and with --minima (a TeraLCP -ominima file, of which only\n"
-              << "              each run's top LCP is used) also phi.  --lf-split, --fl-split\n"
+              << "              each run's top LCP is used) or --lcp-bin (one 64-bit LCP per row)\n"
+              << "              also phi.  --lf-split, --fl-split\n"
               << "              and --phi-split set Orbit's balancing factor for that structure\n"
               << "              (0 = no splitting; defaults: LF 0, FL and phi Orbit's default\n"
               << "              length capping and balancing).\n"
@@ -503,7 +504,7 @@ int main(int argc, char** argv) {
         }
         TmsBuildOptions opts;
         bool with_phi = false;
-        std::string minima_path;
+        std::string minima_path, lcp_bin_path;
         auto split_arg = [](const char* v) {
             const ulint b = std::stoull(v);
             return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
@@ -514,6 +515,7 @@ int main(int argc, char** argv) {
             else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
             else if (from_tsv && strcmp(argv[i], "--phi") == 0) with_phi = true;
             else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
+            else if (!from_tsv && strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
         using clock = std::chrono::steady_clock;
@@ -534,7 +536,26 @@ int main(int argc, char** argv) {
                 std::cerr << "Failed to load RLBWT: " << err << "\n";
                 return 1;
             }
-            if (with_phi) {
+            if (with_phi && !lcp_bin_path.empty()) {
+                // One little-endian 64-bit LCP per row; keep each run head's.
+                std::ifstream lin(lcp_bin_path, std::ios::binary);
+                if (!lin.good()) { std::cerr << "cannot open " << lcp_bin_path << "\n"; return 1; }
+                std::vector<uint64_t> buf(1 << 20);
+                size_t have = 0, at = 0;
+                tops.reserve(heads.size());
+                for (ulint len : lens) {
+                    for (ulint j = 0; j < len; ++j) {
+                        if (at == have) {
+                            lin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 8));
+                            have = static_cast<size_t>(lin.gcount()) / 8;
+                            at = 0;
+                            if (have == 0) { std::cerr << "lcp file is shorter than the RLBWT\n"; return 1; }
+                        }
+                        if (j == 0) tops.push_back(buf[at]);
+                        ++at;
+                    }
+                }
+            } else if (with_phi) {
                 ulint n = 0;
                 for (ulint l : lens) n += l;
                 std::vector<RunLcpPairs> pairs;
