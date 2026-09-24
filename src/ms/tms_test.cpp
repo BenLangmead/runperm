@@ -356,6 +356,60 @@ bool test_tms_vs_ms_minishred(const std::string& data_dir) {
 }
 
 /**
+ * TmsIndex::PackedAccess fits the index and agrees with the index's own
+ * column reads for every LF row (length, character, the LF step from every
+ * offset, psi_at_tail, resolving a position past a row's end) and for every
+ * FL row (psi_step from every offset, and from one past the row's end).
+ * Returns the number of rows checked.
+ */
+size_t check_packed_access(TmsIndex& idx) {
+    const TmsIndex::PackedAccess pa = idx.packed_access();
+    assert(pa.fits() && "the test indexes must fit packed access");
+    std::array<uchar, 256> lf_code, fl_code;
+    for (size_t c = 0; c < 256; ++c) {
+        lf_code[c] = idx.lf_code(static_cast<uchar>(c));
+        fl_code[c] = idx.fl_code(static_cast<uchar>(c));
+        assert((lf_code[c] != TmsIndex::no_code) == idx.occurs(static_cast<uchar>(c)));
+    }
+    size_t rows = 0;
+    for (ulint i = 0; i < idx.move_runs(); ++i, ++rows) {
+        const auto r = pa.row(i);
+        assert(pa.length(r) == idx.get_length(i));
+        assert(pa.code(r) == lf_code[idx.get_character(i)]);
+        const TmsIndex::FLPos q = pa.psi_at_tail(r), want_q = idx.psi_at_tail(i);
+        assert(q.interval == want_q.interval && q.offset == want_q.offset);
+        for (ulint o = 0; o < idx.get_length(i); ++o) {
+            TmsIndex::LFPos p{};
+            p.interval = i;
+            p.offset = o;
+            const TmsIndex::LFPos got = pa.start_LF(r, p), want = idx.start_LF(p);
+            assert(got.interval == want.interval && got.offset == want.offset);
+        }
+        if (i + 1 < idx.move_runs()) {
+            TmsIndex::LFPos p{};
+            p.interval = i;
+            p.offset = idx.get_length(i);
+            const TmsIndex::LFPos want = idx.finish_LF(p);
+            const auto rr = pa.resolve_LF(p);
+            assert(p.interval == want.interval && p.offset == want.offset && rr == pa.row(want.interval));
+        }
+    }
+    for (ulint i = 0; i < idx.psi_intervals(); ++i, ++rows) {
+        const ulint len = idx.fl().get_length(i);
+        for (ulint o = 0; o <= len; ++o) {
+            if (o == len && i + 1 == idx.psi_intervals()) break;
+            TmsIndex::FLPos q{};
+            q.interval = i;
+            q.offset = o;
+            uchar c = 0, want_c = 0;
+            const TmsIndex::FLPos got = pa.psi_step(q, c), want = idx.psi_step(q, want_c);
+            assert(got.interval == want.interval && got.offset == want.offset && c == fl_code[want_c]);
+        }
+    }
+    return rows;
+}
+
+/**
  * tms_query_batch in every mode, with and without positions, gives the
  * lengths tms_query gives, for several numbers of patterns in flight.  The
  * positions are the same in every mode and for every k, and each one is an
@@ -368,7 +422,7 @@ bool test_tms_batch(const std::string& data_dir) {
     std::mt19937 rng(41);
     const auto inputs = batch_inputs(data_dir, rng);
     const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
-    size_t checked = 0, positions = 0;
+    size_t checked = 0, positions = 0, access_rows = 0;
     for (const auto& in : inputs) {
         const std::string& T = in.text;
         auto pats = fuzz_patterns(T, rng, 200);
@@ -382,16 +436,20 @@ bool test_tms_batch(const std::string& data_dir) {
             idx.serialize(ss);
             TmsIndex loaded;
             loaded.load(ss);
+            access_rows += check_packed_access(idx);
             std::vector<std::vector<ulint>> want;
             for (const auto& P : pats) want.push_back(tms_query(idx, P));
             std::vector<std::vector<ulint>> first_pos;
             for (TmsMode mode : modes) {
                 for (size_t k : {1, 3, 32, 1000}) {
-                    for (bool with_pos : {false, true}) {
+                    for (int access = 0; access < 4; ++access) {
+                        // Packed and column access, without and with positions.
+                        const bool packed = access < 2, with_pos = access % 2 == 1;
                         std::vector<std::vector<ulint>> got, pos;
-                        tms_query_batch(k == 3 ? loaded : idx, pats, k, got, mode, with_pos ? &pos : nullptr);
+                        tms_query_batch(k == 3 ? loaded : idx, pats, k, got, mode, with_pos ? &pos : nullptr, packed);
                         if (got != want) {
-                            std::cout << "  FAILED lengths: mode " << int(mode) << ", k " << k << std::endl;
+                            std::cout << "  FAILED lengths: mode " << int(mode) << ", k " << k << ", packed " << packed
+                                      << std::endl;
                             assert(false && "tms_query_batch lengths must match tms_query");
                             return false;
                         }
@@ -422,7 +480,8 @@ bool test_tms_batch(const std::string& data_dir) {
             }
         }
     }
-    std::cout << "  " << checked << " batches and " << positions << " positions PASSED" << std::endl;
+    std::cout << "  " << access_rows << " rows of packed access, " << checked << " batches and " << positions
+              << " positions PASSED" << std::endl;
     return true;
 }
 
