@@ -24,6 +24,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <type_traits>
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -49,15 +50,25 @@ static void usage(const char* prog) {
               << "              (default 32); K = 0 queries one read at a time without\n"
               << "              prefetching.  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
-              << "  tms-build  HEADS LENS INDEX_PATH [--lf-split B] [--fl-split B]\n"
-              << "              Build a tms index (LF and psi, no LCP input) from an RLBWT.\n"
-              << "              --lf-split and --fl-split set Orbit's balancing factor for\n"
-              << "              that structure (0 = no splitting; defaults: LF 0, FL Orbit's\n"
-              << "              default length capping and balancing).\n"
-              << "  tms-build-tsv TSV_PATH INDEX_PATH [--lf-split B] [--fl-split B]\n"
-              << "              Same, taking the runs from a TSV.\n"
+              << "  tms-build  HEADS LENS INDEX_PATH [--minima FILE] [--lf-split B] [--fl-split B]\n"
+              << "            [--phi-split B]\n"
+              << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
+              << "              input, and with --minima (a TeraLCP -ominima file, of which only\n"
+              << "              each run's top LCP is used) also phi.  --lf-split, --fl-split\n"
+              << "              and --phi-split set Orbit's balancing factor for that structure\n"
+              << "              (0 = no splitting; defaults: LF 0, FL and phi Orbit's default\n"
+              << "              length capping and balancing).\n"
+              << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [split options]\n"
+              << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
-              << "              As batch, with a tms index.\n"
+              << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
+              << "              As batch, with a tms index.  --mode sets how repositions\n"
+              << "              compute LCEs (default psi; the others need phi).  --positions\n"
+              << "              adds a third field with an occurrence position for each value\n"
+              << "              (-1 where it is 0); it needs phi.  Results do not depend on the\n"
+              << "              mode or K.\n"
+              << "  tms-text   INDEX_PATH\n"
+              << "              Print the indexed text, read back with LF.\n"
               << "  tms-inspect INDEX_PATH\n"
               << "              Print the structures' sizes and column widths.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
@@ -140,10 +151,19 @@ static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::strin
                        std::vector<std::vector<ulint>>& out) {
     ms_query_batch(idx, p, k, out);
 }
-static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) { return tms_query(idx, s); }
+// tms-batch settings, from its command line.
+static TmsMode g_tms_mode = TmsMode::PSI;
+static bool g_tms_positions = false;
+static std::vector<std::vector<ulint>> g_tms_pos;
+
+static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) {
+    std::vector<std::vector<ulint>> len;
+    tms_query_batch(idx, {s}, 1, len, g_tms_mode, g_tms_positions ? &g_tms_pos : nullptr);
+    return std::move(len[0]);
+}
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k,
                        std::vector<std::vector<ulint>>& out) {
-    tms_query_batch(idx, p, k, out);
+    tms_query_batch(idx, p, k, out, g_tms_mode, g_tms_positions ? &g_tms_pos : nullptr);
 }
 
 static std::optional<TmsIndex> read_tms_index(const std::string& path) {
@@ -177,6 +197,15 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
         else if (strcmp(argv[i], "--interleave") == 0 && i + 1 < argc)
             interleave = static_cast<size_t>(std::stoull(argv[++i]));
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            const std::string m = argv[++i];
+            if (m == "psi") g_tms_mode = TmsMode::PSI;
+            else if (m == "phi") g_tms_mode = TmsMode::PHI;
+            else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
+            else if (m == "dual") g_tms_mode = TmsMode::DUAL;
+            else { std::cerr << "Unknown mode: " << m << "\n"; return 1; }
+        }
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
     }
     using clock = std::chrono::steady_clock;
@@ -209,13 +238,23 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     size_t n_reads = 0, n_bases = 0;
     double query_s = 0.0;
     auto t_all = clock::now();
-    auto write_ms = [&](const std::string& nm, const std::vector<ulint>& ms) {
+    // With --positions, a second tab-separated field holds the positions
+    // (-1 for none).
+    auto write_ms = [&](const std::string& nm, const std::vector<ulint>& ms, size_t j) {
         line.clear();
         line += nm;
         line += '\t';
         for (size_t i = 0; i < ms.size(); ++i) {
             if (i > 0) line += ' ';
             line += std::to_string(ms[i]);
+        }
+        if (std::is_same_v<Index, TmsIndex> && g_tms_positions) {
+            line += '\t';
+            const auto& pos = g_tms_pos[j];
+            for (size_t i = 0; i < pos.size(); ++i) {
+                if (i > 0) line += ' ';
+                line += pos[i] == TMS_NO_POS ? std::string("-1") : std::to_string(pos[i]);
+            }
         }
         line += '\n';
         out->write(line.data(), static_cast<std::streamsize>(line.size()));
@@ -228,7 +267,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             ++n_reads;
             n_bases += seq.size();
-            if (write_output) write_ms(name, ms);
+            if (write_output) write_ms(name, ms, 0);
         }
     } else {
         // Blocks of reads with ms_query_batch, interleave reads in flight.
@@ -250,10 +289,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             query_s += std::chrono::duration<double>(clock::now() - tq).count();
             n_reads += seqs.size();
             if (write_output)
-                for (size_t j = 0; j < seqs.size(); ++j) write_ms(names[j], results[j]);
+                for (size_t j = 0; j < seqs.size(); ++j) write_ms(names[j], results[j], j);
         }
     }
     out->flush();
+#ifdef TMS_STATS
+    std::cerr << "stats: bases=" << tms_stats.bases << " repositions/base=" << double(tms_stats.repositions) / tms_stats.bases
+              << " psi_steps/base=" << double(tms_stats.psi_steps) / tms_stats.bases
+              << " scan_rows/rep=" << double(tms_stats.scan_rows) / tms_stats.repositions
+              << " len/rep=" << double(tms_stats.len_at_rep) / tms_stats.repositions << "\n";
+#endif
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases
               << " index_load_s=" << load_s << " query_s=" << query_s
@@ -452,6 +497,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         TmsBuildOptions opts;
+        bool with_phi = false;
+        std::string minima_path;
         auto split_arg = [](const char* v) {
             const ulint b = std::stoull(v);
             return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
@@ -459,28 +506,44 @@ int main(int argc, char** argv) {
         for (int i = npos; i < argc; ++i) {
             if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) opts.lf_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--fl-split") == 0 && i + 1 < argc) opts.fl_split = split_arg(argv[++i]);
+            else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
+            else if (from_tsv && strcmp(argv[i], "--phi") == 0) with_phi = true;
+            else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
         std::vector<uchar> heads;
-        std::vector<ulint> lens;
+        std::vector<ulint> lens, tops;
         if (from_tsv) {
             std::vector<std::vector<ulint>> lcps;
             if (!tsv::load_tsv(argv[0], heads, lens, lcps)) {
                 std::cerr << "Failed to load TSV: " << argv[0] << "\n";
                 return 1;
             }
+            if (with_phi)
+                for (const auto& l : lcps) tops.push_back(l[0]);
         } else {
             std::string err;
             if (!rlbwt_io::load_rlbwt(argv[0], argv[1], heads, lens, err)) {
                 std::cerr << "Failed to load RLBWT: " << err << "\n";
                 return 1;
             }
+            if (with_phi) {
+                ulint n = 0;
+                for (ulint l : lens) n += l;
+                std::vector<RunLcpPairs> pairs;
+                if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
+                    std::cerr << "Failed to load minima: " << err << "\n";
+                    return 1;
+                }
+                tops.reserve(pairs.size());
+                for (const auto& p : pairs) tops.push_back(p[0].second);
+            }
         }
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         auto t1 = clock::now();
-        TmsIndex idx(heads, lens, opts);
+        TmsIndex idx(heads, lens, opts, with_phi ? &tops : nullptr);
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
         std::ofstream out(idx_path, std::ios::binary);
@@ -500,6 +563,24 @@ int main(int argc, char** argv) {
         auto opt = read_tms_index(argv[0]);
         if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
         opt->describe(std::cout);
+        return 0;
+    }
+
+    if (cmd == "tms-text") {
+        if (argc < 1) { std::cerr << "tms-text requires INDEX_PATH\n"; return 1; }
+        auto opt = read_tms_index(argv[0]);
+        if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
+        // Row 0 holds text position n - 1, so the s-th row LF visits from it
+        // has BWT character T[n - 2 - s].
+        const ulint n = opt->domain();
+        std::string t(n, '\0');
+        auto pos = opt->first();
+        for (ulint st = 0; st < n; ++st) {
+            const uchar c = opt->get_character(pos.interval);
+            t[(2 * n - 2 - st) % n] = c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : static_cast<char>(c);
+            pos = opt->LF_step(pos);
+        }
+        std::cout << t << "\n";
         return 0;
     }
 

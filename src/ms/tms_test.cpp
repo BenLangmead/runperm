@@ -313,6 +313,110 @@ bool test_tms_vs_ms_minishred(const std::string& data_dir) {
     return true;
 }
 
+/**
+ * tms_query_batch in every mode, with and without positions, gives the
+ * lengths tms_query gives, for several numbers of patterns in flight.  The
+ * positions are the same in every mode and for every k, and each one is an
+ * occurrence: T[pos .. pos + len) = P[i .. i + len), with TMS_NO_POS exactly
+ * where the length is 0.  Runs on the fuzz texts and, if its LF is a single
+ * cycle, on minishred.
+ */
+bool test_tms_batch(const std::string& data_dir) {
+    std::cout << "Testing tms_query_batch in every mode against tms_query" << std::endl;
+    struct Input { std::vector<uchar> heads; std::vector<ulint> lens, tops; std::string text; };
+    std::vector<Input> inputs;
+    std::mt19937 rng(41);
+    for (const auto& s : fuzz_texts(rng)) {
+        TextBwt t = make_text_bwt(s);
+        Input in{t.heads, t.lens, {}, t.str};
+        for (const auto& l : t.lcps_per_run) in.tops.push_back(l[0]);
+        inputs.push_back(std::move(in));
+    }
+    {
+        std::vector<uchar> heads;
+        std::vector<ulint> lens;
+        std::vector<std::vector<ulint>> lcps;
+        if (tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", heads, lens, lcps)) {
+            Input in{heads, lens, {}, {}};
+            for (const auto& l : lcps) in.tops.push_back(l[0]);
+            try {
+                TmsIndex probe(heads, lens, TmsBuildOptions{}, &in.tops);
+                auto pos = probe.first();
+                // Row 0 holds text position n - 1, so the s-th row LF visits
+                // from it has BWT character T[n - 2 - s].
+                const ulint n = probe.domain();
+                std::string T(n, ' ');
+                for (ulint st = 0; st < n; ++st) {
+                    const uchar c = probe.get_character(pos.interval);
+                    T[(2 * n - 2 - st) % n] = c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : static_cast<char>(c);
+                    pos = probe.LF_step(pos);
+                }
+                in.text = T;
+                inputs.push_back(std::move(in));
+            } catch (const std::exception& e) {
+                std::cout << "  minishred skipped: " << e.what() << std::endl;
+            }
+        }
+    }
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    size_t checked = 0, positions = 0;
+    for (const auto& in : inputs) {
+        const std::string& T = in.text;
+        auto pats = fuzz_patterns(T, rng, 200);
+        auto variants = split_variants();
+        TmsBuildOptions nophi;
+        nophi.phi_split = orbit::NO_SPLITTING;
+        variants.push_back(nophi);
+        for (const auto& o : variants) {
+            TmsIndex idx(in.heads, in.lens, o, &in.tops);
+            std::stringstream ss;
+            idx.serialize(ss);
+            TmsIndex loaded;
+            loaded.load(ss);
+            std::vector<std::vector<ulint>> want;
+            for (const auto& P : pats) want.push_back(tms_query(idx, P));
+            std::vector<std::vector<ulint>> first_pos;
+            for (TmsMode mode : modes) {
+                for (size_t k : {1, 3, 32, 1000}) {
+                    for (bool with_pos : {false, true}) {
+                        std::vector<std::vector<ulint>> got, pos;
+                        tms_query_batch(k == 3 ? loaded : idx, pats, k, got, mode, with_pos ? &pos : nullptr);
+                        if (got != want) {
+                            std::cout << "  FAILED lengths: mode " << int(mode) << ", k " << k << std::endl;
+                            assert(false && "tms_query_batch lengths must match tms_query");
+                            return false;
+                        }
+                        ++checked;
+                        if (!with_pos) continue;
+                        if (first_pos.empty()) {
+                            first_pos = pos;
+                            for (size_t j = 0; j < pats.size(); ++j)
+                                for (size_t i = 0; i < pats[j].size(); ++i) {
+                                    const ulint l = got[j][i], p = pos[j][i];
+                                    const bool ok = (l == 0) ? (p == TMS_NO_POS)
+                                                             : (p + l <= T.size() && T.compare(p, l, pats[j], i, l) == 0);
+                                    if (!ok) {
+                                        std::cout << "  FAILED position: pattern " << pats[j] << " at " << i << " len " << l
+                                                  << " pos " << p << std::endl;
+                                        assert(false && "each position must be an occurrence");
+                                        return false;
+                                    }
+                                    ++positions;
+                                }
+                        } else if (pos != first_pos) {
+                            std::cout << "  FAILED: positions differ in mode " << int(mode) << ", k " << k << std::endl;
+                            assert(false && "positions must not depend on mode or k");
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::cout << "  " << checked << " batches and " << positions << " positions PASSED" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -320,6 +424,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_tms_vs_naive();
     std::cout << std::endl;
     if (!test_tms_vs_ms_minishred(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    test_tms_batch(data_dir);
     std::cout << std::endl;
     std::cout << (all_ran ? "All tms_test checks PASSED" : "SOME TMS TESTS NOT RUN") << std::endl;
     return all_ran;
