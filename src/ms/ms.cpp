@@ -50,9 +50,8 @@ static void usage(const char* prog) {
               << "              values.  --no-output skips writing (for timing).  --interleave K\n"
               << "              keeps K reads in flight, prefetching each one's next row\n"
               << "              (default 32); K = 0 queries one read at a time without\n"
-              << "              prefetching (for tms-batch, with tms_query when it reports\n"
-              << "              only lengths in psi mode, else the batched engine with one\n"
-              << "              read).  Results do not depend on K.  A summary with\n"
+              << "              prefetching (ms_query for batch, the batched engine with one\n"
+              << "              read for tms-batch).  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--minima FILE] [--lf-split B] [--fl-split B]\n"
               << "            [--phi-split B] [--lcp-bin FILE] [--no-phi-inv]\n"
@@ -183,10 +182,10 @@ static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t 
     for (size_t j = 0; j < p.size(); ++j)
         tms_report_smems(idx, out[j], g_tms_pos[j], g_tms_min_smem_len, g_tms_report, g_tms_hits[j]);
 }
-// Lengths alone in psi mode use the unbatched tms_query, as ms uses
-// ms_query; anything else needs the batched engine, run with one read.
+// One read at a time runs the batched engine with one read: it is faster
+// than tms_query, the plain psi reference, whereas ms_query is as fast as
+// ms's engine with one read.
 static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) {
-    if (g_tms_mode == TmsMode::PSI && !g_tms_positions && g_tms_report == TmsReport::MS) return tms_query(idx, s);
     std::vector<std::vector<ulint>> len;
     query_many(idx, {s}, 1, len);
     return std::move(len[0]);
