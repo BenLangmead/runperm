@@ -73,20 +73,21 @@ public:
     }
 
     /**
-     * Hint that row will be read soon.  get() reads a whole ulint from the
-     * byte where a column starts, so a row's reads span from its first byte
-     * to sizeof(ulint) - 1 bytes past the start of its last column.  This
-     * prefetches the line holding the first byte, and the line holding the
-     * last byte only when it is a different one, since every prefetch that
-     * misses competes for the core's few outstanding misses.
+     * Hint that row will be read soon.  get() and get_row_bits() read a
+     * whole ulint from the byte where a column or row starts, so the reads
+     * of a row, and a get_row_bits() of the row after it (as a move's
+     * fast-forward may do), span from the row's first byte to sizeof(ulint)
+     * - 1 bytes past the start of the next row.  This prefetches the
+     * lines holding the first and last bytes.  They are often the same line,
+     * but testing for that costs more in mispredicted branches than the
+     * second prefetch does.
      */
     void prefetch(size_t row) const {
         const size_t start = get_row_start(row);
         const word_t* first = &data[start / num_bits_type(word_t)];
-        const word_t* last = &data[(start + offsets[num_cols - 1]) / num_bits_type(word_t) + sizeof(ulint) - 1];
+        const word_t* last = &data[(start + row_width) / num_bits_type(word_t) + sizeof(ulint) - 1];
         ORBIT_PREFETCH(first);
-        if ((reinterpret_cast<uintptr_t>(first) ^ reinterpret_cast<uintptr_t>(last)) >= CACHE_LINE_BYTES)
-            ORBIT_PREFETCH(last);
+        ORBIT_PREFETCH(last);
     }
 
     template<size_t col>
