@@ -74,13 +74,15 @@ public:
      * the matrix reload them after any store that might alias them.  It is
      * valid while the matrix is alive and not resized.  Rows are named by
      * their first bit, row_start(row), so that several columns of one row
-     * share the multiplication.
+     * share the multiplication.  Adjacent columns first to last can also be
+     * read together with one load, get_span, when span_fits says they fit.
      */
     struct reader {
         const word_t* data;
         size_t row_width;
         std::array<uint16_t, num_cols> offsets;
         std::array<ulint, num_cols> masks;
+        std::array<uchar, num_cols> widths;
 
         size_t row_start(size_t row) const { return row * row_width; }
         template<size_t col>
@@ -93,8 +95,33 @@ public:
         }
         template<size_t col>
         ulint get(size_t row) const { return get_at<col>(row_start(row)); }
+
+        /** Whether columns first to last, first <= last, fit in one get_span. */
+        template<size_t first, size_t last>
+        bool span_fits() const {
+            static_assert(first <= last && last < num_cols, "Column span out of bounds");
+            return offsets[last] + widths[last] - offsets[first] <= max_width;
+        }
+        /**
+         * The bits of columns first onward of the row starting at bit start,
+         * column first lowest, read with one load.  Bits above the columns
+         * span_fits allowed are unspecified; extract_span takes a column out.
+         */
+        template<size_t first>
+        ulint get_span(size_t start) const {
+            const size_t bit = start + offsets[first];
+            ulint bits = 0;
+            std::memcpy(&bits, &data[bit / num_bits_type(word_t)], sizeof(ulint));
+            return bits >> (bit % num_bits_type(word_t));
+        }
+        /** Column col of a span read with get_span<first>. */
+        template<size_t first, size_t col>
+        ulint extract_span(ulint span) const {
+            static_assert(first <= col && col < num_cols, "Column out of span");
+            return (span >> (offsets[col] - offsets[first])) & masks[col];
+        }
     };
-    reader get_reader() const { return reader{data.data(), row_width, offsets, masks_extract}; }
+    reader get_reader() const { return reader{data.data(), row_width, offsets, masks_extract, widths}; }
 
     /** Column col of a row read with get_row_bits. */
     template<size_t col>
