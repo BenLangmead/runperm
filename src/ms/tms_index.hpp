@@ -326,7 +326,7 @@ public:
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 3;
+    static constexpr uint32_t VERSION = 4;
 
     LF lf_;
     FL fl_;

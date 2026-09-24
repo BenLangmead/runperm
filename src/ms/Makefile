@@ -9,6 +9,13 @@ MS_HDRS = $(wildcard *.hpp) $(shell find ../../include -name '*.hpp')
 ms: $(MS_SRCS) $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o ms $(MS_SRCS)
 
+# Benchmark build: assertions off, as ms-bench.  The test commands refuse to
+# run in it, since the suites check their results with assert.
+ms-bench: $(MS_SRCS) $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -DNDEBUG -o ms-bench $(MS_SRCS)
+
+bench: ms-bench
+
 # Debug build: -O0 -g for breakpoints (e.g. lldb ./ms, then run test ../../data)
 debug: CXXFLAGS += -O0 -g
 debug: ms
@@ -17,11 +24,11 @@ debug: ms
 tms_chain_bench: tms_chain_bench.cpp $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp
 
-.PHONY: test all clean debug
+.PHONY: test all clean debug bench
 test: ms
 	./ms test ../../data
 
 all: ms
 
 clean:
-	rm -f ms tms_chain_bench
+	rm -f ms ms-bench tms_chain_bench
