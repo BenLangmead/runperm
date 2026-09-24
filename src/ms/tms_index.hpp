@@ -279,6 +279,8 @@ public:
     /** PLCP at a phi point: the LCP of its row with the row above. */
     ulint plcp(PhiPos p) const { return phi_.template get<TmsPhiCols::PLCP>(p.interval) - p.offset; }
     ulint phi_intervals() const { return phi_.intervals(); }
+    /** The first text position of phi interval i. */
+    ulint phi_start(ulint i) const { return phi_.get_start(i); }
     /** The phi point of text position x, by binary search over interval starts. */
     PhiPos phi_at(ulint x) const { return locate<PhiPos>(phi_, x); }
 
@@ -286,9 +288,14 @@ public:
     /** The phi_inv point of text position x, by binary search over interval starts. */
     PhiInvPos phi_inv_at(ulint x) const { return locate<PhiInvPos>(phi_inv_, x); }
     PhiInvPos phi_inv(PhiInvPos p) { return phi_inv_.phi_inv(p); }
+    PhiInvPos start_phi_inv(PhiInvPos p) const { return phi_inv_.start_next(p); }
+    PhiInvPos finish_phi_inv(PhiInvPos p) const { return phi_inv_.finish_next(p); }
+    void prefetch_phi_inv(ulint i) const { phi_inv_.prefetch(i); }
     /** PLCPB at a phi_inv point: the LCP of its row with the row below. */
     ulint plcpb(PhiInvPos p) const { return phi_inv_.template get<TmsPhiInvCols::PLCPB>(p.interval) - p.offset; }
     ulint phi_inv_intervals() const { return phi_inv_.intervals(); }
+    /** The first text position of phi_inv interval i. */
+    ulint phi_inv_start(ulint i) const { return phi_inv_.get_start(i); }
 
     const LF& lf() const { return lf_; }
     const FL& fl() const { return fl_; }
