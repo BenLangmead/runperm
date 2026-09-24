@@ -2,6 +2,7 @@
 #define _INTERNAL_PERMUTATION_HPP
 
 #include "orbit/common.hpp"
+#include <functional>
 #include "orbit/internal/move/move_splitting.hpp"
 #include "orbit/internal/move/interval_encoding_impl.hpp"
 #include "orbit/internal/move/move_structure_impl.hpp"
