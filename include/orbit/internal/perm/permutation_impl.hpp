@@ -250,7 +250,9 @@ public:
     /** Hint that the row of the given interval will be read soon. */
     void prefetch(ulint interval) const {
         move_structure.prefetch(interval);
-        if constexpr (!integrated_move_structure) {
+        // Without data columns the separate table has no rows, and its
+        // prefetch addresses would be meaningless.
+        if constexpr (!integrated_move_structure && num_run_cols > 0) {
             this->data_cols.prefetch(interval);
         }
     }
