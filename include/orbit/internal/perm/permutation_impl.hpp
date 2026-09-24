@@ -259,6 +259,10 @@ public:
         static_assert(cols_traits::RELATIVE, "rows store lengths only with relative positions");
         return static_cast<size_t>(to_cols(cols_traits::LENGTH));
     }
+    static constexpr size_t start_column() {
+        static_assert(!cols_traits::RELATIVE, "rows store starts only with absolute positions");
+        return static_cast<size_t>(to_cols(cols_traits::START));
+    }
     template<data_columns col>
     static constexpr size_t data_column() {
         static_assert(integrated_move_structure, "data columns are in the row only when integrated");
