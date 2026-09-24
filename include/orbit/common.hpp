@@ -8,6 +8,20 @@
 #include <fstream>
 #include <tuple>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
+// Hint that the cache line holding addr will be read soon.  The hint never
+// changes results; on compilers without a prefetch intrinsic it does nothing.
+#if defined(__GNUC__) || defined(__clang__)
+#define ORBIT_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define ORBIT_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#define ORBIT_PREFETCH(addr) ((void)(addr))
+#endif
+
 namespace orbit {
 
 typedef unsigned char uchar;

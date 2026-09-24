@@ -227,6 +227,33 @@ public:
         return position;
     }
 
+    /**
+     * next() in two halves, so that several positions can be advanced with
+     * their memory accesses overlapped: start_next() reads only the row of
+     * pos's interval and returns an unresolved position, prefetch() on its
+     * interval requests the row finish_next() will read, and finish_next()
+     * on the unresolved position returns next(pos).
+     */
+    position start_next(position position) const {
+        return move_structure.start_move(position);
+    }
+
+    position finish_next(position position) const {
+        if constexpr (store_absolute_positions && exponential_search) {
+            return move_structure.finish_move_exponential(position);
+        } else {
+            return move_structure.finish_move(position);
+        }
+    }
+
+    /** Hint that the row of the given interval will be read soon. */
+    void prefetch(ulint interval) const {
+        move_structure.prefetch(interval);
+        if constexpr (!integrated_move_structure) {
+            this->data_cols.prefetch(interval);
+        }
+    }
+
     // Non-exponential search version of next()
     position next_linear(position position) {
         return move_structure.move(position);

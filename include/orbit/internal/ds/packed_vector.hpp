@@ -49,6 +49,16 @@ public:
         return extract_bits(bits, pos.offset, masks_extract[col]);
     } 
 
+    /**
+     * Hint that row will be read soon.  A row can straddle a cache line, so
+     * this prefetches the bytes holding its first and last bits.
+     */
+    void prefetch(size_t row) const {
+        const size_t start = get_row_start(row);
+        ORBIT_PREFETCH(&data[start / num_bits_type(word_t)]);
+        ORBIT_PREFETCH(&data[(start + row_width - 1) / num_bits_type(word_t)]);
+    }
+
     template<size_t col>
     void set(size_t row, ulint val) {
         static_assert(col < num_cols, "Column out of bounds");

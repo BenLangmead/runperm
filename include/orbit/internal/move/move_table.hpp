@@ -118,6 +118,12 @@ struct move_table : public move_table_interface<move_table<columns_t>, columns_t
         return table[i].get();
     }
 
+    /** Hint that row i will be read soon. */
+    void prefetch(size_t i) const {
+        ORBIT_PREFETCH(&table[i]);
+        ORBIT_PREFETCH(reinterpret_cast<const char*>(&table[i]) + sizeof(row) - 1);
+    }
+
     size_t serialize(std::ostream &out) {
         size_t written_bytes = 0;
 
@@ -178,6 +184,11 @@ struct move_vector : public move_table_interface<move_vector<columns_t>, columns
 
     std::array<ulint, num_cols> get_row(size_t i) const {
         return vec.get_row(i);
+    }
+
+    /** Hint that row i will be read soon. */
+    void prefetch(size_t i) const {
+        vec.prefetch(i);
     }
 
     const std::array<uchar, num_cols>& get_widths() const {

@@ -154,6 +154,46 @@ public:
         return fast_forward(pos);
     }
 
+    /**
+     * The first half of move(): follow the pointer of pos's interval.  Only
+     * pos's own row is read, so a caller can prefetch the returned interval's
+     * row and later call finish_move() to get the result of move(pos).  The
+     * returned position is unresolved: its offset may run past its
+     * interval's end, and with absolute positions its idx is not yet set.
+     */
+    position start_move(position pos) const
+    {
+        assert(pos.interval < table.size());
+        if constexpr (cols_traits::RELATIVE) {
+            assert(pos.offset < get_length(pos));
+            return {get_pointer(pos), pos.offset + get_offset(pos)};
+        } else {
+            assert(pos.idx < get_start(pos.interval + 1));
+            return {get_pointer(pos), get_offset(pos) + pos.offset, 0};
+        }
+    }
+
+    /** The second half of move(): resolve a position from start_move(). */
+    position finish_move(position pos) const {
+        if constexpr (!cols_traits::RELATIVE) {
+            pos.idx = get_start(pos.interval) + pos.offset;
+        }
+        return fast_forward(pos);
+    }
+
+    /** The second half of move_exponential(). */
+    position finish_move_exponential(position pos) const {
+        if constexpr (!cols_traits::RELATIVE) {
+            pos.idx = get_start(pos.interval) + pos.offset;
+        }
+        return fast_forward_exponential(pos);
+    }
+
+    /** Hint that the row of interval i will be read soon. */
+    void prefetch(size_t i) const {
+        table.prefetch(i);
+    }
+
     position move_exponential(position pos) const {
         if constexpr (cols_traits::RELATIVE) {
             return move(pos);
