@@ -45,8 +45,10 @@ static void usage(const char* prog) {
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "              Load the index once and compute matching statistics for every\n"
-              << "              read in READS (FASTA, FASTQ, or one sequence per line; - for\n"
-              << "              stdin).  Writes one line per read: name, tab, space-separated\n"
+              << "              read in READS (FASTA, FASTQ, or one sequence per line, in\n"
+              << "              which blank lines are skipped; - for stdin; LF or CRLF line\n"
+              << "              endings).  Reads are processed in blocks, so input size is not\n"
+              << "              limited by memory.  Writes one line per read: name, tab, space-separated\n"
               << "              values.  --no-output skips writing (for timing).  --interleave K\n"
               << "              keeps K reads in flight, prefetching each one's next row\n"
               << "              (default 32); K = 0 queries one read at a time without\n"
@@ -117,7 +119,7 @@ public:
         std::string line;
         if (!have_line_) {
             do {
-                if (!std::getline(in_, line)) return false;
+                if (!get_line(line)) return false;
             } while (line.empty());
             pending_ = line;
             have_line_ = true;
@@ -130,24 +132,29 @@ public:
             have_line_ = false;
         } else if (format_ == 2) {
             name = header_name(pending_);
-            if (!std::getline(in_, seq)) return false;
-            std::getline(in_, line);  // +
-            std::getline(in_, line);  // qualities
+            if (!get_line(seq)) return false;
+            get_line(line);  // +
+            get_line(line);  // qualities
             have_line_ = false;
         } else {
             name = header_name(pending_);
             have_line_ = false;
-            while (std::getline(in_, line)) {
+            while (get_line(line)) {
                 if (!line.empty() && line[0] == '>') { pending_ = line; have_line_ = true; break; }
                 seq += line;
             }
         }
-        if (!seq.empty() && seq.back() == '\r') seq.pop_back();
         for (auto& ch : seq) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
         return true;
     }
 
 private:
+    // One line without its line ending, so CRLF files read like LF files.
+    bool get_line(std::string& line) {
+        if (!std::getline(in_, line)) return false;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return true;
+    }
     static std::string header_name(const std::string& h) {
         size_t end = h.find_first_of(" \t\r", 1);
         return h.substr(1, end == std::string::npos ? std::string::npos : end - 1);
@@ -324,17 +331,22 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         }
     } else {
         // Blocks of reads with ms_query_batch, interleave reads in flight.
+        // A block ends at `block` reads or once it holds block_bases bases,
+        // so that long reads do not make a block's per-base results large.
         const size_t block = std::max<size_t>(4096, 64 * interleave);
+        constexpr size_t block_bases = size_t(1) << 24;
         std::vector<std::string> names, seqs;
         std::vector<std::vector<ulint>> results;
         bool more = true;
         while (more) {
             names.clear();
             seqs.clear();
-            while (seqs.size() < block && (more = reads.next(name, seq))) {
+            size_t bases = 0;
+            while (seqs.size() < block && bases < block_bases && (more = reads.next(name, seq))) {
                 names.push_back(name);
                 seqs.push_back(seq);
                 n_bases += seq.size();
+                bases += seq.size();
             }
             if (seqs.empty()) break;
             auto tq = clock::now();
