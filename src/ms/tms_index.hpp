@@ -145,8 +145,13 @@ public:
         return bytes;
     }
 
-    /** Read an index written by serialize().  Throws on malformed input. */
-    void load(std::istream& in) {
+    /**
+     * Read an index written by serialize().  Throws on malformed input.
+     * phi_inv, which only SMEM enumeration uses, is read only if
+     * with_phi_inv; it is the last structure, so skipping it reads nothing
+     * more.
+     */
+    void load(std::istream& in, bool with_phi_inv = true) {
         char magic[4] = {};
         uint32_t v = 0, flags = 0;
         in.read(magic, 4);
@@ -158,7 +163,7 @@ public:
         fl_.load(in);
         has_phi_ = (flags & 1) != 0;
         if (has_phi_) phi_.load(in);
-        has_phi_inv_ = (flags & 2) != 0;
+        has_phi_inv_ = with_phi_inv && (flags & 2) != 0;
         if (has_phi_inv_) phi_inv_.load(in);
         if (!in.good()) throw std::runtime_error("truncated tms index");
         compute_occurs();

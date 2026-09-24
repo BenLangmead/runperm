@@ -186,12 +186,12 @@ static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) {
     return std::move(len[0]);
 }
 
-static std::optional<TmsIndex> read_tms_index(const std::string& path) {
+static std::optional<TmsIndex> read_tms_index(const std::string& path, bool with_phi_inv = true) {
     std::ifstream in(path, std::ios::binary);
     if (!in.good()) return std::nullopt;
     TmsIndex idx;
     try {
-        idx.load(in);
+        idx.load(in, with_phi_inv);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
         return std::nullopt;
@@ -536,7 +536,10 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "tms-batch") {
-        return run_batch<TmsIndex>(argc, argv, read_tms_index);
+        // Only an smem-all report walks phi_inv, so other reports skip loading it.
+        return run_batch<TmsIndex>(argc, argv, [](const std::string& path) {
+            return read_tms_index(path, g_tms_report == TmsReport::SMEM_ALL);
+        });
     }
 
     if (cmd == "tms-build" || cmd == "tms-build-tsv") {
