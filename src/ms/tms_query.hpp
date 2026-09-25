@@ -43,7 +43,7 @@ inline TmsStats tms_stats;
 #endif
 
 /**
- * Number of leading characters of pat[0 .. m) that the suffix at FL point q
+ * Number of leading characters of pat[0 .. m) that the suffix at psi point q
  * shares, capped at cap.  At most cap - 1 psi steps.
  */
 inline ulint tms_psi_lce(TmsIndex& idx, TmsIndex::FLPos q, const char* pat, size_t m, ulint cap) {
@@ -175,7 +175,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     constexpr ulint INF = std::numeric_limits<ulint>::max();
     enum : uint8_t { STEP, SCAN, WALK, PRED_POS };
     struct Side {
-        FLPos q;          // psi walk: unresolved FL point of the next character
+        FLPos q;          // psi walk: unresolved psi point of the next character
         PhiPos p;         // phi walk: unresolved phi point of the next LCP value
         ulint psi_lce;    // psi walk: characters matched so far
         ulint phi_min;    // phi walk: minimum LCP so far
@@ -207,7 +207,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     const ulint last_run = idx.move_runs() - 1;
     // What the access's LF and FL characters are for each byte, kept local
     // so that stores to the output cannot force them to be reloaded.
-    constexpr bool packed = std::is_same_v<Access, TmsIndex::PackedAccess>;
+    constexpr bool packed = !std::is_same_v<Access, TmsIndex::ColumnAccess>;
     std::array<uchar, 256> lf_sym, fl_sym;
     for (size_t c = 0; c < 256; ++c) {
         lf_sym[c] = packed ? idx.lf_code(static_cast<uchar>(c)) : static_cast<uchar>(c);
@@ -383,20 +383,17 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     } else {
                         if (found_up) {
                             setup(s.up, dist_up, cap);
-                            if (s.up.psi_on) { s.up.q = acc.psi_at_tail(acc.row(s.u)); acc.prefetch_psi(s.up.q.interval); }
+                            if (s.up.psi_on) { s.up.q = acc.psi_at_tail(s.u); acc.prefetch_psi(s.up.q.interval); }
                             if (s.up.phi_on) s.up.p = s.ph;  // the current row is the lower one
                         }
                         if (found_down) {
                             setup(s.down, dist_down, cap);
                             if (s.down.psi_on) {
-                                // The head's FL point is one past the tail
-                                // of the interval above (d > 0 here),
-                                // unresolved: the first psi step may move on
-                                // to the next FL row.
-                                s.down.q = acc.psi_at_tail(acc.row(s.d - 1));
-                                ++s.down.q.offset;
+                                // Row d and the row below it, which the
+                                // reads that follow from row d often reach.
+                                s.down.q = acc.psi_at_head(s.d);
                                 acc.prefetch_psi(s.down.q.interval);
-                                if (s.down.q.interval + 1 < idx.psi_intervals()) acc.prefetch_psi(s.down.q.interval + 1);
+                                if (s.d < last_run) acc.prefetch_psi(s.d + 1);
                             }
                             if (s.down.phi_on) { s.down.p = idx.phi_at_head(s.d); idx.prefetch_phi(s.down.p.interval); }
                         }
@@ -474,18 +471,15 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
     if ((mode != TmsMode::PSI || out_pos) && !idx.has_phi())
         throw std::invalid_argument("this mode or positions need an index built with phi");
     if (mode != TmsMode::PHI && !idx.has_psi()) throw std::invalid_argument("this mode needs an index with psi");
-    const TmsIndex::PackedAccess pa = idx.packed_access();
-    const bool use_packed = packed && pa.fits();
     auto run = [&](auto m) {
         constexpr TmsMode M = decltype(m)::value;
-        if (use_packed) {
-            if (out_pos) tms_query_batch_impl<M, true>(idx, pa, patterns, k, out_len, out_pos);
-            else tms_query_batch_impl<M, false>(idx, pa, patterns, k, out_len, nullptr);
-        } else {
-            const TmsIndex::ColumnAccess ca = idx.column_access();
-            if (out_pos) tms_query_batch_impl<M, true>(idx, ca, patterns, k, out_len, out_pos);
-            else tms_query_batch_impl<M, false>(idx, ca, patterns, k, out_len, nullptr);
-        }
+        auto with = [&](const auto acc) {
+            if (out_pos) tms_query_batch_impl<M, true>(idx, acc, patterns, k, out_len, out_pos);
+            else tms_query_batch_impl<M, false>(idx, acc, patterns, k, out_len, nullptr);
+        };
+        const TmsIndex::PackedAccess pa = idx.packed_access();
+        if (packed && pa.fits()) with(pa);
+        else with(idx.column_access());
     };
     switch (mode) {
         case TmsMode::PSI: run(std::integral_constant<TmsMode, TmsMode::PSI>{}); break;

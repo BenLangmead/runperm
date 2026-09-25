@@ -56,8 +56,7 @@ static void usage(const char* prog) {
               << "              read for tms-batch).  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--minima FILE]\n"
-              << "            [--lcp-bin FILE] [--lf-split B] [--fl-split B] [--phi-split B]\n"
-              << "            [--no-phi-inv]\n"
+              << "            [--lcp-bin FILE] [--lf-split B] [--phi-split B] [--no-phi-inv]\n"
               << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
               << "              input, and with --minima (a TeraLCP -ominima file, of which only\n"
               << "              each run's top LCP is used) or --lcp-bin (one 64-bit LCP per row)\n"
@@ -67,10 +66,12 @@ static void usage(const char* prog) {
               << "              LF and psi, takes no LCP input, and serves only --mode psi without\n"
               << "              --positions or an SMEM report; phi keeps LF, phi and phi_inv,\n"
               << "              needs LCP input, and serves every query but --mode psi, phiskip\n"
-              << "              and dual.  --lf-split, --fl-split and --phi-split set Orbit's\n"
-              << "              balancing factor for that structure, with its default length\n"
-              << "              capping (default: Orbit's default balancing).  LF is always\n"
-              << "              split, so --lf-split must be positive; 0 leaves FL or phi unsplit.\n"
+              << "              and dual.  In the psi and full layouts, LF and psi share one\n"
+              << "              table of rows, the union of LF's split intervals and their\n"
+              << "              images.  --lf-split and --phi-split set Orbit's balancing factor\n"
+              << "              for LF and phi, with its default length capping (default: Orbit's\n"
+              << "              default balancing).  LF is always split, so --lf-split must be\n"
+              << "              positive; --phi-split 0 leaves phi unsplit.\n"
               << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [--layout ...] [split options]\n"
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
@@ -614,7 +615,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            else if (strcmp(argv[i], "--fl-split") == 0 && i + 1 < argc) opts.fl_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--no-phi-inv") == 0) opts.phi_inv = false;
             else if (strcmp(argv[i], "--layout") == 0 && i + 1 < argc) {

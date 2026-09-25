@@ -212,15 +212,15 @@ MSIndexSpillLCP<false> ms_index_for(const TextBwt& t) {
     return MSIndexSpillLCP<false>(t.heads, t.lens, run_data, std::move(spill), max_top, max_sub);
 }
 
+/** LF split in several ways, and phi split with balancing 2. */
 std::vector<TmsBuildOptions> split_variants() {
     TmsBuildOptions a;
     TmsBuildOptions b;
-    b.fl_split = orbit::NO_SPLITTING;
+    b.phi_split = orbit::split_params(std::nullopt, 2);
     TmsBuildOptions c;
     c.lf_split = orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, std::nullopt);
     TmsBuildOptions d;
     d.lf_split = orbit::split_params(std::nullopt, 2);
-    d.fl_split = orbit::split_params(std::nullopt, 2);
     return {a, b, c, d};
 }
 
@@ -356,13 +356,16 @@ bool test_tms_vs_ms_minishred(const std::string& data_dir) {
 }
 
 /**
- * TmsIndex::PackedAccess fits the index and agrees with the index's own
- * column reads for every LF row (length, character, the LF step from every
- * offset, psi_at_tail, resolving a position past a row's end) and for every
- * FL row (psi_step from every offset, and from one past the row's end).
- * Returns the number of rows checked.
+ * TmsIndex::PackedAccess fits an index with psi and agrees with the index's
+ * own column reads for every row: length, character, the LF step from every
+ * offset, resolving a position past a row's end, psi_at_tail and
+ * psi_at_head, and the psi step from every offset and from one past the
+ * row's end.  psi inverts LF on every position, and its character is the
+ * BWT character of the row psi reaches, the F character.  Returns the
+ * number of rows checked.
  */
 size_t check_packed_access(TmsIndex& idx) {
+    assert(idx.has_psi());
     const TmsIndex::PackedAccess pa = idx.packed_access();
     assert(pa.fits() && "the test indexes must fit packed access");
     std::array<uchar, 256> lf_code, fl_code;
@@ -370,40 +373,44 @@ size_t check_packed_access(TmsIndex& idx) {
         lf_code[c] = idx.lf_code(static_cast<uchar>(c));
         fl_code[c] = idx.fl_code(static_cast<uchar>(c));
         assert((lf_code[c] != TmsIndex::no_code) == idx.occurs(static_cast<uchar>(c)));
+        assert((fl_code[c] != TmsIndex::no_code) == idx.occurs(static_cast<uchar>(c)));
     }
-    size_t rows = 0;
-    for (ulint i = 0; i < idx.move_runs(); ++i, ++rows) {
+    const ulint rows = idx.move_runs();
+    assert(idx.psi_intervals() == rows);
+    std::vector<ulint> start(rows + 1, 0);
+    for (ulint i = 0; i < rows; ++i) start[i + 1] = start[i] + idx.get_length(i);
+    auto absolute = [&](TmsIndex::LFPos p) { return start[p.interval] + p.offset; };
+    for (ulint i = 0; i < rows; ++i) {
         const auto r = pa.row(i);
-        assert(pa.length(r) == idx.get_length(i));
+        const ulint len = idx.get_length(i);
+        assert(pa.length(r) == len);
         assert(pa.code(r) == lf_code[idx.get_character(i)]);
-        const TmsIndex::FLPos q = pa.psi_at_tail(r), want_q = idx.psi_at_tail(i);
-        assert(q.interval == want_q.interval && q.offset == want_q.offset);
-        for (ulint o = 0; o < idx.get_length(i); ++o) {
+        const TmsIndex::FLPos t = pa.psi_at_tail(i), want_t = idx.psi_at_tail(i);
+        assert(t.interval == i && t.offset + 1 == len && want_t.interval == i && want_t.offset == t.offset);
+        const TmsIndex::FLPos h = pa.psi_at_head(i), want_h = idx.psi_at_head(i);
+        assert(h.interval == i && h.offset == 0 && want_h.interval == i && want_h.offset == 0);
+        for (ulint o = 0; o <= len; ++o) {
+            if (o == len && i + 1 == rows) break;
             TmsIndex::LFPos p{};
             p.interval = i;
             p.offset = o;
-            const TmsIndex::LFPos got = pa.start_LF(r, p), want = idx.start_LF(p);
-            assert(got.interval == want.interval && got.offset == want.offset);
-        }
-        if (i + 1 < idx.move_runs()) {
-            TmsIndex::LFPos p{};
-            p.interval = i;
-            p.offset = idx.get_length(i);
-            const TmsIndex::LFPos want = idx.finish_LF(p);
-            const auto rr = pa.resolve_LF(p);
-            assert(p.interval == want.interval && p.offset == want.offset && rr == pa.row(want.interval));
-        }
-    }
-    for (ulint i = 0; i < idx.psi_intervals(); ++i, ++rows) {
-        const ulint len = idx.fl().get_length(i);
-        for (ulint o = 0; o <= len; ++o) {
-            if (o == len && i + 1 == idx.psi_intervals()) break;
-            TmsIndex::FLPos q{};
-            q.interval = i;
-            q.offset = o;
+            if (o < len) {
+                const TmsIndex::LFPos got = pa.start_LF(r, p), want = idx.start_LF(p);
+                assert(got.interval == want.interval && got.offset == want.offset);
+            } else {
+                TmsIndex::LFPos q = p;
+                const TmsIndex::LFPos want = idx.finish_LF(p);
+                const auto rr = pa.resolve_LF(q);
+                assert(q.interval == want.interval && q.offset == want.offset && rr == pa.row(want.interval));
+            }
             uchar c = 0, want_c = 0;
-            const TmsIndex::FLPos got = pa.psi_step(q, c), want = idx.psi_step(q, want_c);
+            const TmsIndex::FLPos got = pa.psi_step(p, c), want = idx.psi_step(p, want_c);
             assert(got.interval == want.interval && got.offset == want.offset && c == fl_code[want_c]);
+            // psi then LF returns to the position, and the F character is
+            // the BWT character of the row psi reaches.
+            const TmsIndex::LFPos y = idx.resolve_psi(got);
+            assert(idx.get_character(y.interval) == want_c);
+            assert(absolute(idx.LF_step(y)) == absolute(idx.finish_LF(p)));
         }
     }
     return rows;
@@ -889,7 +896,9 @@ bool test_layouts(const std::string& data_dir) {
             for (size_t c = 0; c < fw.size(); ++c) {
                 const bool psi_col = c == PSI_INT || c == PSI_INT + 1, phi_col = c == PSI_INT + 2 || c == PSI_INT + 3;
                 assert(fw[c] > 0);
-                assert(sw[c] == (phi_col ? 0 : fw[c]) && hw[c] == (psi_col ? 0 : fw[c]));
+                // The phi layout's LF has other rows, without the union
+                // with the images, so only its zero widths are compared.
+                assert(sw[c] == (phi_col ? 0 : fw[c]) && (hw[c] == 0) == psi_col);
             }
             assert(psi.packed_access().fits() && phi.packed_access().fits());
 
@@ -958,6 +967,72 @@ bool test_layouts(const std::string& data_dir) {
     return true;
 }
 
+/**
+ * The psi and full layouts, from LF split in several ways, give the same
+ * output for every query as the full index from LF split with Orbit's
+ * default: every mode, with and without positions, every report, packed and
+ * column access, and 1 and 32 patterns in flight, also after serialization
+ * and a partial load.  Their rows are the union of the split LF intervals'
+ * starts and their images' starts, so there are as many as the phi
+ * layout's split LF intervals (whose LF has no union) and at most twice
+ * that.
+ */
+bool test_lf_rows(const std::string& data_dir) {
+    std::cout << "Testing LF rows from LF split several ways" << std::endl;
+    std::mt19937 rng(53);
+    const auto inputs = batch_inputs(data_dir, rng);
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    size_t compared = 0, access_rows = 0, rows = 0, split_rows = 0;
+    for (const auto& in : inputs) {
+        const bool big = in.text.size() > 5000;
+        auto pats = fuzz_patterns(in.text, rng, big ? 60 : 100);
+        TmsIndex ref(in.heads, in.lens, TmsBuildOptions{}, &in.tops);
+        for (const auto& sp : {orbit::split_params(std::nullopt, 2), orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, std::nullopt),
+                               orbit::split_params(2.0, 64), orbit::split_params(std::nullopt, 1024)}) {
+            TmsBuildOptions o, psi_opts, phi_opts;
+            o.lf_split = psi_opts.lf_split = phi_opts.lf_split = sp;
+            psi_opts.layout = TmsLayout::PSI;
+            phi_opts.layout = TmsLayout::PHI;
+            TmsIndex full_built(in.heads, in.lens, o, &in.tops), psi_built(in.heads, in.lens, psi_opts);
+            TmsIndex phi(in.heads, in.lens, phi_opts, &in.tops);
+            TmsIndex full = round_trip(full_built), psi = round_trip(psi_built);
+            const TmsParts psi_need = tms_query_parts(TmsMode::PSI, false, TmsReport::MS);
+            TmsIndex full_psi = round_trip(full_built, &psi_need);
+            assert(full.move_runs() == psi.move_runs() && full.move_runs() >= phi.move_runs() &&
+                   full.move_runs() <= 2 * phi.move_runs());
+            rows += full.move_runs();
+            split_rows += phi.move_runs();
+            access_rows += check_packed_access(full) + check_packed_access(psi_built);
+            for (const auto& P : pats) assert(tms_query(full, P) == tms_query(ref, P) && tms_query(psi, P) == tms_query(ref, P));
+            for (size_t k : {1, 32}) {
+                for (bool packed : {true, false}) {
+                    const auto want_psi = query_output(ref, pats, k, TmsMode::PSI, false, TmsReport::MS, packed);
+                    for (TmsIndex* x : {&psi, &full_psi, &psi_built}) {
+                        assert(query_output(*x, pats, k, TmsMode::PSI, false, TmsReport::MS, packed) == want_psi);
+                        ++compared;
+                    }
+                    for (TmsMode mode : modes)
+                        for (bool positions : {false, true})
+                            for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
+                                if (big && report == TmsReport::SMEM_ONE) continue;
+                                const auto want = query_output(ref, pats, k, mode, positions, report, packed);
+                                if (query_output(full, pats, k, mode, positions, report, packed) != want) {
+                                    std::cout << "  FAILED: output depends on the LF split, mode " << int(mode) << ", k "
+                                              << k << ", packed " << packed << std::endl;
+                                    assert(false && "output must not depend on the LF split");
+                                    return false;
+                                }
+                                ++compared;
+                            }
+                }
+            }
+        }
+    }
+    std::cout << "  " << access_rows << " rows of packed access, " << compared << " batches PASSED (" << rows
+              << " rows for " << split_rows << " split LF intervals)" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -975,6 +1050,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_smem_report(data_dir);
     std::cout << std::endl;
     test_layouts(data_dir);
+    std::cout << std::endl;
+    test_lf_rows(data_dir);
     std::cout << std::endl;
     std::cout << (all_ran ? "All tms_test checks PASSED" : "SOME TMS TESTS NOT RUN") << std::endl;
     return all_ran;

@@ -20,15 +20,19 @@
  *
  * The index holds:
  *
- *  - LF over the BWT runs, runs-based (rows store lengths), with integrated
- *    columns per LF interval: PSI_INT and PSI_OFF, the FL point of the
- *    interval's tail row, and PHI_INT and PHI_OFF, the phi point of its head
- *    row's text position.  The FL point of a head row is the one just after
- *    the previous interval's tail, and the phi point of a tail row is one phi
- *    step from the next interval's head's phi point.  So a reposition reads
- *    both candidates' start points from rows its scan has already read.
- *  - FL over the F runs, runs-based, with no data columns.  Its character at
- *    a position is the first character of that row's suffix.
+ *  - LF over the BWT, runs-based (rows store lengths), split and balanced
+ *    with Orbit's splitting.  In the psi and full layouts its rows are the
+ *    union of the split LF intervals and their images, so that each row lies
+ *    inside one LF interval and inside one image, and psi (Orbit's FL) is a
+ *    move structure over the same rows.  LF has integrated columns per row:
+ *    PSI_INT and PSI_OFF, psi's pointer and offset for the row's head, and
+ *    PHI_INT and PHI_OFF, the phi point of its head row's text position.
+ *    The phi point of a tail row is one phi step from the next row's head's
+ *    phi point, so a reposition reads both candidates' start points from
+ *    rows its scan has already read.
+ *  - With psi, a table of F block starts.  An F block starts at a row start
+ *    (the image of the first run of its character), so a row's F character
+ *    is the block its index falls in.
  *  - Optionally, phi over text positions, starts-based (rows store absolute
  *    starts), with an integrated PLCP column holding PLCP at each interval's
  *    start.
@@ -39,19 +43,25 @@
  *    phi and phi_inv together enumerate every row of a BWT interval from one
  *    of its text positions (see tms_smem.hpp).
  *
- * LF, FL and the PSI columns come from the run heads and lengths alone in
- * O(r) time and space.  phi also needs the LCP value at each run head and a
- * walk over all n rows.  Each structure takes its own splitting parameters.
+ * LF positions and psi points are the same (interval, offset) pairs, so a
+ * candidate row's psi walk starts at the row itself: its tail is
+ * (u, length - 1) and its head (d, 0).
+ *
+ * LF, its rows and the PSI columns come from the run heads and lengths alone
+ * in O(r) time and space.  phi also needs the LCP value at each run head and
+ * a walk over all n rows.  LF and phi each take their own splitting
+ * parameters.
  *
  * An index is built with one of three layouts (TmsLayout), so that it holds
  * only what its queries read:
  *
  *  - full: everything above.  Built without LCP values, it holds what psi
  *    holds.
- *  - psi: LF with the PSI columns, and FL.  Enough for matching statistics
- *    with psi, without positions or SMEMs.
- *  - phi: LF with the PHI columns, phi and optionally phi_inv, without FL.
- *    Enough for every query that does not walk psi.
+ *  - psi: LF with the PSI columns and the F block starts.  Enough for
+ *    matching statistics with psi, without positions or SMEMs.
+ *  - phi: LF with the PHI columns, phi and optionally phi_inv.  LF's rows are
+ *    then the split LF intervals alone, since nothing walks psi.  Enough for
+ *    every query that does not walk psi.
  *
  * The LF data columns a layout omits have width 0 (see Orbit's
  * permutation_impl), so they take no bits and read as 0, and the columns
@@ -82,6 +92,14 @@
 using uchar = orbit::uchar;
 using ulint = orbit::ulint;
 
+// Inline a function the batched engine calls in its hot loop, where GCC
+// otherwise may keep it out of line.
+#if defined(__GNUC__)
+#define TMS_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define TMS_ALWAYS_INLINE inline
+#endif
+
 enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, COUNT };
 enum class TmsPhiCols { PLCP, COUNT };
 enum class TmsPhiInvCols { PLCPB, COUNT };
@@ -90,8 +108,9 @@ enum class TmsPhiInvCols { PLCPB, COUNT };
 enum class TmsLayout { FULL, PSI, PHI };
 
 /**
- * Parts of a TmsIndex beyond LF, which every query reads: psi is FL with
- * LF's PSI columns, phi is phi with LF's PHI columns, and phi_inv is phi_inv.
+ * Parts of a TmsIndex beyond LF, which every query reads: psi is LF's PSI
+ * columns and the F block starts, phi is phi with LF's PHI columns, and
+ * phi_inv is phi_inv.
  * An index holds some of them, and a query needs some of them.
  */
 struct TmsParts {
@@ -100,11 +119,11 @@ struct TmsParts {
 
 /** Splitting parameters for each move structure of a TmsIndex. */
 struct TmsBuildOptions {
-    // LF, FL and phi are walked one dependent step at a time, so balancing
-    // them keeps each step's fast-forward short.  LF must be split: its
-    // balancing also bounds its row lengths and offsets.
+    // LF and phi are walked one dependent step at a time, so balancing them
+    // keeps each step's fast-forward short.  LF must be split: its balancing
+    // also bounds row lengths and offsets, and in the psi and full layouts
+    // the union with the images makes the rows psi's too.
     orbit::split_params lf_split = orbit::split_params{};
-    orbit::split_params fl_split = orbit::split_params{};
     orbit::split_params phi_split = orbit::split_params{};
     // Build phi_inv along with phi (same splitting as phi).
     bool phi_inv = true;
@@ -114,14 +133,17 @@ struct TmsBuildOptions {
 class TmsIndex {
 public:
     using LF = orbit::rlbwt::lf_permutation<TmsLFCols, true, false>;
-    using FL = orbit::rlbwt::fl_permutation<orbit::empty_data_columns, false, false>;
     using Phi = orbit::rlbwt::phi_permutation_impl<TmsPhiCols, true, true, orbit::move_vector>;
     using PhiInv = orbit::rlbwt::phi_inv_permutation_impl<TmsPhiInvCols, true, true, orbit::move_vector>;
     using LFPos = typename LF::position;
-    using FLPos = typename FL::position;
+    // A psi point: an LF position whose F character and psi step psi reads.
+    using FLPos = LFPos;
     using PhiPos = typename Phi::position;
     using PhiInvPos = typename PhiInv::position;
     using position = LFPos;
+    // The most F blocks after the first: one per character of the
+    // alphabet but the smallest.
+    static constexpr size_t F_BLOCKS = orbit::nucleotide::SIGMA - 1;
 
     TmsIndex() = default;
 
@@ -140,28 +162,22 @@ public:
         if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
         check_lf_split(opts.lf_split);
         has_psi_ = opts.layout != TmsLayout::PHI;
-        // FL first, so that its encoding is freed before LF's is built.
-        if (has_psi_) fl_ = FL(Enc::fl_interval_encoding(heads, lens, opts.fl_split));
-        Enc lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
-        const ulint lf_count = lf_enc.intervals();
-        std::vector<typename LF::data_tuple> cols(lf_count);
+        Enc lf_enc;
+        std::vector<typename LF::data_tuple> cols;
         if (has_psi_) {
-            // Merge the two partitions of the rows: for each LF interval,
-            // the FL interval holding its tail row and the offset within it.
-            ulint l_pos = 0, f_pos = 0, f_int = 0;
-            const ulint f_count = fl_.intervals();
-            for (ulint k = 0; k < lf_count; ++k) {
-                l_pos += lf_enc.get_length(k);
-                const ulint tail = l_pos - 1;
-                while (f_int < f_count && f_pos + fl_.get_length(f_int) <= tail)
-                    f_pos += fl_.get_length(f_int++);
-                cols[k][col(TmsLFCols::PSI_INT)] = f_int;
-                cols[k][col(TmsLFCols::PSI_OFF)] = tail - f_pos;
-            }
+            std::vector<uchar> row_heads;
+            std::vector<ulint> row_lens;
+            union_rows(heads, lens, opts.lf_split, row_heads, row_lens);
+            cols.resize(row_lens.size());
+            fill_psi(row_heads, row_lens, cols);
+            lf_enc = Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING);
+        } else {
+            lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
+            cols.resize(lf_enc.intervals());
         }
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
-            build_phi(heads, lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, cols);
+            build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, cols);
             has_phi_ = true;
             has_phi_inv_ = opts.phi_inv;
         }
@@ -184,9 +200,9 @@ public:
 
     /**
      * Write the index in Orbit's packed serialization, host byte order: a
-     * header with the parts the index holds, LF, and then each part's
-     * structure present, FL, phi and phi_inv, after its size in bytes so
-     * that load() can skip it.
+     * header with the parts the index holds, LF, with psi the table of F
+     * block starts, and then each part's structure present, phi and phi_inv,
+     * after its size in bytes so that load() can skip it.
      */
     size_t serialize(std::ostream& out) {
         size_t bytes = 0;
@@ -196,7 +212,13 @@ public:
         out.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
         bytes += 12;
         bytes += lf_.serialize(out);
-        if (has_psi_) bytes += serialize_sized(fl_, out);
+        if (has_psi_) {
+            for (ulint s : f_rows_) {
+                const uint64_t x = s;
+                out.write(reinterpret_cast<const char*>(&x), sizeof(x));
+            }
+            bytes += F_BLOCKS * sizeof(uint64_t);
+        }
         if (has_phi_) bytes += serialize_sized(phi_, out);
         if (has_phi_inv_) bytes += serialize_sized(phi_inv_, out);
         return bytes;
@@ -241,61 +263,45 @@ public:
     ulint move_runs() const { return lf_.intervals(); }
     ulint domain() const { return lf_.domain(); }
 
-    /** FL point of the tail row of LF interval k. */
+    // psi side.  psi points are LF positions, and psi reads LF's rows.
+    /** psi point of the tail row of LF interval k: (k, length - 1). */
     FLPos psi_at_tail(ulint k) const {
         FLPos q;
-        q.interval = lf_.template get<TmsLFCols::PSI_INT>(k);
-        q.offset = lf_.template get<TmsLFCols::PSI_OFF>(k);
+        q.interval = k;
+        q.offset = lf_.get_length(k) - 1;
         return q;
     }
-    /**
-     * FL point of the head row of LF interval k, unresolved: its offset may
-     * run past its interval's end, and finish_psi or resolve_psi resolves it.
-     * Reads LF row k - 1 only.
-     */
-    FLPos psi_at_head_unresolved(ulint k) const {
-        if (k == 0) return FLPos{};
-        FLPos q = psi_at_tail(k - 1);
-        ++q.offset;
+    /** psi point of the head row of LF interval k: (k, 0). */
+    FLPos psi_at_head(ulint k) const {
+        FLPos q;
+        q.interval = k;
+        q.offset = 0;
         return q;
     }
-    /** FL point of the head row of LF interval k. */
-    FLPos psi_at_head(ulint k) const { return resolve_psi(psi_at_head_unresolved(k)); }
-
-    // FL side.
-    uchar psi_character(FLPos q) { return fl_.get_character(q.interval); }
-    FLPos psi(FLPos q) { return fl_.FL(q); }
-    FLPos start_psi(FLPos q) const { return fl_.start_next(q); }
-    FLPos finish_psi(FLPos q) const { return fl_.finish_next(q); }
-    /**
-     * One psi step on an FL point q, resolved or not: resolve it, set c to
-     * the first character of its suffix, and return the unresolved FL point
-     * of the next character.  When FL's rows fit in a word, each row is read
-     * with one load.
-     */
-    FLPos psi_step(FLPos q, uchar& c) {
-        if (!fl_rows_fit_word_) {
-            q = finish_psi(q);
-            c = psi_character(q);
-            return start_psi(q);
-        }
-        ulint w = fl_.row_bits(q.interval);
-        ulint len = fl_.length_of(w);
-        while (q.offset >= len) {
-            q.offset -= len;
-            w = fl_.row_bits(++q.interval);
-            len = fl_.length_of(w);
-        }
-        c = fl_.character_of(w);
-        FLPos next{};
-        next.interval = fl_.pointer_of(w);
-        next.offset = q.offset + fl_.offset_of(w);
+    /** The F character of a resolved psi point: the first character of its row's suffix. */
+    uchar psi_character(FLPos q) const { return f_byte_[f_block(q.interval)]; }
+    FLPos psi(FLPos q) const { return finish_psi(start_psi(q)); }
+    FLPos start_psi(FLPos q) const {
+        FLPos next;
+        next.interval = lf_.template get<TmsLFCols::PSI_INT>(q.interval);
+        next.offset = lf_.template get<TmsLFCols::PSI_OFF>(q.interval) + q.offset;
         return next;
     }
-    /** Resolve an FL point whose offset may run past its interval's end. */
-    FLPos resolve_psi(FLPos q) const { return fl_.finish_next(q); }
-    void prefetch_psi(ulint i) const { fl_.prefetch(i); }
-    ulint psi_intervals() const { return fl_.intervals(); }
+    /** Resolve a psi point whose offset may run past its row's end. */
+    FLPos finish_psi(FLPos q) const { return lf_.finish_next(q); }
+    FLPos resolve_psi(FLPos q) const { return finish_psi(q); }
+    /**
+     * One psi step on a psi point q, resolved or not: resolve it, set c to
+     * the first character of its suffix, and return the unresolved psi point
+     * of the next character.
+     */
+    FLPos psi_step(FLPos q, uchar& c) const {
+        q = finish_psi(q);
+        c = psi_character(q);
+        return start_psi(q);
+    }
+    void prefetch_psi(ulint i) const { lf_.prefetch(i); }
+    ulint psi_intervals() const { return lf_.intervals(); }
 
     // phi side.  The text position of a phi point is its idx.
     /** phi point of the text position of LF interval k's head row. */
@@ -548,50 +554,44 @@ public:
     PhiInvWalker phi_inv_walker() const { return PhiInvWalker(phi_inv_, phi_inv_table_); }
 
     const LF& lf() const { return lf_; }
-    const FL& fl() const { return fl_; }
-
     /**
-     * The alphabet code of byte c in LF's and FL's character columns, or
-     * no_code if c does not occur (or, for FL, if the index lacks psi).
+     * The alphabet code of byte c in LF's character column, or no_code if c
+     * does not occur; and the code of c as an F character, its F block, or
+     * no_code if c does not occur or the index lacks psi.
      */
     uchar lf_code(uchar c) { return occurs_[c] ? lf_.character_code(c).value_or(no_code) : no_code; }
-    uchar fl_code(uchar c) { return occurs_[c] && has_psi_ ? fl_.character_code(c).value_or(no_code) : no_code; }
+    uchar fl_code(uchar c) const { return occurs_[c] && has_psi_ ? f_block_of_[c] : no_code; }
     static constexpr uchar no_code = 0xFF;
 
     /**
-     * Row access for the batched engine through local copies of LF's and
-     * FL's packed layouts (see Orbit's packed_matrix::reader).  Kept in a
-     * local variable, it lets the compiler hold the layouts in registers,
+     * Row access for the batched engine through a local copy of LF's packed
+     * layout (see Orbit's packed_matrix::reader) and of the F block starts.
+     * Kept in a local variable, it lets the compiler hold them in registers,
      * where reads through the index reload them after any store that might
-     * alias them.  An LF row is named by its first bit, row(i).  Its pointer
-     * and offset columns are read with one load, as are its character and
-     * PSI columns, and an FL row is read whole with one load; fits() says
-     * whether the index's column widths allow that.  Characters are alphabet
-     * codes (lf_code, fl_code).  Without psi, the FL reader is all zeros, which
-     * fits() accepts, and only the LF reads are valid.
+     * alias them.  A row is named by its first bit, row(i).  Its pointer and
+     * offset columns are read with one load, as are its character and PSI
+     * columns; fits() says whether the index's column widths allow that.  A
+     * psi step reads a row's length and then its PSI columns, and takes the
+     * F character from the block starts.  Characters are alphabet codes:
+     * lf_code for LF's, fl_code for F's.  Without psi, only the LF reads are
+     * valid.
      */
     struct PackedAccess {
         using LFRows = decltype(std::declval<const LF&>().get_reader());
-        using FLRows = decltype(std::declval<const FL&>().get_reader());
         static constexpr size_t len_col = LF::length_column();
         static constexpr size_t ptr_col = LF::pointer_column();
         static constexpr size_t off_col = LF::offset_column();
         static constexpr size_t chr_col = LF::character_column();
         static constexpr size_t psi_int_col = LF::template data_column<TmsLFCols::PSI_INT>();
         static constexpr size_t psi_off_col = LF::template data_column<TmsLFCols::PSI_OFF>();
-        static constexpr size_t fl_len_col = FL::length_column();
-        static constexpr size_t fl_ptr_col = FL::pointer_column();
-        static constexpr size_t fl_off_col = FL::offset_column();
-        static constexpr size_t fl_chr_col = FL::character_column();
         static_assert(ptr_col < off_col && chr_col < psi_int_col && psi_int_col < psi_off_col, "unexpected LF column order");
-        static_assert(fl_len_col == 0 && fl_ptr_col <= 3 && fl_off_col <= 3 && fl_chr_col <= 3, "unexpected FL columns");
         LFRows lf;
-        FLRows fl;
+        // The first row of F blocks 1 to F_BLOCKS, or a value past every row.
+        std::array<ulint, F_BLOCKS> f_rows;
         using Row = ulint;
 
         bool fits() const {
-            return lf.template span_fits<ptr_col, off_col>() && lf.template span_fits<chr_col, psi_off_col>() &&
-                   fl.template span_fits<0, 3>() && fl.offsets[0] == 0;
+            return lf.template span_fits<ptr_col, off_col>() && lf.template span_fits<chr_col, psi_off_col>();
         }
         Row row(ulint i) const { return lf.row_start(i); }
         ulint length(Row r) const { return lf.template get_at<len_col>(r); }
@@ -612,42 +612,45 @@ public:
             p.offset += lf.template extract_span<ptr_col, off_col>(span);
             return p;
         }
-        /** psi_at_tail of the LF interval whose row is r. */
-        FLPos psi_at_tail(Row r) const {
-            const ulint span = lf.template get_span<chr_col>(r);
+        /** The F block, and so the F character's code, of row i. */
+        uchar f_code(ulint i) const {
+            uchar b = 0;
+            for (size_t k = 0; k < F_BLOCKS; ++k) b += i >= f_rows[k];
+            return b;
+        }
+        /** psi_at_tail of LF interval k: (k, length - 1). */
+        FLPos psi_at_tail(ulint k) const {
             FLPos q;
-            q.interval = lf.template extract_span<chr_col, psi_int_col>(span);
-            q.offset = lf.template extract_span<chr_col, psi_off_col>(span);
+            q.interval = k;
+            q.offset = length(row(k)) - 1;
             return q;
         }
-        /** Column col of an FL row read whole; its first column starts at bit 0. */
-        template <size_t col>
-        ulint fl_col(ulint w) const { return (w >> fl.offsets[col]) & fl.masks[col]; }
-        /** As TmsIndex::psi_step, with c an alphabet code. */
-        FLPos psi_step(FLPos q, uchar& c) const {
-            ulint start = fl.row_start(q.interval);
-            ulint w = fl.template get_span<0>(start);
-            ulint len = w & fl.masks[fl_len_col];
-            while (q.offset >= len) {
+        /** psi_at_head of LF interval k: (k, 0). */
+        FLPos psi_at_head(ulint k) const {
+            FLPos q;
+            q.interval = k;
+            q.offset = 0;
+            return q;
+        }
+        /** As TmsIndex::psi_step, with c the F character's code. */
+        TMS_ALWAYS_INLINE FLPos psi_step(FLPos q, uchar& c) const {
+            Row r = row(q.interval);
+            for (ulint len = length(r); q.offset >= len; len = length(r)) {
                 q.offset -= len;
-                ++q.interval;
-                start += fl.row_width;
-                w = fl.template get_span<0>(start);
-                len = w & fl.masks[fl_len_col];
+                r = row(++q.interval);
             }
-            c = static_cast<uchar>(fl_col<fl_chr_col>(w));
+            c = f_code(q.interval);
+            const ulint span = lf.template get_span<chr_col>(r);
             FLPos next;
-            next.interval = fl_col<fl_ptr_col>(w);
-            next.offset = q.offset + fl_col<fl_off_col>(w);
+            next.interval = lf.template extract_span<chr_col, psi_int_col>(span);
+            next.offset = q.offset + lf.template extract_span<chr_col, psi_off_col>(span);
             return next;
         }
         void prefetch(ulint i) const { lf.prefetch(i); }
         void prefetch_rows(ulint lo, ulint hi) const { lf.prefetch_rows(lo, hi); }
-        void prefetch_psi(ulint i) const { fl.prefetch(i); }
+        void prefetch_psi(ulint i) const { lf.prefetch(i); }
     };
-    PackedAccess packed_access() const {
-        return PackedAccess{lf_.get_reader(), has_psi_ ? fl_.get_reader() : typename PackedAccess::FLRows{}};
-    }
+    PackedAccess packed_access() const { return PackedAccess{lf_.get_reader(), f_rows_}; }
 
     /** The same row access through the index's own column reads, with bytes for characters. */
     struct ColumnAccess {
@@ -661,7 +664,8 @@ public:
             return p.interval;
         }
         LFPos start_LF(Row, LFPos p) const { return idx->start_LF(p); }
-        FLPos psi_at_tail(Row i) const { return idx->psi_at_tail(i); }
+        FLPos psi_at_tail(ulint k) const { return idx->psi_at_tail(k); }
+        FLPos psi_at_head(ulint k) const { return idx->psi_at_head(k); }
         FLPos psi_step(FLPos q, uchar& c) const { return idx->psi_step(q, c); }
         void prefetch(ulint i) const { idx->prefetch(i); }
         void prefetch_rows(ulint lo, ulint hi) const { idx->prefetch_rows(lo, hi); }
@@ -673,20 +677,14 @@ public:
     void describe(std::ostream& os) const {
         auto row_bits = [](const auto& w) { size_t b = 0; for (auto x : w) b += x; return b; };
         auto widths = [&](const auto& w) { for (size_t i = 0; i < w.size(); ++i) os << (i ? "," : "") << int(w[i]); };
-        os << "layout: " << layout_name(parts()) << (has_phi_ && !has_phi_inv_ ? " (without phi_inv)" : "") << "\n";
+        os << "layout: " << layout_name(parts()) << (has_phi_ && !has_phi_inv_ ? " (without phi_inv)" : "")
+           << "\n";
         const auto& w = lf_.get_widths();
-        os << "LF: intervals=" << lf_.intervals() << " runs=" << lf_.runs() << " n=" << lf_.domain()
+        os << "LF: intervals=" << lf_.intervals() << " runs=" << bwt_runs_ << " n=" << lf_.domain()
            << " widths(len,ptr,off,chr,psi_int,psi_off,phi_int,phi_off)=";
         widths(w);
         os << " row_bits=" << row_bits(w) << "\n";
         double total = double(row_bits(w)) * lf_.intervals();
-        if (has_psi_) {
-            const auto& fw = fl_.get_widths();
-            os << "FL: intervals=" << fl_.intervals() << " widths(len,ptr,off,chr)=";
-            widths(fw);
-            os << " row_bits=" << row_bits(fw) << "\n";
-            total += double(row_bits(fw)) * fl_.intervals();
-        }
         if (has_phi_) {
             const auto& pw = phi_.get_widths();
             os << "phi: intervals=" << phi_.intervals() << " widths(start,ptr,off,plcp)=";
@@ -701,24 +699,29 @@ public:
             os << " row_bits=" << row_bits(pw) << "\n";
             total += double(row_bits(pw)) * phi_inv_.intervals();
         }
-        os << "total: " << total / 8 / 1e6 << " MB, " << total / lf_.runs() << " bits/run\n";
+        os << "total: " << total / 8 / 1e6 << " MB, " << total / bwt_runs_ << " bits/run\n";
     }
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 5;
+    static constexpr uint32_t VERSION = 6;
     // Header flags for the parts an index holds.
     static constexpr uint32_t FLAG_PHI = 1, FLAG_PHI_INV = 2, FLAG_PSI = 4;
 
     LF lf_;
-    FL fl_;
     Phi phi_;
     PhiInv phi_inv_;
     bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false;
     // Start tables of phi and phi_inv, built when phi_inv is present.
     StartTable phi_table_, phi_inv_table_;
     std::array<bool, 256> occurs_{};
-    bool fl_rows_fit_word_ = false;
+    // With psi, the first row of each F block after the first (as
+    // PackedAccess::f_rows), each block's byte, and each byte's block.
+    std::array<ulint, F_BLOCKS> f_rows_{};
+    std::array<uchar, F_BLOCKS + 1> f_byte_{};
+    std::array<uchar, 256> f_block_of_{};
+    // Maximal runs of equal characters in LF's rows: the BWT runs.
+    ulint bwt_runs_ = 0;
 
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
@@ -798,10 +801,16 @@ private:
         const TmsParts want = need ? *need : held;
         check_parts(held, want);
         lf_.load(in);
+        if (held.psi) {
+            for (ulint& s : f_rows_) {
+                uint64_t x = 0;
+                in.read(reinterpret_cast<char*>(&x), sizeof(x));
+                s = x;
+            }
+        }
         has_psi_ = want.psi;
         has_phi_ = want.phi;
         has_phi_inv_ = want.phi && want.phi_inv;
-        if (held.psi) load_sized(fl_, in, has_psi_);
         if (held.phi) load_sized(phi_, in, has_phi_);
         if (held.phi_inv && has_phi_inv_) load_sized(phi_inv_, in, true);
         if (!in.good()) throw std::runtime_error("truncated tms index");
@@ -812,7 +821,7 @@ private:
     /** Throw, naming what is missing and how to build it, if an index with parts held lacks one in want. */
     static void check_parts(const TmsParts& held, const TmsParts& want) {
         std::string missing;
-        if (want.psi && !held.psi) missing = "psi (FL and the PSI columns)";
+        if (want.psi && !held.psi) missing = "psi (the PSI columns)";
         else if (want.phi && !held.phi) missing = "phi (phi and the PHI columns)";
         else if (want.phi_inv && !held.phi_inv) missing = "phi_inv";
         else return;
@@ -825,11 +834,148 @@ private:
                                  ") lacks; build one with tms-build --layout " + build);
     }
 
-    // Derived fields: whole-row FL reads, and which characters occur.
+    // Derived fields: which characters occur, the BWT runs, and each F
+    // block's byte and each byte's block.
     void compute_occurs() {
-        fl_rows_fit_word_ = has_psi_ && fl_.row_fits_word();
         occurs_.fill(false);
-        for (ulint i = 0; i < lf_.intervals(); ++i) occurs_[lf_.get_character(i)] = true;
+        bwt_runs_ = 0;
+        for (ulint i = 0, prev = 256; i < lf_.intervals(); ++i) {
+            const uchar c = lf_.get_character(i);
+            bwt_runs_ += c != prev;
+            occurs_[c] = true;
+            prev = c;
+        }
+        // F blocks are in byte order.
+        f_block_of_.fill(no_code);
+        f_byte_.fill(0);
+        uchar b = 0;
+        for (size_t c = 0; c < 256; ++c)
+            if (occurs_[c]) {
+                if (b > F_BLOCKS) throw std::runtime_error("more characters than the F block table holds");
+                f_byte_[b] = static_cast<uchar>(c);
+                f_block_of_[c] = b++;
+            }
+    }
+
+    /**
+     * The rows of the psi and full layouts (see the file comment) of the
+     * RLBWT with the given run heads and lengths: the union of the starts of
+     * LF's intervals, split with sp, and of their images.  Each row gets the
+     * byte of the run it lies in.  O(r) time and space.
+     */
+    static void union_rows(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
+                           const orbit::split_params& sp, std::vector<uchar>& row_heads,
+                           std::vector<ulint>& row_lens) {
+        using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+        const Enc split = Enc::lf_interval_encoding(heads, lens, sp);
+        const ulint m = split.intervals();
+        // Call f(k, c) for each split interval k in row order, with c its byte.
+        auto each = [&](auto f) {
+            ulint k = 0;
+            for (size_t r = 0; r < lens.size(); ++r)
+                for (ulint covered = 0; covered < lens[r]; ++k) {
+                    f(k, heads[r]);
+                    covered += split.get_length(k);
+                }
+        };
+        // Byte c's F block holds the images of c's intervals in their order,
+        // so counting rows and intervals per byte places every image.
+        std::array<ulint, 256> rows_of{}, intervals_of{}, next_image{}, next_slot{};
+        each([&](ulint k, uchar c) {
+            rows_of[c] += split.get_length(k);
+            ++intervals_of[c];
+        });
+        for (size_t c = 0, a = 0, b = 0; c < 256; ++c) {
+            next_image[c] = a;
+            a += rows_of[c];
+            next_slot[c] = b;
+            b += intervals_of[c];
+        }
+        // The images' starts, in row order.
+        std::vector<ulint> images(m);
+        each([&](ulint k, uchar c) {
+            images[next_slot[c]++] = next_image[c];
+            next_image[c] += split.get_length(k);
+        });
+        // Merge the two sorted lists of starts, calling emit(c, length) for
+        // each row.
+        auto merge = [&](auto emit) {
+            ulint start = 0;
+            size_t j = 0;
+            each([&](ulint k, uchar c) {
+                const ulint end = start + split.get_length(k);
+                ulint at = start;
+                while (j < m && images[j] <= start) ++j;
+                for (; j < m && images[j] < end; ++j) {
+                    emit(c, images[j] - at);
+                    at = images[j];
+                }
+                emit(c, end - at);
+                start = end;
+            });
+        };
+        size_t rows = 0;
+        merge([&](uchar, ulint) { ++rows; });
+        row_heads.clear();
+        row_lens.clear();
+        row_heads.reserve(rows);
+        row_lens.reserve(rows);
+        merge([&](uchar c, ulint len) {
+            row_heads.push_back(c);
+            row_lens.push_back(len);
+        });
+    }
+
+    /**
+     * For LF rows with the given heads and lengths, fill the PSI columns
+     * with psi's pointer and offset for each row's head, and the table of F
+     * block starts.  Row i with byte c holds the occurrences of c ranked R
+     * to R + length - 1 in the BWT, where R counts those in earlier rows, so
+     * psi maps F positions C[c] + R onward into it; the rows of c's F block
+     * that start there are found by walking the block alongside.
+     */
+    void fill_psi(const std::vector<uchar>& row_heads, const std::vector<ulint>& row_lens,
+                  std::vector<typename LF::data_tuple>& cols) {
+        const size_t rows = row_lens.size();
+        std::array<ulint, 256> count{}, f_pos{}, f_row{};
+        for (size_t i = 0; i < rows; ++i) count[row_heads[i]] += row_lens[i];
+        for (size_t c = 0, a = 0; c < 256; ++c) {
+            f_pos[c] = a;
+            a += count[c];
+        }
+        // Each F block's first row, and the table of blocks after the first.
+        f_rows_.fill(std::numeric_limits<ulint>::max());
+        {
+            ulint start = 0;
+            size_t i = 0, b = 0;
+            for (size_t c = 0; c < 256; ++c) {
+                if (count[c] == 0) continue;
+                while (start < f_pos[c]) start += row_lens[i++];
+                if (start != f_pos[c]) throw std::logic_error("an F block must start at a row start");
+                f_row[c] = i;
+                if (b > F_BLOCKS) throw std::runtime_error("more characters than the F block table holds");
+                if (b > 0) f_rows_[b - 1] = i;
+                ++b;
+            }
+        }
+        std::array<ulint, 256> rank{};
+        std::array<ulint, 256> next_row = f_row, next_start = f_pos;
+        for (size_t i = 0; i < rows; ++i) {
+            const uchar c = row_heads[i];
+            const ulint lo = f_pos[c] + rank[c], hi = lo + row_lens[i];
+            for (; next_start[c] < hi; next_start[c] += row_lens[next_row[c]++]) {
+                cols[next_row[c]][col(TmsLFCols::PSI_INT)] = i;
+                cols[next_row[c]][col(TmsLFCols::PSI_OFF)] = next_start[c] - lo;
+            }
+            rank[c] += row_lens[i];
+        }
+    }
+
+    /** The F block of row i: how many F blocks after the first start at or before it. */
+    uchar f_block(ulint i) const {
+        uchar b = 0;
+        for (ulint s : f_rows_) b += i >= s;
+        return b;
     }
 
     /**
@@ -885,7 +1031,7 @@ private:
      * run, or 0 for row n - 1.
      */
     template <typename Enc>
-    void build_phi(const std::vector<uchar>& heads, const std::vector<ulint>& lens, const Enc& lf_enc,
+    void build_phi(const std::vector<ulint>& lens, const Enc& lf_enc,
                    const std::vector<ulint>& run_tops, const orbit::split_params& sp, bool with_inv,
                    std::vector<typename LF::data_tuple>& cols) {
         const ulint lf_count = lf_enc.intervals();
@@ -898,7 +1044,7 @@ private:
                 ulint covered = 0;
                 while (covered < lens[r]) covered += lf_enc.get_length(k++);
             }
-            orbit::rlbwt::lf_move<false> lf(heads, lens, lf_enc.get_split_params());
+            orbit::rlbwt::lf_move<false> lf(lf_enc);
             const ulint n = lf.domain();
             auto pos = lf.first();
             ulint sa = n - 1;

@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
         for (auto& x : li) x = rng() % idx.move_runs();
         for (size_t d : {0, 8, 32}) {
             auto t0 = std::chrono::steady_clock::now();
-            for (size_t j = 0; j < N; ++j) { if (d && j + d < N) idx.prefetch_psi(fi[j + d]); sink += idx.fl().get_length(fi[j]); }
+            for (size_t j = 0; j < N; ++j) { if (d && j + d < N) idx.prefetch_psi(fi[j + d]); sink += idx.lf().get_length(fi[j]); }
             auto t1 = std::chrono::steady_clock::now();
             for (size_t j = 0; j < N; ++j) { if (d && j + d < N) idx.prefetch(li[j + d]); sink += idx.lf().get_length(li[j]); }
             auto t2 = std::chrono::steady_clock::now();
