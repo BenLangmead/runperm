@@ -100,11 +100,10 @@ struct TmsParts {
 
 /** Splitting parameters for each move structure of a TmsIndex. */
 struct TmsBuildOptions {
-    // LF is unsplit by default, as in ms, so that the two tools take the
-    // same LF steps and differ only in how they compute LCEs.
-    orbit::split_params lf_split = orbit::NO_SPLITTING;
-    // FL and phi are walked one dependent step at a time, so balancing them
-    // keeps each step's fast-forward short.
+    // LF, FL and phi are walked one dependent step at a time, so balancing
+    // them keeps each step's fast-forward short.  LF must be split: its
+    // balancing also bounds its row lengths and offsets.
+    orbit::split_params lf_split = orbit::split_params{};
     orbit::split_params fl_split = orbit::split_params{};
     orbit::split_params phi_split = orbit::split_params{};
     // Build phi_inv along with phi (same splitting as phi).
@@ -132,13 +131,14 @@ public:
      * LCP value at each run's head row (0 for row 0), and the index also gets
      * phi (and phi_inv if opts.phi_inv); this walks LF over all n rows.
      * opts.layout says which parts to build: the psi layout takes no
-     * run_tops, and the phi layout needs them.
+     * run_tops, and the phi layout needs them.  opts.lf_split must split.
      */
     TmsIndex(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
              const TmsBuildOptions& opts = TmsBuildOptions{}, const std::vector<ulint>* run_tops = nullptr) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
         if (opts.layout == TmsLayout::PSI && run_tops) throw std::invalid_argument("a psi layout takes no LCP values");
         if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
+        check_lf_split(opts.lf_split);
         has_psi_ = opts.layout != TmsLayout::PHI;
         // FL first, so that its encoding is freed before LF's is built.
         if (has_psi_) fl_ = FL(Enc::fl_interval_encoding(heads, lens, opts.fl_split));
@@ -169,6 +169,17 @@ public:
         lf_ = LF(lf_enc, cols, {!has_psi_, !has_psi_, !has_phi_, !has_phi_});
         compute_occurs();
         if (has_phi_inv_) build_start_tables();
+    }
+
+    /**
+     * Throw unless sp splits LF: TmsIndex's LF is always split, with length
+     * capping or balancing (see TmsBuildOptions).
+     */
+    static void check_lf_split(const orbit::split_params& sp) {
+        const bool caps = sp.length_capping.has_value() && *sp.length_capping > 0;
+        const bool balances = sp.balancing.has_value() && *sp.balancing > 0;
+        if (!caps && !balances)
+            throw std::invalid_argument("LF must be split, with length capping or balancing; unsplit LF is not supported");
     }
 
     /**

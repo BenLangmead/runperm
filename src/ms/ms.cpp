@@ -68,8 +68,9 @@ static void usage(const char* prog) {
               << "              --positions or an SMEM report; phi keeps LF, phi and phi_inv,\n"
               << "              needs LCP input, and serves every query but --mode psi, phiskip\n"
               << "              and dual.  --lf-split, --fl-split and --phi-split set Orbit's\n"
-              << "              balancing factor for that structure (0 = no splitting; defaults:\n"
-              << "              LF 0, FL and phi Orbit's default length capping and balancing).\n"
+              << "              balancing factor for that structure, with its default length\n"
+              << "              capping (default: Orbit's default balancing).  LF is always\n"
+              << "              split, so --lf-split must be positive; 0 leaves FL or phi unsplit.\n"
               << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [--layout ...] [split options]\n"
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
@@ -606,7 +607,13 @@ int main(int argc, char** argv) {
             return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
         };
         for (int i = npos; i < argc; ++i) {
-            if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) opts.lf_split = split_arg(argv[++i]);
+            if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
+                opts.lf_split = split_arg(argv[++i]);
+                if (opts.lf_split == orbit::NO_SPLITTING) {
+                    std::cerr << "--lf-split must be positive: LF is always split and balanced\n";
+                    return 1;
+                }
+            }
             else if (strcmp(argv[i], "--fl-split") == 0 && i + 1 < argc) opts.fl_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--no-phi-inv") == 0) opts.phi_inv = false;
