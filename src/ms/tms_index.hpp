@@ -556,8 +556,8 @@ public:
      * and offset columns are read with one load, as are its character and
      * PSI columns, and an FL row is read whole with one load; fits() says
      * whether the index's column widths allow that.  Characters are alphabet
-     * codes (lf_code, fl_code).  Without psi, the FL reader is empty and only
-     * the LF reads are valid.
+     * codes (lf_code, fl_code).  Without psi, the FL reader is all zeros, which
+     * fits() accepts, and only the LF reads are valid.
      */
     struct PackedAccess {
         using LFRows = decltype(std::declval<const LF&>().get_reader());
@@ -576,12 +576,11 @@ public:
         static_assert(fl_len_col == 0 && fl_ptr_col <= 3 && fl_off_col <= 3 && fl_chr_col <= 3, "unexpected FL columns");
         LFRows lf;
         FLRows fl;
-        bool with_psi;
         using Row = ulint;
 
         bool fits() const {
             return lf.template span_fits<ptr_col, off_col>() && lf.template span_fits<chr_col, psi_off_col>() &&
-                   (!with_psi || (fl.template span_fits<0, 3>() && fl.offsets[0] == 0));
+                   fl.template span_fits<0, 3>() && fl.offsets[0] == 0;
         }
         Row row(ulint i) const { return lf.row_start(i); }
         ulint length(Row r) const { return lf.template get_at<len_col>(r); }
@@ -636,7 +635,7 @@ public:
         void prefetch_psi(ulint i) const { fl.prefetch(i); }
     };
     PackedAccess packed_access() const {
-        return PackedAccess{lf_.get_reader(), has_psi_ ? fl_.get_reader() : typename PackedAccess::FLRows{}, has_psi_};
+        return PackedAccess{lf_.get_reader(), has_psi_ ? fl_.get_reader() : typename PackedAccess::FLRows{}};
     }
 
     /** The same row access through the index's own column reads, with bytes for characters. */
