@@ -567,7 +567,7 @@ void check_phi_inv(const TextBwt& t, const TmsBuildOptions& o) {
     // Loaded without phi_inv, phi has no start table.
     std::stringstream again(ss.str());
     TmsIndex phi_only;
-    phi_only.load(again, false);
+    phi_only.load(again, TmsParts{true, true, false});
     assert(!phi_only.has_phi_inv() && phi_only.start_table_bytes() == 0);
     check_walker(phi_only.phi_walker(), n, [&](ulint i) { return phi_only.phi_start(i); }, phi_only.phi_intervals(),
                  [&](TmsIndex::PhiPos p) { return phi_only.phi(p); }, [&](TmsIndex::PhiPos p) { return phi_only.plcp(p); });
@@ -807,6 +807,150 @@ bool test_smem_report(const std::string& data_dir) {
     return true;
 }
 
+namespace {
+
+/** Serialize idx and load it back, with every part or only those in need. */
+TmsIndex round_trip(TmsIndex& idx, const TmsParts* need = nullptr) {
+    std::stringstream ss;
+    idx.serialize(ss);
+    TmsIndex loaded;
+    if (need) loaded.load(ss, *need);
+    else loaded.load(ss);
+    return loaded;
+}
+
+/** One query's output, as tms-batch would print it: lengths, positions and SMEMs per pattern. */
+std::vector<std::string> query_output(TmsIndex& idx, const std::vector<std::string>& pats, size_t k, TmsMode mode,
+                                      bool positions, TmsReport report, bool packed) {
+    std::vector<std::vector<ulint>> len, pos;
+    const bool toehold = positions || report != TmsReport::MS;
+    tms_query_batch(idx, pats, k, len, mode, toehold ? &pos : nullptr, packed);
+    std::vector<TmsSmemHits> hits;
+    if (report != TmsReport::MS) tms_report_smems_batch(idx, len, pos, 0, report, k, hits);
+    std::vector<std::string> out(pats.size());
+    for (size_t j = 0; j < pats.size(); ++j) {
+        for (ulint x : len[j]) out[j] += std::to_string(x) + ' ';
+        if (positions)
+            for (ulint x : pos[j]) out[j] += (x == TMS_NO_POS ? std::string("-1") : std::to_string(x)) + ' ';
+        if (report != TmsReport::MS) tms_format_smems(hits[j], report, out[j]);
+    }
+    return out;
+}
+
+/** Whether f() throws an E whose message contains what. */
+template <typename E, typename F>
+bool throws(F f, const char* what) {
+    try {
+        f();
+    } catch (const E& e) {
+        return std::string(e.what()).find(what) != std::string::npos;
+    }
+    return false;
+}
+
+}  // namespace
+
+/**
+ * Indexes built with the psi and phi layouts, and full indexes loaded with
+ * only the parts a query needs, give the same output as the full index for
+ * every query they can serve, with packed and column access and several
+ * numbers of patterns in flight.  The LF columns a layout omits have width
+ * 0, and the parts it omits are absent.  Queries that need a missing part are
+ * refused, at load and at query time, and so are layouts given the wrong LCP
+ * input.
+ */
+bool test_layouts(const std::string& data_dir) {
+    std::cout << "Testing psi and phi layouts and partial loads against the full layout" << std::endl;
+    std::mt19937 rng(47);
+    const auto inputs = batch_inputs(data_dir, rng);
+    size_t compared = 0;
+    for (const auto& in : inputs) {
+        auto pats = fuzz_patterns(in.text, rng, in.text.size() > 5000 ? 60 : 100);
+        for (const auto& base : {split_variants()[0], split_variants()[3]}) {
+            TmsBuildOptions psi_opts = base, phi_opts = base, phi_noinv_opts = base;
+            psi_opts.layout = TmsLayout::PSI;
+            phi_opts.layout = phi_noinv_opts.layout = TmsLayout::PHI;
+            phi_noinv_opts.phi_inv = false;
+            TmsIndex full(in.heads, in.lens, base, &in.tops);
+            TmsIndex psi_built(in.heads, in.lens, psi_opts);
+            TmsIndex phi_built(in.heads, in.lens, phi_opts, &in.tops);
+            TmsIndex phi_noinv_built(in.heads, in.lens, phi_noinv_opts, &in.tops);
+            TmsIndex psi = round_trip(psi_built), phi = round_trip(phi_built), phi_noinv = round_trip(phi_noinv_built);
+            // Parts held, and LF columns of width 0 exactly where a part is missing.
+            auto parts_are = [](const TmsIndex& x, bool a, bool b, bool c) {
+                return x.has_psi() == a && x.has_phi() == b && x.has_phi_inv() == c;
+            };
+            assert(parts_are(full, true, true, true) && parts_are(psi, true, false, false));
+            assert(parts_are(phi, false, true, true) && parts_are(phi_noinv, false, true, false));
+            const auto& fw = full.lf().get_widths();
+            const auto& sw = psi.lf().get_widths();
+            const auto& hw = phi.lf().get_widths();
+            constexpr size_t PSI_INT = TmsIndex::LF::template data_column<TmsLFCols::PSI_INT>();
+            for (size_t c = 0; c < fw.size(); ++c) {
+                const bool psi_col = c == PSI_INT || c == PSI_INT + 1, phi_col = c == PSI_INT + 2 || c == PSI_INT + 3;
+                assert(fw[c] > 0);
+                assert(sw[c] == (phi_col ? 0 : fw[c]) && hw[c] == (psi_col ? 0 : fw[c]));
+            }
+            assert(psi.packed_access().fits() && phi.packed_access().fits());
+
+            // Full indexes loaded with only what psi MS, and what phi queries, read.
+            const TmsParts psi_need = tms_query_parts(TmsMode::PSI, false, TmsReport::MS);
+            const TmsParts phi_need = tms_query_parts(TmsMode::PHI, true, TmsReport::SMEM_ALL);
+            TmsIndex full_psi = round_trip(full, &psi_need), full_phi = round_trip(full, &phi_need);
+            assert(parts_are(full_psi, true, false, false) && parts_are(full_phi, false, true, true));
+
+            for (size_t k : {1, 7, 32}) {
+                for (bool packed : {true, false}) {
+                    const auto want = query_output(full, pats, k, TmsMode::PSI, false, TmsReport::MS, packed);
+                    for (TmsIndex* x : {&psi, &full_psi, &psi_built}) {
+                        assert(query_output(*x, pats, k, TmsMode::PSI, false, TmsReport::MS, packed) == want);
+                        ++compared;
+                    }
+                    for (bool positions : {false, true})
+                        for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
+                            const auto want_phi = query_output(full, pats, k, TmsMode::PHI, positions, report, packed);
+                            std::vector<TmsIndex*> xs = {&phi, &full_phi, &phi_built};
+                            if (report != TmsReport::SMEM_ALL) xs.push_back(&phi_noinv);
+                            for (TmsIndex* x : xs) {
+                                if (query_output(*x, pats, k, TmsMode::PHI, positions, report, packed) != want_phi) {
+                                    std::cout << "  FAILED: phi layout output differs, k " << k << std::endl;
+                                    assert(false && "a phi index must answer as the full index does");
+                                    return false;
+                                }
+                                ++compared;
+                            }
+                        }
+                }
+            }
+
+            // Refusals.
+            const TmsParts phiskip_need = tms_query_parts(TmsMode::PHISKIP, false, TmsReport::MS);
+            const TmsParts smem_one_psi = tms_query_parts(TmsMode::PSI, false, TmsReport::SMEM_ONE);
+            const TmsParts pos_psi = tms_query_parts(TmsMode::PSI, true, TmsReport::MS);
+            assert(throws<std::runtime_error>([&] { round_trip(phi_built, &psi_need); }, "needs psi"));
+            assert(throws<std::runtime_error>([&] { round_trip(phi_built, &phiskip_need); }, "needs psi"));
+            assert(throws<std::runtime_error>([&] { round_trip(psi_built, &phi_need); }, "needs phi"));
+            assert(throws<std::runtime_error>([&] { round_trip(psi_built, &smem_one_psi); }, "needs phi"));
+            assert(throws<std::runtime_error>([&] { round_trip(psi_built, &pos_psi); }, "needs phi"));
+            assert(throws<std::runtime_error>([&] { round_trip(phi_noinv_built, &phi_need); }, "needs phi_inv"));
+            std::vector<std::vector<ulint>> len, pos;
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi, pats, 8, len, TmsMode::PSI); }, "psi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi, pats, 8, len, TmsMode::DUAL); }, "psi"));
+            assert(throws<std::invalid_argument>([&] { tms_query(phi, "ACGT"); }, "psi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PHI); }, "phi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PSI, &pos); }, "phi"));
+            tms_query_batch(phi_noinv, pats, 8, len, TmsMode::PHI, &pos);
+            std::vector<TmsSmemHits> hits;
+            assert(throws<std::invalid_argument>(
+                [&] { tms_report_smems_batch(phi_noinv, len, pos, 0, TmsReport::SMEM_ALL, 8, hits); }, "phi_inv"));
+            assert(throws<std::invalid_argument>([&] { TmsIndex(in.heads, in.lens, psi_opts, &in.tops); }, "psi layout"));
+            assert(throws<std::invalid_argument>([&] { TmsIndex(in.heads, in.lens, phi_opts); }, "phi layout"));
+        }
+    }
+    std::cout << "  " << compared << " batches PASSED" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -822,6 +966,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_smem_detection();
     std::cout << std::endl;
     test_smem_report(data_dir);
+    std::cout << std::endl;
+    test_layouts(data_dir);
     std::cout << std::endl;
     std::cout << (all_ran ? "All tms_test checks PASSED" : "SOME TMS TESTS NOT RUN") << std::endl;
     return all_ran;

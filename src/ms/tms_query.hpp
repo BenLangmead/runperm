@@ -95,8 +95,9 @@ tms_reposition(TmsIndex& idx, ulint interval, uchar c, const char* rest, ulint l
     return std::make_pair(idx.down(from), down_lce);
 }
 
-/** Matching statistics of pattern against the index; same result as ms_query. */
+/** Matching statistics of pattern against an index with psi; same result as ms_query. */
 inline std::vector<ulint> tms_query(TmsIndex& idx, const std::string& pattern) {
+    if (!idx.has_psi()) throw std::invalid_argument("tms_query needs an index with psi");
     std::vector<ulint> out(pattern.size(), 0);
     if (pattern.empty()) return out;
     const char* pat = pattern.data();
@@ -161,7 +162,7 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * ColumnAccess).  out_len[j] receives the statistics for patterns[j]; if positions is true,
  * out_pos[j] receives for each one a text position where it occurs
  * (TMS_NO_POS with a statistic of 0).  PHI, PHISKIP, DUAL and positions need
- * an index with phi.
+ * an index with phi, and PSI, PHISKIP and DUAL one with psi.
  */
 template <TmsMode Mode, bool Positions, class Access>
 inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vector<std::string>& patterns, size_t k,
@@ -472,6 +473,7 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
                             bool packed = true) {
     if ((mode != TmsMode::PSI || out_pos) && !idx.has_phi())
         throw std::invalid_argument("this mode or positions need an index built with phi");
+    if (mode != TmsMode::PHI && !idx.has_psi()) throw std::invalid_argument("this mode needs an index with psi");
     const TmsIndex::PackedAccess pa = idx.packed_access();
     const bool use_packed = packed && pa.fits();
     auto run = [&](auto m) {

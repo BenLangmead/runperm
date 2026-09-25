@@ -55,24 +55,32 @@ static void usage(const char* prog) {
               << "              prefetching (ms_query for batch, the batched engine with one\n"
               << "              read for tms-batch).  Results do not depend on K.  A summary with\n"
               << "              query time per base goes to stderr.\n"
-              << "  tms-build  HEADS LENS INDEX_PATH [--minima FILE] [--lf-split B] [--fl-split B]\n"
-              << "            [--phi-split B] [--lcp-bin FILE] [--no-phi-inv]\n"
+              << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--minima FILE]\n"
+              << "            [--lcp-bin FILE] [--lf-split B] [--fl-split B] [--phi-split B]\n"
+              << "            [--no-phi-inv]\n"
               << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
               << "              input, and with --minima (a TeraLCP -ominima file, of which only\n"
               << "              each run's top LCP is used) or --lcp-bin (one 64-bit LCP per row)\n"
               << "              also phi and phi_inv (phi_inv unless --no-phi-inv; it is needed\n"
-              << "              only for tms-batch --report smem-all).  --lf-split, --fl-split\n"
-              << "              and --phi-split set Orbit's balancing factor for that structure\n"
-              << "              (0 = no splitting; defaults: LF 0, FL and phi Orbit's default\n"
-              << "              length capping and balancing).\n"
-              << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [split options]\n"
+              << "              only for tms-batch --report smem-all).  --layout keeps only what\n"
+              << "              some queries read: full (the default) keeps everything; psi keeps\n"
+              << "              LF and psi, takes no LCP input, and serves only --mode psi without\n"
+              << "              --positions or an SMEM report; phi keeps LF, phi and phi_inv,\n"
+              << "              needs LCP input, and serves every query but --mode psi, phiskip\n"
+              << "              and dual.  --lf-split, --fl-split and --phi-split set Orbit's\n"
+              << "              balancing factor for that structure (0 = no splitting; defaults:\n"
+              << "              LF 0, FL and phi Orbit's default length capping and balancing).\n"
+              << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [--layout ...] [split options]\n"
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
               << "            [--max-smem-positions N]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
-              << "              compute LCEs (default psi; the others need phi).  --positions\n"
+              << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
+              << "              the others need phi).  Only the index's structures that the\n"
+              << "              query reads are loaded, and a query the index's layout cannot\n"
+              << "              serve is refused.  --positions\n"
               << "              adds a field with an occurrence position for each value (-1\n"
               << "              where it is 0); it needs phi.  --report adds a field with the\n"
               << "              read's SMEMs (super-maximal exact matches), space-separated:\n"
@@ -209,12 +217,14 @@ static std::vector<ulint> query_one(TmsIndex& idx, const std::string& s) {
     return std::move(len[0]);
 }
 
-static std::optional<TmsIndex> read_tms_index(const std::string& path, bool with_phi_inv = true) {
+// Read a tms index with the parts in *need, or every part it holds if need is null.
+static std::optional<TmsIndex> read_tms_index(const std::string& path, const TmsParts* need = nullptr) {
     std::ifstream in(path, std::ios::binary);
     if (!in.good()) return std::nullopt;
     TmsIndex idx;
     try {
-        idx.load(in, with_phi_inv);
+        if (need) idx.load(in, *need);
+        else idx.load(in);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
         return std::nullopt;
@@ -270,16 +280,6 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         return 1;
     }
     const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
-    if constexpr (std::is_same_v<Index, TmsIndex>) {
-        if ((g_tms_positions || g_tms_report != TmsReport::MS || g_tms_mode != TmsMode::PSI) && !opt->has_phi()) {
-            std::cerr << "--positions, --report smem-one/smem-all and modes other than psi need an index with phi\n";
-            return 1;
-        }
-        if (g_tms_report == TmsReport::SMEM_ALL && !opt->has_phi_inv()) {
-            std::cerr << "--report smem-all needs an index with phi_inv\n";
-            return 1;
-        }
-    }
 
     std::ifstream fin;
     std::istream* in = &std::cin;
@@ -583,9 +583,11 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "tms-batch") {
-        // Only an smem-all report walks phi_inv, so other reports skip loading it.
+        // Load only the parts the query reads; the load refuses an index
+        // that lacks one.
         return run_batch<TmsIndex>(argc, argv, [](const std::string& path) {
-            return read_tms_index(path, g_tms_report == TmsReport::SMEM_ALL);
+            const TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
+            return read_tms_index(path, &need);
         });
     }
 
@@ -608,10 +610,25 @@ int main(int argc, char** argv) {
             else if (strcmp(argv[i], "--fl-split") == 0 && i + 1 < argc) opts.fl_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--no-phi-inv") == 0) opts.phi_inv = false;
+            else if (strcmp(argv[i], "--layout") == 0 && i + 1 < argc) {
+                const std::string l = argv[++i];
+                if (l == "full") opts.layout = TmsLayout::FULL;
+                else if (l == "psi") opts.layout = TmsLayout::PSI;
+                else if (l == "phi") opts.layout = TmsLayout::PHI;
+                else { std::cerr << "Unknown layout: " << l << "\n"; return 1; }
+            }
             else if (from_tsv && strcmp(argv[i], "--phi") == 0) with_phi = true;
             else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
             else if (!from_tsv && strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
+        }
+        if (opts.layout == TmsLayout::PSI && with_phi) {
+            std::cerr << "--layout psi takes no LCP input (" << (from_tsv ? "--phi" : "--minima or --lcp-bin") << ")\n";
+            return 1;
+        }
+        if (opts.layout == TmsLayout::PHI && !with_phi) {
+            std::cerr << "--layout phi needs LCP input (" << (from_tsv ? "--phi" : "--minima or --lcp-bin") << ")\n";
+            return 1;
         }
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
@@ -702,7 +719,9 @@ int main(int argc, char** argv) {
 
     if (cmd == "tms-text") {
         if (argc < 1) { std::cerr << "tms-text requires INDEX_PATH\n"; return 1; }
-        auto opt = read_tms_index(argv[0]);
+        // LF alone reads the text back.
+        const TmsParts lf_only;
+        auto opt = read_tms_index(argv[0], &lf_only);
         if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
         // Row 0 holds text position n - 1, so the s-th row LF visits from it
         // has BWT character T[n - 2 - s].

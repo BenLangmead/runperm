@@ -44,6 +44,20 @@ enum class TmsReport {
     SMEM_ALL,  // plus every SA entry of each SMEM
 };
 
+/**
+ * The parts of a TmsIndex (see TmsParts) that tms_query_batch in a mode, with
+ * or without positions, and then a report, read.  Positions and SMEM reports
+ * need the toehold, which phi keeps; walking the rows of an SMEM for
+ * SMEM_ALL needs phi_inv.
+ */
+inline TmsParts tms_query_parts(TmsMode mode, bool positions, TmsReport report) {
+    TmsParts p;
+    p.psi = mode != TmsMode::PHI;
+    p.phi = mode != TmsMode::PSI || positions || report != TmsReport::MS;
+    p.phi_inv = report == TmsReport::SMEM_ALL;
+    return p;
+}
+
 /** A max_listed that lists every position. */
 constexpr ulint TMS_ALL_POSITIONS = std::numeric_limits<ulint>::max();
 
@@ -261,6 +275,8 @@ inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<
                                    const std::vector<std::vector<ulint>>& pos, ulint min_len, TmsReport report,
                                    size_t k, std::vector<TmsSmemHits>& hits,
                                    ulint max_listed = TMS_ALL_POSITIONS) {
+    if (report == TmsReport::SMEM_ALL && !idx.has_phi_inv())
+        throw std::invalid_argument("listing every position of an SMEM needs an index with phi_inv");
     hits.resize(ms.size());
     if (report != TmsReport::SMEM_ALL || k == 0) {
         for (size_t j = 0; j < ms.size(); ++j) tms_report_smems(idx, ms[j], pos[j], min_len, report, hits[j], max_listed);

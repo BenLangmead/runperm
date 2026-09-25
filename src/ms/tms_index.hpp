@@ -42,6 +42,22 @@
  * LF, FL and the PSI columns come from the run heads and lengths alone in
  * O(r) time and space.  phi also needs the LCP value at each run head and a
  * walk over all n rows.  Each structure takes its own splitting parameters.
+ *
+ * An index is built with one of three layouts (TmsLayout), so that it holds
+ * only what its queries read:
+ *
+ *  - full: everything above.  Built without LCP values, it holds what psi
+ *    holds.
+ *  - psi: LF with the PSI columns, and FL.  Enough for matching statistics
+ *    with psi, without positions or SMEMs.
+ *  - phi: LF with the PHI columns, phi and optionally phi_inv, without FL.
+ *    Enough for every query that does not walk psi.
+ *
+ * The LF data columns a layout omits have width 0 (see Orbit's
+ * permutation_impl), so they take no bits and read as 0, and the columns
+ * kept stay where the full layout has them.  The header records which parts
+ * the index holds (TmsParts), and load() reads only the parts a query needs,
+ * seeking past the rest.
  */
 
 #ifndef _TMS_INDEX_HPP
@@ -51,11 +67,13 @@
 #include "orbit/common.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -68,6 +86,18 @@ enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, COUNT };
 enum class TmsPhiCols { PLCP, COUNT };
 enum class TmsPhiInvCols { PLCPB, COUNT };
 
+/** Which structures a TmsIndex is built with (see the file comment). */
+enum class TmsLayout { FULL, PSI, PHI };
+
+/**
+ * Parts of a TmsIndex beyond LF, which every query reads: psi is FL with
+ * LF's PSI columns, phi is phi with LF's PHI columns, and phi_inv is phi_inv.
+ * An index holds some of them, and a query needs some of them.
+ */
+struct TmsParts {
+    bool psi = false, phi = false, phi_inv = false;
+};
+
 /** Splitting parameters for each move structure of a TmsIndex. */
 struct TmsBuildOptions {
     // LF is unsplit by default, as in ms, so that the two tools take the
@@ -79,6 +109,7 @@ struct TmsBuildOptions {
     orbit::split_params phi_split = orbit::split_params{};
     // Build phi_inv along with phi (same splitting as phi).
     bool phi_inv = true;
+    TmsLayout layout = TmsLayout::FULL;
 };
 
 class TmsIndex {
@@ -100,16 +131,21 @@ public:
      * or a nucleotide) and run lengths.  If run_tops is given, it holds the
      * LCP value at each run's head row (0 for row 0), and the index also gets
      * phi (and phi_inv if opts.phi_inv); this walks LF over all n rows.
+     * opts.layout says which parts to build: the psi layout takes no
+     * run_tops, and the phi layout needs them.
      */
     TmsIndex(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
              const TmsBuildOptions& opts = TmsBuildOptions{}, const std::vector<ulint>* run_tops = nullptr) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+        if (opts.layout == TmsLayout::PSI && run_tops) throw std::invalid_argument("a psi layout takes no LCP values");
+        if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
+        has_psi_ = opts.layout != TmsLayout::PHI;
         // FL first, so that its encoding is freed before LF's is built.
-        fl_ = FL(Enc::fl_interval_encoding(heads, lens, opts.fl_split));
+        if (has_psi_) fl_ = FL(Enc::fl_interval_encoding(heads, lens, opts.fl_split));
         Enc lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
         const ulint lf_count = lf_enc.intervals();
         std::vector<typename LF::data_tuple> cols(lf_count);
-        {
+        if (has_psi_) {
             // Merge the two partitions of the rows: for each LF interval,
             // the FL interval holding its tail row and the offset within it.
             ulint l_pos = 0, f_pos = 0, f_int = 0;
@@ -129,53 +165,51 @@ public:
             has_phi_ = true;
             has_phi_inv_ = opts.phi_inv;
         }
-        lf_ = LF(lf_enc, cols);
+        // The columns of parts the index lacks hold zeros and take no bits.
+        lf_ = LF(lf_enc, cols, {!has_psi_, !has_psi_, !has_phi_, !has_phi_});
         compute_occurs();
         if (has_phi_inv_) build_start_tables();
     }
 
-    /** Write the index in Orbit's packed serialization, host byte order. */
+    /**
+     * Write the index in Orbit's packed serialization, host byte order: a
+     * header with the parts the index holds, LF, and then each part's
+     * structure present, FL, phi and phi_inv, after its size in bytes so
+     * that load() can skip it.
+     */
     size_t serialize(std::ostream& out) {
         size_t bytes = 0;
         out.write(MAGIC, 4);
-        const uint32_t v = VERSION, flags = (has_phi_ ? 1 : 0) | (has_phi_inv_ ? 2 : 0);
+        const uint32_t v = VERSION, flags = parts_flags(parts());
         out.write(reinterpret_cast<const char*>(&v), sizeof(v));
         out.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
         bytes += 12;
         bytes += lf_.serialize(out);
-        bytes += fl_.serialize(out);
-        if (has_phi_) bytes += phi_.serialize(out);
-        if (has_phi_inv_) bytes += phi_inv_.serialize(out);
+        if (has_psi_) bytes += serialize_sized(fl_, out);
+        if (has_phi_) bytes += serialize_sized(phi_, out);
+        if (has_phi_inv_) bytes += serialize_sized(phi_inv_, out);
         return bytes;
     }
 
-    /**
-     * Read an index written by serialize().  Throws on malformed input.
-     * phi_inv, which only SMEM enumeration uses, is read only if
-     * with_phi_inv; it is the last structure, so skipping it reads nothing
-     * more.
-     */
-    void load(std::istream& in, bool with_phi_inv = true) {
-        char magic[4] = {};
-        uint32_t v = 0, flags = 0;
-        in.read(magic, 4);
-        in.read(reinterpret_cast<char*>(&v), sizeof(v));
-        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
-        if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
-        lf_.load(in);
-        fl_.load(in);
-        has_phi_ = (flags & 1) != 0;
-        if (has_phi_) phi_.load(in);
-        has_phi_inv_ = with_phi_inv && (flags & 2) != 0;
-        if (has_phi_inv_) phi_inv_.load(in);
-        if (!in.good()) throw std::runtime_error("truncated tms index");
-        compute_occurs();
-        if (has_phi_inv_) build_start_tables();
-    }
+    /** Read an index written by serialize(), with every part it holds.  Throws on malformed input. */
+    void load(std::istream& in) { load(in, nullptr); }
 
+    /**
+     * Read an index written by serialize(), with only LF and the parts in
+     * need, seeking past the rest.  Throws, before reading LF, if the index
+     * lacks a part in need.
+     */
+    void load(std::istream& in, const TmsParts& need) { load(in, &need); }
+
+    bool has_psi() const { return has_psi_; }
     bool has_phi() const { return has_phi_; }
     bool has_phi_inv() const { return has_phi_inv_; }
+    /** The parts the index holds, or those loaded if load() skipped some. */
+    TmsParts parts() const { return TmsParts{has_psi_, has_phi_, has_phi_inv_}; }
+    /** The name of the layout with the given parts: full, psi, phi, or none (LF alone). */
+    static std::string layout_name(const TmsParts& p) {
+        return p.psi && p.phi ? "full" : p.psi ? "psi" : p.phi ? "phi" : "none";
+    }
 
     /** True if byte c occurs in the indexed text. */
     bool occurs(uchar c) const { return occurs_[c]; }
@@ -505,9 +539,12 @@ public:
     const LF& lf() const { return lf_; }
     const FL& fl() const { return fl_; }
 
-    /** The alphabet code of byte c in LF's and FL's character columns, or no_code if c does not occur. */
+    /**
+     * The alphabet code of byte c in LF's and FL's character columns, or
+     * no_code if c does not occur (or, for FL, if the index lacks psi).
+     */
     uchar lf_code(uchar c) { return occurs_[c] ? lf_.character_code(c).value_or(no_code) : no_code; }
-    uchar fl_code(uchar c) { return occurs_[c] ? fl_.character_code(c).value_or(no_code) : no_code; }
+    uchar fl_code(uchar c) { return occurs_[c] && has_psi_ ? fl_.character_code(c).value_or(no_code) : no_code; }
     static constexpr uchar no_code = 0xFF;
 
     /**
@@ -519,7 +556,8 @@ public:
      * and offset columns are read with one load, as are its character and
      * PSI columns, and an FL row is read whole with one load; fits() says
      * whether the index's column widths allow that.  Characters are alphabet
-     * codes (lf_code, fl_code).
+     * codes (lf_code, fl_code).  Without psi, the FL reader is empty and only
+     * the LF reads are valid.
      */
     struct PackedAccess {
         using LFRows = decltype(std::declval<const LF&>().get_reader());
@@ -538,11 +576,12 @@ public:
         static_assert(fl_len_col == 0 && fl_ptr_col <= 3 && fl_off_col <= 3 && fl_chr_col <= 3, "unexpected FL columns");
         LFRows lf;
         FLRows fl;
+        bool with_psi;
         using Row = ulint;
 
         bool fits() const {
             return lf.template span_fits<ptr_col, off_col>() && lf.template span_fits<chr_col, psi_off_col>() &&
-                   fl.template span_fits<0, 3>() && fl.offsets[0] == 0;
+                   (!with_psi || (fl.template span_fits<0, 3>() && fl.offsets[0] == 0));
         }
         Row row(ulint i) const { return lf.row_start(i); }
         ulint length(Row r) const { return lf.template get_at<len_col>(r); }
@@ -596,7 +635,9 @@ public:
         void prefetch_rows(ulint lo, ulint hi) const { lf.prefetch_rows(lo, hi); }
         void prefetch_psi(ulint i) const { fl.prefetch(i); }
     };
-    PackedAccess packed_access() const { return PackedAccess{lf_.get_reader(), fl_.get_reader()}; }
+    PackedAccess packed_access() const {
+        return PackedAccess{lf_.get_reader(), has_psi_ ? fl_.get_reader() : typename PackedAccess::FLRows{}, has_psi_};
+    }
 
     /** The same row access through the index's own column reads, with bytes for characters. */
     struct ColumnAccess {
@@ -618,20 +659,24 @@ public:
     };
     ColumnAccess column_access() { return ColumnAccess{this}; }
 
-    /** One line per structure: intervals and column widths in bits. */
+    /** The layout, then one line per structure: intervals and column widths in bits. */
     void describe(std::ostream& os) const {
         auto row_bits = [](const auto& w) { size_t b = 0; for (auto x : w) b += x; return b; };
         auto widths = [&](const auto& w) { for (size_t i = 0; i < w.size(); ++i) os << (i ? "," : "") << int(w[i]); };
+        os << "layout: " << layout_name(parts()) << (has_phi_ && !has_phi_inv_ ? " (without phi_inv)" : "") << "\n";
         const auto& w = lf_.get_widths();
         os << "LF: intervals=" << lf_.intervals() << " runs=" << lf_.runs() << " n=" << lf_.domain()
            << " widths(len,ptr,off,chr,psi_int,psi_off,phi_int,phi_off)=";
         widths(w);
         os << " row_bits=" << row_bits(w) << "\n";
-        const auto& fw = fl_.get_widths();
-        os << "FL: intervals=" << fl_.intervals() << " widths(len,ptr,off,chr)=";
-        widths(fw);
-        os << " row_bits=" << row_bits(fw) << "\n";
-        double total = double(row_bits(w)) * lf_.intervals() + double(row_bits(fw)) * fl_.intervals();
+        double total = double(row_bits(w)) * lf_.intervals();
+        if (has_psi_) {
+            const auto& fw = fl_.get_widths();
+            os << "FL: intervals=" << fl_.intervals() << " widths(len,ptr,off,chr)=";
+            widths(fw);
+            os << " row_bits=" << row_bits(fw) << "\n";
+            total += double(row_bits(fw)) * fl_.intervals();
+        }
         if (has_phi_) {
             const auto& pw = phi_.get_widths();
             os << "phi: intervals=" << phi_.intervals() << " widths(start,ptr,off,plcp)=";
@@ -651,13 +696,15 @@ public:
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 4;
+    static constexpr uint32_t VERSION = 5;
+    // Header flags for the parts an index holds.
+    static constexpr uint32_t FLAG_PHI = 1, FLAG_PHI_INV = 2, FLAG_PSI = 4;
 
     LF lf_;
     FL fl_;
     Phi phi_;
     PhiInv phi_inv_;
-    bool has_phi_ = false, has_phi_inv_ = false;
+    bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false;
     // Start tables of phi and phi_inv, built when phi_inv is present.
     StartTable phi_table_, phi_inv_table_;
     std::array<bool, 256> occurs_{};
@@ -665,9 +712,112 @@ private:
 
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
+    static uint32_t parts_flags(const TmsParts& p) {
+        return (p.phi ? FLAG_PHI : 0) | (p.phi_inv ? FLAG_PHI_INV : 0) | (p.psi ? FLAG_PSI : 0);
+    }
+
+    /** A stream buffer that counts the bytes written to it and keeps none. */
+    struct CountingBuf : std::streambuf {
+        size_t count = 0;
+        int_type overflow(int_type c) override {
+            if (!traits_type::eq_int_type(c, traits_type::eof())) ++count;
+            return traits_type::not_eof(c);
+        }
+        std::streamsize xsputn(const char*, std::streamsize n) override {
+            count += static_cast<size_t>(n);
+            return n;
+        }
+    };
+
+    /**
+     * Write x after its serialized size in bytes, as a uint64_t.  Returns the
+     * bytes written.  The size is counted from a first serialization rather
+     * than taken from serialize()'s return value, which for some Orbit
+     * structures leaves out a few bytes.
+     */
+    template <typename Structure>
+    static size_t serialize_sized(Structure& x, std::ostream& out) {
+        CountingBuf counter;
+        std::ostream sizing(&counter);
+        x.serialize(sizing);
+        const uint64_t size = counter.count;
+        out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        x.serialize(out);
+        return sizeof(size) + size;
+    }
+
+    /**
+     * Read a structure written by serialize_sized into x if want, else seek
+     * past it.  Throws if a read structure's size disagrees with the one
+     * recorded.
+     */
+    template <typename Structure>
+    static void load_sized(Structure& x, std::istream& in, bool want) {
+        uint64_t size = 0;
+        in.read(reinterpret_cast<char*>(&size), sizeof(size));
+        if (!in.good()) throw std::runtime_error("truncated tms index");
+        if (!want) {
+            in.seekg(static_cast<std::streamoff>(size), std::ios::cur);
+            if (!in.good()) {
+                // A stream that cannot seek reads past the structure instead.
+                in.clear();
+                in.ignore(static_cast<std::streamsize>(size));
+            }
+            return;
+        }
+        const std::streampos at = in.tellg();
+        x.load(in);
+        if (at != std::streampos(-1) && in.good() && static_cast<uint64_t>(in.tellg() - at) != size)
+            throw std::runtime_error("malformed tms index: a structure's size disagrees with its header");
+    }
+
+    /**
+     * load() with the parts in *need, or every part the index holds if need
+     * is null.  phi_inv, whose start tables take time to build, is read only
+     * with phi.
+     */
+    void load(std::istream& in, const TmsParts* need) {
+        char magic[4] = {};
+        uint32_t v = 0, flags = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&v), sizeof(v));
+        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
+        if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
+        const TmsParts held{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0};
+        const TmsParts want = need ? *need : held;
+        check_parts(held, want);
+        lf_.load(in);
+        has_psi_ = want.psi;
+        has_phi_ = want.phi;
+        has_phi_inv_ = want.phi && want.phi_inv;
+        if (held.psi) load_sized(fl_, in, has_psi_);
+        if (held.phi) load_sized(phi_, in, has_phi_);
+        if (held.phi_inv && has_phi_inv_) load_sized(phi_inv_, in, true);
+        if (!in.good()) throw std::runtime_error("truncated tms index");
+        compute_occurs();
+        if (has_phi_inv_) build_start_tables();
+    }
+
+    /** Throw, naming what is missing and how to build it, if an index with parts held lacks one in want. */
+    static void check_parts(const TmsParts& held, const TmsParts& want) {
+        std::string missing;
+        if (want.psi && !held.psi) missing = "psi (FL and the PSI columns)";
+        else if (want.phi && !held.phi) missing = "phi (phi and the PHI columns)";
+        else if (want.phi_inv && !held.phi_inv) missing = "phi_inv";
+        else return;
+        // The smallest layout with every part the query needs.
+        std::string build = want.psi && want.phi ? "full" : want.psi ? "psi or full" : "phi or full";
+        if (want.phi) build += ", with --minima or --lcp-bin";
+        if (want.phi_inv) build += " and without --no-phi-inv";
+        throw std::runtime_error("this query needs " + missing + ", which this index (layout " + layout_name(held) +
+                                 (held.phi && !held.phi_inv ? ", without phi_inv" : "") +
+                                 ") lacks; build one with tms-build --layout " + build);
+    }
+
     // Derived fields: whole-row FL reads, and which characters occur.
     void compute_occurs() {
-        fl_rows_fit_word_ = fl_.row_fits_word();
+        fl_rows_fit_word_ = has_psi_ && fl_.row_fits_word();
         occurs_.fill(false);
         for (ulint i = 0; i < lf_.intervals(); ++i) occurs_[lf_.get_character(i)] = true;
     }
