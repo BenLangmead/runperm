@@ -67,6 +67,45 @@ void test_packed_matrix_multi_column() {
     }
 }
 
+// Width-0 columns, between other columns and last, take no bits and read as
+// 0 through get, the reader, a span and a whole-row read, before and after a
+// serialize/load round trip.
+void test_packed_matrix_zero_width_columns() {
+    constexpr size_t NumCols = 4;
+    const array<uchar, NumCols> widths{7, 0, 9, 0};
+    const size_t rows = 50;
+    packed_matrix<NumCols> m(rows, widths);
+    for (size_t i = 0; i < rows; ++i) {
+        m.set<0>(i, (i * 3) & mask(7));
+        m.set<1>(i, 0);
+        m.set<2>(i, (i * 7 + 1) & mask(9));
+        m.set<3>(i, 0);
+    }
+    std::stringstream ss;
+    m.serialize(ss);
+    packed_matrix<NumCols> loaded;
+    loaded.load(ss);
+    for (const auto* x : {&m, &loaded}) {
+        assert(x->row_fits_word());
+        const auto rd = x->get_reader();
+        assert(rd.row_width == 16);
+        assert((rd.template span_fits<0, 3>()));
+        for (size_t i = 0; i < rows; ++i) {
+            const ulint a = (i * 3) & mask(7), b = (i * 7 + 1) & mask(9);
+            assert(x->template get<0>(i) == a && x->template get<1>(i) == 0);
+            assert(x->template get<2>(i) == b && x->template get<3>(i) == 0);
+            const size_t start = rd.row_start(i);
+            assert(rd.template get_at<1>(start) == 0 && rd.template get_at<3>(start) == 0);
+            const ulint span = rd.template get_span<0>(start);
+            assert((rd.template extract_span<0, 1>(span)) == 0 && (rd.template extract_span<0, 2>(span)) == b);
+            assert((rd.template extract_span<0, 3>(span)) == 0);
+            const ulint bits = x->get_row_bits(i);
+            assert(x->template extract<0>(bits) == a && x->template extract<1>(bits) == 0);
+            assert(x->template extract<2>(bits) == b && x->template extract<3>(bits) == 0);
+        }
+    }
+}
+
 // Round-trip serialize/load for int_vector.
 void test_int_vector_serialize_roundtrip() {
     const size_t rows = 50;
@@ -367,6 +406,7 @@ void test_packed_vector_aligned_with_enum() {
 int main() {
     test_packed_matrix_single_column();
     test_packed_matrix_multi_column();
+    test_packed_matrix_zero_width_columns();
     test_int_vector_serialize_roundtrip();
     test_int_vector_vector_ctor_non_empty();
     test_int_vector_vector_ctor_empty();

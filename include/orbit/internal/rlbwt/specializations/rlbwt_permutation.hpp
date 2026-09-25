@@ -55,16 +55,21 @@ public:
                   const split_params& sp = split_params()) 
     : rlbwt_permutation(rlbwt_heads, rlbwt_run_lengths, sp, std::vector<data_tuple>(rlbwt_heads.size())) {}
 
-    // Regular non-gated constructors for user defined data columns
+    using zero_width_columns = typename base::zero_width_columns;
+
+    // Regular non-gated constructors for user defined data columns.  Data
+    // columns marked in zero_width get width 0 and must hold only zeros (see
+    // permutation_impl).
     template<typename rlbwt_interval_encoding_t>
-    rlbwt_permutation(const rlbwt_interval_encoding_t& enc, const std::vector<data_tuple> &run_data) {
+    rlbwt_permutation(const rlbwt_interval_encoding_t& enc, const std::vector<data_tuple> &run_data,
+                      const zero_width_columns& zero_width = {}) {
         static_assert(std::is_same_v<alphabet_t, typename rlbwt_interval_encoding_t::alphabet_tag>, "alphabet_t must be the same as the alphabet type used to create the interval encoding");
 
         base::split_params_ = enc.get_split_params();
         alphabet_ = enc.get_alphabet();
         packed_vector<base_columns> base_structure = base::move_structure_base::find_structure(enc);
         if (run_data.size() == enc.intervals()) {
-            base::populate_structure(std::move(base_structure), run_data, enc.domain(), enc.runs());
+            base::populate_structure(std::move(base_structure), run_data, enc.domain(), enc.runs(), zero_width);
         }
         else if (run_data.size() == enc.runs()) {
             throw std::invalid_argument("Run data size is same as number of runs, not intervals after splitting; avoid splitting, manually split run data, or use permutation copy split.");

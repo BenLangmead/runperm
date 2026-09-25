@@ -57,6 +57,8 @@ protected:
 public:
     using data_columns = data_columns_t;
     using data_tuple = columns_tuple<data_columns>;
+    // For each data column, whether it gets width 0 (see the constructor from an encoding)
+    using zero_width_columns = std::array<bool, num_run_cols>;
     using position = typename move_structure_perm::position;
 
     // TODO use int_vector and container templates here
@@ -99,13 +101,16 @@ public:
     permutation_impl(const container1_t& lengths, const container2_t& images, const split_params& sp = split_params())
     : permutation_impl(lengths, images, sp, std::vector<data_tuple>(lengths.size())) {}
 
-    // Intended constructor for manual splitting of run data
+    // Intended constructor for manual splitting of run data.  Data columns
+    // marked in zero_width get width 0: they take no bits and read as 0, so
+    // their run data must be 0.
     template<typename interval_encoding_t>
-    permutation_impl(const interval_encoding_t& enc, const std::vector<data_tuple> &run_data) {
+    permutation_impl(const interval_encoding_t& enc, const std::vector<data_tuple> &run_data,
+                     const zero_width_columns& zero_width = {}) {
         split_params_ = enc.get_split_params();
         packed_vector<base_columns> base_structure = move_structure_base::find_structure(enc);
         if (run_data.size() == enc.intervals()) {
-            populate_structure(std::move(base_structure), run_data, enc.domain(), enc.runs());
+            populate_structure(std::move(base_structure), run_data, enc.domain(), enc.runs(), zero_width);
         }
         else if (run_data.size() == enc.runs()) {
             throw std::invalid_argument("Run data size is same as number of runs, not intervals after splitting; avoid splitting, manually split run data, or use permutation copy split.");
@@ -548,7 +553,8 @@ protected:
         return final_run_data;
     }
 
-    std::array<uchar, num_run_cols> get_data_cols_widths(const std::vector<data_tuple> &run_data) {
+    std::array<uchar, num_run_cols> get_data_cols_widths(const std::vector<data_tuple> &run_data,
+                                                         const zero_width_columns& zero_width = {}) {
         data_tuple max_value = {};
         std::array<uchar, num_run_cols> run_cols_widths = {};
         for (size_t i = 0; i < num_run_cols; ++i) {
@@ -557,7 +563,10 @@ protected:
             }
         }
         for (size_t i = 0; i < num_run_cols; ++i) {
-            run_cols_widths[i] = bit_width(max_value[i]);
+            if (zero_width[i] && max_value[i] != 0) {
+                throw std::invalid_argument("a zero-width data column must hold only zeros");
+            }
+            run_cols_widths[i] = zero_width[i] ? 0 : bit_width(max_value[i]);
         }
         return run_cols_widths;
     }
@@ -592,8 +601,9 @@ protected:
     }
 
     // Sets move structure and run data from the base structure and run data
-    void populate_structure(packed_vector<base_columns>&& base_structure, const std::vector<data_tuple>& run_data, const size_t domain, const size_t runs) {
-        auto run_cols_widths = this->get_data_cols_widths(run_data);
+    void populate_structure(packed_vector<base_columns>&& base_structure, const std::vector<data_tuple>& run_data, const size_t domain, const size_t runs,
+                            const zero_width_columns& zero_width = {}) {
+        auto run_cols_widths = this->get_data_cols_widths(run_data, zero_width);
         if constexpr (integrated_move_structure) {
             auto base_widths = base_structure.get_widths();
             auto widths = get_widths(base_widths, run_cols_widths);
