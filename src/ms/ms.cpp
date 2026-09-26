@@ -19,6 +19,7 @@
 #include "perf_counters.hpp"
 #include "parallel_blocks.hpp"
 #include "read_chunks.hpp"
+#include "format_int.hpp"
 #include <zlib.h>
 #include <iostream>
 #include <string>
@@ -370,7 +371,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         text += '\t';
         for (size_t i = 0; i < ms.size(); ++i) {
             if (i > 0) text += ' ';
-            text += std::to_string(ms[i]);
+            append_uint(text, ms[i]);
         }
         if constexpr (std::is_same_v<Index, TmsIndex>) {
             if (g_tms_positions) {
@@ -378,7 +379,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
                 const auto& pos = r.pos[j];
                 for (size_t i = 0; i < pos.size(); ++i) {
                     if (i > 0) text += ' ';
-                    text += pos[i] == TMS_NO_POS ? std::string("-1") : std::to_string(pos[i]);
+                    if (pos[i] == TMS_NO_POS) text += "-1";
+                    else append_uint(text, pos[i]);
                 }
             }
             if (g_tms_report != TmsReport::MS) {

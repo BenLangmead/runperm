@@ -29,6 +29,7 @@
 
 #include "tms_index.hpp"
 #include "tms_query.hpp"
+#include "format_int.hpp"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -321,17 +322,17 @@ inline void tms_format_smems(const TmsSmemHits& hits, TmsReport report, std::str
     for (size_t s = 0; s < hits.smems.size(); ++s) {
         const auto& h = hits.smems[s];
         if (s > 0) line += ' ';
-        line += std::to_string(h.start);
+        append_uint(line, h.start);
         line += ':';
-        line += std::to_string(h.len);
+        append_uint(line, h.len);
         line += ':';
         if (report == TmsReport::SMEM_ALL) {
-            line += std::to_string(h.count);
+            append_uint(line, h.count);
             line += ':';
         }
         for (ulint c = 0; c < h.listed; ++c) {
             if (c > 0) line += ',';
-            line += std::to_string(hits.pos[at++]);
+            append_uint(line, hits.pos[at++]);
         }
     }
 }
