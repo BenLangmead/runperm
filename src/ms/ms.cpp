@@ -419,6 +419,12 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
               << " lf_ff/step=" << double(tms_stats.lf_ff) / tms_stats.lf_steps
               << " walk_visits/base=" << double(tms_stats.walk_visits) / tms_stats.bases << "\n";
 #endif
+#ifdef MS_STATS
+    std::cerr << "stats: bases=" << n_bases << " repositions/base=" << double(ms_stats.repositions) / n_bases
+              << " lf_ff/step=" << double(ms_stats.lf_ff) / ms_stats.lf_steps
+              << " walk_up/rep=" << double(ms_stats.walk_up) / ms_stats.repositions
+              << " walk_down/rep=" << double(ms_stats.walk_down) / ms_stats.repositions << "\n";
+#endif
     perf.report(std::cerr, n_bases);
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases

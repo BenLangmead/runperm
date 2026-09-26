@@ -16,6 +16,11 @@ ms-bench: $(MS_SRCS) $(MS_HDRS)
 
 bench: ms-bench
 
+# Benchmark build that also counts LF fast-forward rows and reposition walk
+# lengths in ms batch (see MsStats), as ms-stats.
+ms-stats: $(MS_SRCS) $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -DNDEBUG -DMS_STATS -o ms-stats $(MS_SRCS)
+
 # Debug build: -O0 -g for breakpoints (e.g. lldb ./ms, then run test ../../data)
 debug: CXXFLAGS += -O0 -g
 debug: ms
@@ -31,4 +36,4 @@ test: ms
 all: ms
 
 clean:
-	rm -f ms ms-bench tms_chain_bench
+	rm -f ms ms-bench ms-stats tms_chain_bench

@@ -43,6 +43,21 @@
 using uchar = orbit::uchar;
 using ulint = orbit::ulint;
 
+#ifdef MS_STATS
+/**
+ * Counts from ms_query_batch, for builds with MS_STATS: LF steps and the rows
+ * their fast-forward skips, and repositions and the rows their walks up and
+ * down read.
+ */
+struct MsStats {
+    ulint lf_steps = 0, lf_ff = 0, repositions = 0, walk_up = 0, walk_down = 0;
+};
+inline MsStats ms_stats;
+#define MS_COUNT(field, v) (ms_stats.field += (v))
+#else
+#define MS_COUNT(field, v) ((void)0)
+#endif
+
 /**
  * Decide which interior LCP values of a run must be stored.  lcp[0] is the
  * run's top (boundary) LCP and lcp_next, if present, is the next run's LCP
@@ -1071,13 +1086,16 @@ reposition_target_impl(MSIndexSpillLCP<SP>& idx, const Access acc, ulint interva
     const uchar code = idx.code(c);
     ulint u = interval, d = interval;
     bool found_up = false, found_down = false;
+    MS_COUNT(repositions, 1);
     while (u > 0) {
+        MS_COUNT(walk_up, 1);
         const auto r = acc.row(--u);
         const auto t = acc.tail(r);
         if (acc.code(t) == code) { found_up = true; break; }
         min_up = std::min(min_up, row_min_lcp(idx, acc, r, t, u));
     }
     while (d < last_run) {
+        MS_COUNT(walk_down, 1);
         const auto r = acc.row(++d);
         const auto t = acc.tail(r);
         if (acc.code(t) == code) {
@@ -1235,7 +1253,9 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                 if constexpr (packed) {
                     ulint i = s.pos.interval, o = s.pos.offset;
                     r = acc.row(i);
+                    MS_COUNT(lf_steps, 1);
                     for (ulint len = acc.length(r); o >= len; len = acc.length(r)) {
+                        MS_COUNT(lf_ff, 1);
                         o -= len;
                         r = acc.row(++i);
                     }
