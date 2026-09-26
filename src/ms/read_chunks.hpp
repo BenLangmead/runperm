@@ -42,7 +42,51 @@ enum class ReadFormat { UNKNOWN, FASTA, FASTQ, PLAIN };
 /** A block of input bytes, shared by the chunks that point into it. */
 struct ReadSegment {
     std::unique_ptr<char[]> data;
-    size_t size = 0;
+    size_t size = 0, capacity = 0;
+};
+
+/**
+ * Segments no longer referenced by any chunk, for reuse, so that reading
+ * does not allocate and fault in fresh memory for every segment.  Chunks
+ * are released on the query threads, so the pool is locked.
+ */
+class ReadSegmentPool : public std::enable_shared_from_this<ReadSegmentPool> {
+public:
+    /** A segment of at least `capacity` bytes, returned here once unused. */
+    std::shared_ptr<ReadSegment> take(size_t capacity) {
+        std::unique_ptr<ReadSegment> seg;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t i = 0; i < free_.size(); ++i)
+                if (free_[i]->capacity >= capacity) {
+                    seg = std::move(free_[i]);
+                    free_[i] = std::move(free_.back());
+                    free_.pop_back();
+                    break;
+                }
+        }
+        if (!seg) {
+            seg.reset(new ReadSegment);
+            seg->data.reset(new char[capacity]);
+            seg->capacity = capacity;
+        }
+        seg->size = 0;
+        std::weak_ptr<ReadSegmentPool> pool = shared_from_this();
+        return std::shared_ptr<ReadSegment>(seg.release(), [pool](ReadSegment* s) {
+            if (auto p = pool.lock()) p->give(s);
+            else delete s;
+        });
+    }
+
+private:
+    // Keeps a bounded number of segments; the rest are freed.
+    void give(ReadSegment* s) {
+        std::unique_ptr<ReadSegment> seg(s);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (free_.size() < 64) free_.push_back(std::move(seg));
+    }
+    std::mutex mu_;
+    std::vector<std::unique_ptr<ReadSegment>> free_;
 };
 
 /** The bytes of whole records, and the number of records before them. */
@@ -254,8 +298,7 @@ private:
         // Reading at least as much as is carried keeps the copying of a
         // record longer than read_size linear in its length.
         const size_t want = std::max(read_size_, carry);
-        auto seg = std::make_shared<ReadSegment>();
-        seg->data.reset(new char[carry + want]);
+        auto seg = pool_->take(carry + want);
         if (carry > 0) std::memcpy(seg->data.get(), seg_->data.get() + pos_, carry);
         in_.read(seg->data.get() + carry, static_cast<std::streamsize>(want));
         const size_t got = static_cast<size_t>(in_.gcount());
@@ -284,6 +327,7 @@ private:
 
     std::istream& in_;
     size_t read_size_;
+    std::shared_ptr<ReadSegmentPool> pool_ = std::make_shared<ReadSegmentPool>();
     std::shared_ptr<ReadSegment> seg_;  // bytes [pos_, seg_->size) are unread
     size_t pos_ = 0;
     size_t count_ = 0;

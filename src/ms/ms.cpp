@@ -70,7 +70,7 @@ static void usage(const char* prog) {
               << "              read for tms-batch).  --threads T (or -p T) queries on T\n"
               << "              threads, each with its own K reads in flight (default 1; 0 uses\n"
               << "              every hardware thread).  Each thread takes a block of B reads at\n"
-              << "              a time (--block-reads, default max(1024, 64K)).  Results and\n"
+              << "              a time (--block-reads, default max(2048, 16K)).  Results and\n"
               << "              their order do not depend on K, T or B.  A summary goes to\n"
               << "              stderr: query_ns_per_base is the threads' summed query time per\n"
               << "              base, and wall_ns_per_base the elapsed time per base.\n"
@@ -292,9 +292,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 
     // A block ends at block_reads reads or once it holds block_bases bytes
     // of input, so that long reads do not make a block's per-base results
-    // large.  The
-    // default keeps K reads in flight for all but the end of a block.
-    if (block_reads == 0) block_reads = std::max<size_t>(1024, 64 * interleave);
+    // large.  The default keeps K reads in flight for all but the end of a
+    // block, and keeps blocks small enough to spread over many threads.
+    if (block_reads == 0) block_reads = std::max<size_t>(2048, 16 * interleave);
     constexpr size_t block_bases = size_t(1) << 24;
     ReadPrefetcher reads(*in, block_reads, block_bases, 2 * threads + 2);
 
@@ -331,7 +331,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         text += '\n';
     };
     struct Worker {
-        QueryResults r;
+        QueryResults r, one;
         PerfCounters perf;
         double query_s = 0.0;
         size_t reads = 0, bases = 0;
@@ -352,16 +352,29 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             w.query_s += std::chrono::duration<double>(clock::now() - tq).count();
         };
         if (interleave == 0) {
-            // One read at a time, without prefetching.
-            for (size_t j = 0; j < b.seqs.size(); ++j) {
-                timed([&] { query_one(idx, b.seqs[j], w.r); });
-                if (write_output) format(text, b.names[j], w.r, 0);
-            }
+            // One read at a time, without prefetching.  The block is timed
+            // as a whole, so that timing each read does not add to it.
+            const size_t n_reads = b.seqs.size();
+            timed([&] {
+                w.r.ms.resize(n_reads);
+                for (size_t j = 0; j < n_reads; ++j) {
+                    query_one(idx, b.seqs[j], w.one);
+                    w.r.ms[j] = std::move(w.one.ms[0]);
+                    if (!w.one.pos.empty()) {
+                        w.r.pos.resize(n_reads);
+                        w.r.pos[j] = std::move(w.one.pos[0]);
+                    }
+                    if (!w.one.hits.empty()) {
+                        w.r.hits.resize(n_reads);
+                        w.r.hits[j] = std::move(w.one.hits[0]);
+                    }
+                }
+            });
         } else {
             timed([&] { query_many(idx, b.seqs, interleave, w.r); });
-            if (write_output)
-                for (size_t j = 0; j < b.seqs.size(); ++j) format(text, b.names[j], w.r, j);
         }
+        if (write_output)
+            for (size_t j = 0; j < b.seqs.size(); ++j) format(text, b.names[j], w.r, j);
     };
     PerfCounters perf;
     double query_s = 0.0, wait_s = 0.0;
