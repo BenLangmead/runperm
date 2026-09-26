@@ -35,8 +35,16 @@
 
 #ifdef TMS_STATS
 struct TmsStats { ulint bases = 0, repositions = 0, psi_steps = 0, phi_steps = 0, scan_rows = 0, dist = 0, len_at_rep = 0, lce = 0, lce_capped = 0, dist1 = 0,
-                  lf_ff = 0, lf_steps = 0, scan_visits = 0, walk_visits = 0; };
-inline TmsStats tms_stats;
+                  lf_ff = 0, lf_steps = 0, scan_visits = 0, walk_visits = 0;
+                  TmsStats& operator+=(const TmsStats& o) {
+                      bases += o.bases; repositions += o.repositions; psi_steps += o.psi_steps; phi_steps += o.phi_steps;
+                      scan_rows += o.scan_rows; dist += o.dist; len_at_rep += o.len_at_rep; lce += o.lce;
+                      lce_capped += o.lce_capped; dist1 += o.dist1; lf_ff += o.lf_ff; lf_steps += o.lf_steps;
+                      scan_visits += o.scan_visits; walk_visits += o.walk_visits;
+                      return *this;
+                  } };
+// Each query thread counts into its own copy; the batch driver adds them up.
+inline thread_local TmsStats tms_stats;
 #define TMS_COUNT(field, v) (tms_stats.field += (v))
 #else
 #define TMS_COUNT(field, v) ((void)0)

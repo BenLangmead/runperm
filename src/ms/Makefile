@@ -1,6 +1,6 @@
 # MS application: build from project root with make -C src/ms
 CXX = g++
-CXXFLAGS = -std=c++17 -I../../include -I. -O3
+CXXFLAGS = -std=c++17 -I../../include -I. -O3 -pthread
 
 MS_SRCS = ms.cpp tsv.cpp ms_io.cpp ms_test.cpp inspect.cpp tms_test.cpp
 
@@ -29,9 +29,13 @@ debug: ms
 tms_chain_bench: tms_chain_bench.cpp $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp
 
-.PHONY: test all clean debug bench
+.PHONY: test test-threads all clean debug bench
 test: ms
 	./ms test ../../data
+
+# Output identity across interleave, thread count and block size
+test-threads: ms
+	./test_threads.sh ./ms ../../data
 
 all: ms
 

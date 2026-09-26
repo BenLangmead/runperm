@@ -4,7 +4,8 @@
  * as name=config pairs separated by commas, where config is a raw
  * perf_event config in hex (event | umask << 8 | cmask << 24 on Intel), or
  * one of the names cycles, instructions and branch-misses with no config.
- * Counting is for this thread in user mode only.  On systems without
+ * Counting is for the thread that constructs the object, in user mode
+ * only; add() sums the counts of several threads.  On systems without
  * perf_event_open, or with MS_PERF unset, nothing is counted.
  */
 
@@ -81,6 +82,12 @@ public:
             if (read(fds_[i], &v, sizeof(v)) == sizeof(v)) totals_[i] += v;
         }
 #endif
+    }
+    /** Adds o's totals to this one's, matching events by name. */
+    void add(const PerfCounters& o) {
+        for (size_t j = 0; j < o.names_.size(); ++j)
+            for (size_t i = 0; i < names_.size(); ++i)
+                if (names_[i] == o.names_[j]) totals_[i] += o.totals_[j];
     }
     /** One line with each event's count per base. */
     void report(std::ostream& os, size_t bases) const {

@@ -51,8 +51,14 @@ using ulint = orbit::ulint;
  */
 struct MsStats {
     ulint lf_steps = 0, lf_ff = 0, repositions = 0, walk_up = 0, walk_down = 0;
+    MsStats& operator+=(const MsStats& o) {
+        lf_steps += o.lf_steps; lf_ff += o.lf_ff; repositions += o.repositions;
+        walk_up += o.walk_up; walk_down += o.walk_down;
+        return *this;
+    }
 };
-inline MsStats ms_stats;
+// Each query thread counts into its own copy; the batch driver adds them up.
+inline thread_local MsStats ms_stats;
 #define MS_COUNT(field, v) (ms_stats.field += (v))
 #else
 #define MS_COUNT(field, v) ((void)0)
