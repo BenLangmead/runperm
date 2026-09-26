@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstring>
 #include <istream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -144,15 +145,16 @@ public:
         using namespace read_chunks_detail;
         // Drop the bytes of earlier chunks once they are most of the
         // buffer, so each byte is moved at most about once.
-        if (pos_ > buf_.size() / 2) {
-            buf_.erase(0, pos_);
+        if (pos_ > size_ / 2) {
+            std::memmove(buf_.get(), buf_.get() + pos_, size_ - pos_);
+            size_ -= pos_;
             pos_ = 0;
         }
         if (format_ == ReadFormat::UNKNOWN && !detect()) return false;
         const size_t start = pos_;
         size_t at = pos_, records = 0;
         size_t lb, le;
-        auto blank = [&](size_t b, size_t e) { return content_len(buf_.data() + b, buf_.data() + e) == 0; };
+        auto blank = [&](size_t b, size_t e) { return content_len(buf_.get() + b, buf_.get() + e) == 0; };
         while (records < max_records && at - start < max_bytes) {
             if (format_ == ReadFormat::PLAIN) {
                 if (!line(at, lb, le)) break;
@@ -189,7 +191,7 @@ public:
             pos_ = at;
             return false;
         }
-        c.bytes.assign(buf_.data() + start, at - start);
+        c.bytes.assign(buf_.get() + start, at - start);
         c.first = count_;
         c.format = format_;
         count_ += records;
@@ -202,32 +204,37 @@ private:
     // end of the input.  Reads more input as needed.  False at the end.
     bool line(size_t b, size_t& lb, size_t& le) {
         for (;;) {
-            if (b < buf_.size()) {
-                const void* nl = std::memchr(buf_.data() + b, '\n', buf_.size() - b);
+            if (b < size_) {
+                const void* nl = std::memchr(buf_.get() + b, '\n', size_ - b);
                 if (nl) {
                     lb = b;
-                    le = size_t(static_cast<const char*>(nl) - buf_.data());
+                    le = size_t(static_cast<const char*>(nl) - buf_.get());
                     return true;
                 }
             }
             if (eof_) {
-                if (b >= buf_.size()) return false;
+                if (b >= size_) return false;
                 lb = b;
-                le = buf_.size();
+                le = size_;
                 return true;
             }
             fill();
         }
     }
-    size_t after(size_t le) const { return le < buf_.size() ? le + 1 : le; }
+    size_t after(size_t le) const { return le < size_ ? le + 1 : le; }
 
     // Appends up to read_size bytes of input to the buffer.
     void fill() {
-        const size_t old = buf_.size();
-        buf_.resize(old + read_size_);
-        in_.read(&buf_[old], static_cast<std::streamsize>(read_size_));
+        if (size_ + read_size_ > cap_) {
+            const size_t cap = std::max(2 * cap_, size_ + read_size_);
+            std::unique_ptr<char[]> b(new char[cap]);
+            if (size_ > 0) std::memcpy(b.get(), buf_.get(), size_);
+            buf_ = std::move(b);
+            cap_ = cap;
+        }
+        in_.read(buf_.get() + size_, static_cast<std::streamsize>(read_size_));
         const size_t got = static_cast<size_t>(in_.gcount());
-        buf_.resize(old + got);
+        size_ += got;
         if (got < read_size_) eof_ = true;
     }
 
@@ -235,7 +242,7 @@ private:
     bool detect() {
         size_t at = pos_, lb, le;
         while (line(at, lb, le)) {
-            if (read_chunks_detail::content_len(buf_.data() + lb, buf_.data() + le) > 0) {
+            if (read_chunks_detail::content_len(buf_.get() + lb, buf_.get() + le) > 0) {
                 const char c = buf_[lb];
                 format_ = c == '>' ? ReadFormat::FASTA : c == '@' ? ReadFormat::FASTQ : ReadFormat::PLAIN;
                 return true;
@@ -247,7 +254,8 @@ private:
 
     std::istream& in_;
     size_t read_size_;
-    std::string buf_;
+    std::unique_ptr<char[]> buf_;  // input bytes [0, size_), of which [pos_, size_) are unread
+    size_t size_ = 0, cap_ = 0;
     size_t pos_ = 0;
     size_t count_ = 0;
     bool eof_ = false;
