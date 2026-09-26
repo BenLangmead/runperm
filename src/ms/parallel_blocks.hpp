@@ -11,6 +11,9 @@
  * A thread waits before reading a new block only when that block would be
  * more than max_ahead blocks past the next one to write, which bounds the
  * memory held by finished blocks when one block is slow.
+ *
+ * Threads are not pinned to cores; on machines with several memory nodes,
+ * place memory with the operating system's tools (see the usage text).
  */
 
 #ifndef _PARALLEL_BLOCKS_HPP
@@ -25,12 +28,27 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 /**
- * Number of threads for a --threads value: n itself when positive, else
- * the hardware's thread count (1 if it is unknown).
+ * Number of threads for a --threads value: n itself when positive, else the
+ * number of CPUs this process may run on.  On Linux that is the affinity
+ * mask, which schedulers such as Slurm and tools such as taskset and
+ * numactl narrow; elsewhere it is the hardware's thread count (1 if it is
+ * unknown).
  */
 inline size_t resolve_thread_count(size_t n) {
     if (n > 0) return n;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int c = CPU_COUNT(&set);
+        if (c > 0) return static_cast<size_t>(c);
+    }
+#endif
     const unsigned hw = std::thread::hardware_concurrency();
     return hw > 0 ? hw : 1;
 }
