@@ -11,11 +11,14 @@
 #include "serialize.hpp"
 #include "tsv.hpp"
 #include "rlbwt_io.hpp"
+#include "tms_test.hpp"
 #include <cstdio>
 #include <iostream>
 #include <cassert>
 #include <cstdio>
 #include <functional>
+#include <optional>
+#include <stdexcept>
 #include <random>
 #include <string>
 #include <utility>
@@ -28,6 +31,22 @@ namespace {
  * values are preserved; the output is simply the list of all decoded integers
  * in the order in which they appear in the buffer.
  */
+/**
+ * A reference index whose rows are the runs, after any LCP splitting, with
+ * no LF splitting: the LCP probes relate its rows to the TSV's runs, and
+ * test_lf_split compares split indexes with it.  Builds for users always
+ * split LF.
+ */
+static MSIndexSpillLCP<false> unsplit_index(std::vector<uchar> heads, std::vector<ulint> lens,
+                                            std::vector<std::vector<ulint>> lcps, const ms_io::BuildOptions& o) {
+    apply_lcp_splitting(heads, lens, lcps, o.split_threshold, o.minima_only);
+    auto [run_data, spill, max_top, max_sub, skinny, jumbo] = build_spill_data_from_pairs(
+        retained_lcp_pairs(lcps, o.minima_only), o.percentile_k, o.coalesce, false, o.spill_align,
+        o.spill_split_bits);
+    return MSIndexSpillLCP<false>(heads, lens, run_data, std::move(spill), max_top, max_sub, o.spill_align,
+                                  o.spill_split_bits);
+}
+
 /** Reconstruct the original text by LF-walking from first() for n steps. */
 static std::string reconstruct_text(MSIndexSpillLCP<false>& idx) {
     std::string t;
@@ -840,6 +859,160 @@ bool test_index_types_consistency(const std::string& data_dir) {
     return true;
 }
 
+/** An RLBWT with each run's full LCP vector, and a name for messages. */
+struct LfSplitInput {
+    std::string name;
+    std::vector<uchar> heads;
+    std::vector<ulint> lens;
+    std::vector<std::vector<ulint>> lcps;
+};
+
+/**
+ * An index from each run's retained LCP pairs, cut into LF rows with sp, or
+ * with rows the runs if sp is not given (a reference, as unsplit_index).
+ */
+static MSIndexSpillLCP<false> index_from_pairs(std::vector<uchar> heads, std::vector<ulint> lens,
+                                               std::vector<RunLcpPairs> pairs, const ms_io::BuildOptions& o,
+                                               std::optional<orbit::split_params> sp) {
+    if (sp) apply_lf_splitting(heads, lens, pairs, *sp, true);
+    auto [run_data, spill, max_top, max_sub, skinny, jumbo] = build_spill_data_from_pairs(
+        std::move(pairs), o.percentile_k, o.coalesce, false, o.spill_align, o.spill_split_bits);
+    return MSIndexSpillLCP<false>(heads, lens, run_data, std::move(spill), max_top, max_sub, o.spill_align,
+                                  o.spill_split_bits);
+}
+
+/**
+ * Check that a split index gives exactly what the unsplit one does: the same
+ * text read back with LF, and the same matching statistics from ms_query and
+ * from ms_query_batch with several patterns in flight, on patterns from the
+ * text with substitutions, N and bytes absent from the text.
+ */
+static bool same_answers(MSIndexSpillLCP<false>& unsplit, MSIndexSpillLCP<false>& split, std::mt19937& rng) {
+    const std::string T = reconstruct_text(unsplit);
+    if (reconstruct_text(split) != T) return false;
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    const double rates[] = {0.0, 0.01, 0.05, 0.3, 1.0};
+    std::vector<std::string> patterns;
+    for (int k = 0; k < 120; ++k) {
+        const size_t len = std::min<size_t>(T.size(), (k % 40 == 0) ? 0 : (k % 40 == 1) ? 1 : rng() % 150);
+        std::string P = T.substr(rng() % (T.size() - len + 1), len);
+        for (auto& c : P)
+            if (unif(rng) < rates[k % 5] || static_cast<uchar>(c) < 'A') c = "ACGT"[rng() % 4];
+        if (k % 7 == 0 && !P.empty()) P[rng() % P.size()] = 'N';
+        if (k % 11 == 0 && !P.empty()) P[rng() % P.size()] = 'X';
+        patterns.push_back(std::move(P));
+    }
+    std::vector<std::vector<ulint>> want;
+    for (const auto& P : patterns) {
+        want.push_back(ms_query(unsplit, P));
+        if (ms_query(split, P) != want.back()) return false;
+    }
+    for (size_t k : {1, 8, 32}) {
+        std::vector<std::vector<ulint>> got;
+        ms_query_batch(split, patterns, k, got);
+        if (got != want) return false;
+    }
+    return true;
+}
+
+/**
+ * LF splitting (apply_lf_splitting) must not change any result.  On the fuzz
+ * texts and minishred, for several LF splits and build options, compare split
+ * indexes, built from full LCPs as build does and from minima-only retained
+ * pairs as build-rlbwt does with a minima file, with unsplit references.
+ * Without LCP splitting, the split index's rows must be Orbit's LF intervals.
+ * Split parameters that do not split are refused.
+ */
+bool test_lf_split(const std::string& data_dir) {
+    std::cout << "Testing LF splitting against unsplit indexes" << std::endl;
+    std::vector<LfSplitInput> inputs;
+    std::mt19937 rng(2027);
+    for (const auto& s : tms_test::fuzz_texts(rng)) {
+        auto t = tms_test::make_text_bwt(s);
+        inputs.push_back({"fuzz text of length " + std::to_string(s.size()), t.heads, t.lens, t.lcps_per_run});
+    }
+    {
+        LfSplitInput in{"minishred", {}, {}, {}};
+        if (!tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", in.heads, in.lens, in.lcps)) {
+            std::cout << "  DID NOT RUN" << std::endl;
+            return false;
+        }
+        inputs.push_back(std::move(in));
+    }
+    struct Config { const char* name; ms_io::BuildOptions opts; };
+    std::vector<Config> configs(4);
+    configs[0].name = "base";
+    configs[1].name = "minima+pk0.9+coalesce+splitbits6";
+    configs[1].opts.minima_only = true; configs[1].opts.percentile_k = 0.9;
+    configs[1].opts.coalesce = true; configs[1].opts.spill_split_bits = 6;
+    configs[2].name = "coalesce+split1+align4";
+    configs[2].opts.coalesce = true; configs[2].opts.split_threshold = 1; configs[2].opts.spill_align = 4;
+    configs[3].name = "minima+split1+align8+splitbits2";
+    configs[3].opts.minima_only = true; configs[3].opts.split_threshold = 1;
+    configs[3].opts.spill_align = 8; configs[3].opts.spill_split_bits = 2;
+    const std::vector<std::pair<const char*, orbit::split_params>> splits = {
+        {"default", orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, orbit::DEFAULT_BALANCING)},
+        {"balance2", orbit::split_params(std::nullopt, 2)},
+        {"cap8", orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, std::nullopt)},
+        {"cap2+balance4", orbit::split_params(2.0, 4)},
+    };
+    bool refused = false;
+    try {
+        ms_io::BuildOptions o;
+        o.lf_split = orbit::NO_SPLITTING;
+        ms_io::build_ms_index_spill(inputs[0].heads, inputs[0].lens, inputs[0].lcps, o);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    assert(refused && "unsplit LF must be refused");
+    size_t checks = 0, more_rows = 0;
+    for (const auto& in : inputs) {
+        for (const auto& cfg : configs) {
+            auto unsplit = unsplit_index(in.heads, in.lens, in.lcps, cfg.opts);
+            for (const auto& [sname, sp] : splits) {
+                ms_io::BuildOptions o = cfg.opts;
+                o.lf_split = sp;
+                auto split = ms_io::build_ms_index_spill(in.heads, in.lens, in.lcps, o);
+                if (o.split_threshold == SPLIT_THRESHOLD_NEVER &&
+                    split.move_runs() != lf_split_row_lengths(in.heads, in.lens, sp).size()) {
+                    std::cout << "  FAILED: rows are not Orbit's LF intervals for " << in.name << ", " << cfg.name
+                              << ", " << sname << std::endl;
+                    assert(false && "split rows must be Orbit's LF intervals");
+                    return false;
+                }
+                more_rows += split.move_runs() > unsplit.move_runs();
+                // Every split cuts some of minishred's runs, so that it
+                // tests rows cut from inside runs.
+                assert((&in != &inputs.back() || split.move_runs() > unsplit.move_runs()) &&
+                       "LF splitting must cut some of minishred's runs");
+                if (!same_answers(unsplit, split, rng)) {
+                    std::cout << "  FAILED for " << in.name << ", " << cfg.name << ", " << sname << std::endl;
+                    assert(false && "a split index must answer as the unsplit one does");
+                    return false;
+                }
+                ++checks;
+            }
+        }
+        // The minima file path, whose pairs lack the LCPs inside runs.
+        ms_io::BuildOptions o = configs[1].opts;
+        const auto pairs = retained_lcp_pairs(in.lcps, true);
+        auto unsplit = index_from_pairs(in.heads, in.lens, pairs, o, std::nullopt);
+        for (const auto& [sname, sp] : splits) {
+            auto split = index_from_pairs(in.heads, in.lens, pairs, o, sp);
+            more_rows += split.move_runs() > unsplit.move_runs();
+            if (!same_answers(unsplit, split, rng)) {
+                std::cout << "  FAILED for " << in.name << ", minima pairs, " << sname << std::endl;
+                assert(false && "a split index from minima must answer as the unsplit one does");
+                return false;
+            }
+            ++checks;
+        }
+    }
+    std::cout << "  " << checks << " split indexes on " << inputs.size() << " inputs PASSED (" << more_rows
+              << " with more rows than runs)" << std::endl;
+    return true;
+}
+
 }  // anonymous namespace
 
 namespace ms_test {
@@ -885,6 +1058,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_index_file_roundtrip(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_ms_query_batch(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!test_lf_split(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (all_ran) {
         std::cout << "All ms_test checks PASSED" << std::endl;
@@ -1091,11 +1266,8 @@ bool run_probe_lcp_queries(const std::string& data_dir, size_t first_row, size_t
         std::cerr << "Failed to load TSV" << std::endl;
         return false;
     }
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{});
-    if (!idx) {
-        std::cerr << "Failed to build base index" << std::endl;
-        return false;
-    }
+    auto idx = std::optional<MSIndexSpillLCP<false>>(
+        unsplit_index(bwt_heads, bwt_run_lengths, lcps_per_run, ms_io::BuildOptions{}));
     const size_t offset = 2;  /* the offset from the trace */
     std::cout << "LCP probe: base index, rows " << first_row << "-" << last_row
               << ", offset=" << offset << std::endl;

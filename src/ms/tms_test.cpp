@@ -145,7 +145,8 @@ void check_phi(const TextBwt& t, const orbit::split_params& sp) {
     }
 }
 
-/** Texts from the families that found bugs in TeraMS, plus haplotype sets. */
+}  // namespace
+
 std::vector<std::string> fuzz_texts(std::mt19937& rng) {
     std::vector<std::string> texts;
     auto rnd = [&](size_t len, const char* alpha, size_t k) {
@@ -185,6 +186,8 @@ std::vector<std::string> fuzz_texts(std::mt19937& rng) {
     for (int k = 0; k < 4; ++k) texts.push_back(rnd(2000, "ACGT", 4));
     return texts;
 }
+
+namespace {
 
 /** Patterns drawn from T with mutations, some with N or absent bytes. */
 std::vector<std::string> fuzz_patterns(const std::string& T, std::mt19937& rng, int count) {

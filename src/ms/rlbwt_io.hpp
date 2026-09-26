@@ -16,6 +16,7 @@
 
 #include "orbit/common.hpp"
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -173,6 +174,47 @@ inline bool read_minima(const std::string& path, size_t expected_runs, ulint exp
     unsigned char extra;
     if (byte(extra)) { err = "trailing bytes after the last record"; return false; }
     if (pairs_seen != total_pairs) { err = "pair count does not match the header"; return false; }
+    return true;
+}
+
+/**
+ * Read a file of one little-endian 64-bit LCP value per BWT row, optionally
+ * after a 64-bit row count (msbench prep's form), and call f(i, values) for
+ * each run i in order, with values holding its rows' LCPs.  lens gives the
+ * runs' lengths.  On failure returns false and sets err.
+ */
+template <typename F>
+inline bool for_each_run_lcps(const std::string& path, const std::vector<ulint>& lens, F f, std::string& err) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in.good()) { err = "cannot open " + path; return false; }
+    ulint n = 0;
+    for (ulint l : lens) n += l;
+    const ulint bytes = static_cast<ulint>(in.tellg());
+    in.seekg(0);
+    if (bytes == 8 * (n + 1)) {
+        uint64_t count = 0;
+        in.read(reinterpret_cast<char*>(&count), 8);
+        if (count != n) { err = "lcp file count " + std::to_string(count) + " is not n = " + std::to_string(n); return false; }
+    } else if (bytes != 8 * n) {
+        err = "lcp file has " + std::to_string(bytes) + " bytes; expected 8 per row for n = " + std::to_string(n);
+        return false;
+    }
+    std::vector<uint64_t> buf(1 << 20);
+    size_t have = 0, at = 0;
+    std::vector<ulint> values;
+    for (size_t i = 0; i < lens.size(); ++i) {
+        values.resize(static_cast<size_t>(lens[i]));
+        for (auto& v : values) {
+            if (at == have) {
+                in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 8));
+                have = static_cast<size_t>(in.gcount()) / 8;
+                at = 0;
+                if (have == 0) { err = "lcp file is shorter than the RLBWT"; return false; }
+            }
+            v = buf[at++];
+        }
+        f(i, values);
+    }
     return true;
 }
 

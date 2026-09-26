@@ -35,12 +35,22 @@ static void usage(const char* prog) {
               << "Main commands:\n"
               << "  build      TSV_PATH INDEX_PATH [--percentile K] [--split-threshold N]\n"
               << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
-              << "            [--minima-only]\n"
-              << "              Build index from TSV.\n"
-              << "  build-rlbwt HEADS LENS MINIMA INDEX_PATH [--percentile K]\n"
-              << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
+              << "            [--minima-only] [--lf-split B]\n"
+              << "              Build index from TSV.  LF is always split: the rows (runs, or\n"
+              << "              their pieces after --split-threshold) are cut into LF intervals\n"
+              << "              with Orbit's default length capping and balancing, each with\n"
+              << "              its own LCP data.  --lf-split B sets the balancing factor\n"
+              << "              (default: Orbit's default balancing); it must be positive.\n"
+              << "              Results do not depend on B.\n"
+              << "  build-rlbwt HEADS LENS INDEX_PATH (--minima FILE | --lcp-bin FILE)\n"
+              << "            [--minima-only] [--percentile K] [--coalesce-spillover]\n"
+              << "            [--spill-align N] [--spill-split-bits X] [--lf-split B]\n"
               << "              Build index from an RLBWT (HEADS: one byte per run; LENS:\n"
-              << "              fixed-width little-endian lengths) and a TeraLCP -ominima file.\n"
+              << "              fixed-width little-endian lengths) and either a TeraLCP\n"
+              << "              -ominima file, which keeps only the LCP minima that queries\n"
+              << "              need, or --lcp-bin, one 64-bit LCP per row, optionally after a\n"
+              << "              64-bit row count.  --minima-only applies to --lcp-bin as to\n"
+              << "              build.  --lf-split as for build.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
@@ -180,6 +190,26 @@ private:
     int format_ = 0;  // 1 FASTA, 2 FASTQ, 3 plain
     size_t count_ = 0;
 };
+
+/**
+ * The split parameters for --lf-split or --phi-split B: Orbit's default
+ * length capping and balancing factor B, or none for B = 0.
+ */
+static orbit::split_params split_arg(const char* v) {
+    const ulint b = std::stoull(v);
+    return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
+}
+
+/**
+ * Parse --lf-split's value into sp.  Returns false, after saying why, for 0:
+ * LF is always split.
+ */
+static bool lf_split_arg(const char* v, orbit::split_params& sp) {
+    sp = split_arg(v);
+    if (sp != orbit::NO_SPLITTING) return true;
+    std::cerr << "--lf-split must be positive: LF is always split and balanced\n";
+    return false;
+}
 
 static std::vector<ulint> query_one(MSIndexSpillLCP<false>& idx, const std::string& s) { return ms_query(idx, s); }
 static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::string>& p, size_t k,
@@ -476,6 +506,7 @@ int main(int argc, char** argv) {
         ulint spill_align = 0;
         uchar spill_split_bits = 0;
         bool minima_only = false;
+        orbit::split_params lf_split;
         for (int i = 2; i < argc; ++i) {
             if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) {
                 percentile_k = std::stod(argv[++i]);
@@ -489,6 +520,8 @@ int main(int argc, char** argv) {
                 spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
             } else if (strcmp(argv[i], "--minima-only") == 0) {
                 minima_only = true;
+            } else if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
+                if (!lf_split_arg(argv[++i], lf_split)) return 1;
             } else {
                 std::cerr << "Unknown build option: " << argv[i] << "\n";
                 return 1;
@@ -501,15 +534,20 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to load TSV: " << tsv_path << "\n";
             return 1;
         }
+        const size_t runs = bwt_heads.size();
         apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, split_threshold, minima_only);
-        auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
-            build_spill_data(lcps_per_run, percentile_k, coalesce, false /* coalesce_lcp_separately */, split_threshold, spill_align, spill_split_bits, minima_only);
+        auto pairs = retained_lcp_pairs(lcps_per_run, minima_only);
+        std::vector<std::vector<ulint>>().swap(lcps_per_run);
+        apply_lf_splitting(bwt_heads, bwt_run_lengths, pairs, lf_split, minima_only);
+        auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] = build_spill_data_from_pairs(
+            std::move(pairs), percentile_k, coalesce, false /* coalesce_lcp_separately */, spill_align, spill_split_bits);
         MSIndexSpillLCP<false> idx(bwt_heads, bwt_run_lengths, run_data, std::move(spill_vectors), max_top, max_sub, spill_align, spill_split_bits);
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
-        std::cout << "Built index: " << idx_path << " (skinny=" << skinny_count << ", jumbo=" << jumbo_count << ")\n";
+        std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs()
+                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ")\n";
         return 0;
     }
 
@@ -536,23 +574,39 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "build-rlbwt") {
-        if (argc < 4) {
-            std::cerr << "build-rlbwt requires HEADS, LENS, MINIMA and INDEX_PATH\n";
+        if (argc < 3) {
+            std::cerr << "build-rlbwt requires HEADS, LENS and INDEX_PATH\n";
             return 1;
         }
-        const std::string heads_path = argv[0], lens_path = argv[1], minima_path = argv[2], idx_path = argv[3];
+        const std::string heads_path = argv[0], lens_path = argv[1], idx_path = argv[2];
+        std::string minima_path, lcp_bin_path;
         double percentile_k = 0.98;
-        bool coalesce = false;
+        bool coalesce = false, minima_only = false;
         ulint spill_align = 0;
         uchar spill_split_bits = 0;
-        for (int i = 4; i < argc; ++i) {
-            if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) percentile_k = std::stod(argv[++i]);
+        orbit::split_params lf_split;
+        for (int i = 3; i < argc; ++i) {
+            if (strcmp(argv[i], "--minima") == 0 && i + 1 < argc) minima_path = argv[++i];
+            else if (strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) lcp_bin_path = argv[++i];
+            else if (strcmp(argv[i], "--minima-only") == 0) minima_only = true;
+            else if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) percentile_k = std::stod(argv[++i]);
             else if (strcmp(argv[i], "--coalesce-spillover") == 0) coalesce = true;
             else if (strcmp(argv[i], "--spill-align") == 0 && i + 1 < argc) spill_align = std::stoull(argv[++i]);
             else if (strcmp(argv[i], "--spill-split-bits") == 0 && i + 1 < argc)
                 spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
+            else if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
+                if (!lf_split_arg(argv[++i], lf_split)) return 1;
+            }
             else { std::cerr << "Unknown build-rlbwt option: " << argv[i] << "\n"; return 1; }
         }
+        if (minima_path.empty() == lcp_bin_path.empty()) {
+            std::cerr << "build-rlbwt needs exactly one of --minima and --lcp-bin\n";
+            return 1;
+        }
+        // A minima file holds only the minima, so it is minima-only by nature.
+        if (!minima_path.empty()) minima_only = true;
+        using clock = std::chrono::steady_clock;
+        auto t0 = clock::now();
         std::vector<uchar> heads;
         std::vector<ulint> lens;
         std::vector<RunLcpPairs> pairs;
@@ -563,20 +617,46 @@ int main(int argc, char** argv) {
         }
         ulint n = 0;
         for (ulint l : lens) n += l;
-        if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
-            std::cerr << "Failed to load minima: " << err << "\n";
-            return 1;
+        if (!minima_path.empty()) {
+            if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
+                std::cerr << "Failed to load minima: " << err << "\n";
+                return 1;
+            }
+        } else {
+            // Which interior values a run keeps depends on the next run's top,
+            // so each run's pairs are made once the next run is read.
+            pairs.resize(heads.size());
+            std::vector<ulint> prev, kept;
+            auto finish = [&](size_t i, const std::vector<ulint>* next) {
+                compress_lcps(prev, next, kept, minima_only);
+                pairs[i] = detail::compressed_to_pairs(kept);
+            };
+            const bool ok = rlbwt_io::for_each_run_lcps(lcp_bin_path, lens, [&](size_t i, const std::vector<ulint>& v) {
+                if (i > 0) finish(i - 1, &v);
+                prev = v;
+            }, err);
+            if (!ok) {
+                std::cerr << "Failed to load LCPs: " << err << "\n";
+                return 1;
+            }
+            finish(heads.size() - 1, nullptr);
         }
+        const size_t runs = heads.size();
+        const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+        auto t1 = clock::now();
+        apply_lf_splitting(heads, lens, pairs, lf_split, minima_only);
         auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
             build_spill_data_from_pairs(std::move(pairs), percentile_k, coalesce, false, spill_align, spill_split_bits);
         MSIndexSpillLCP<false> idx(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub, spill_align,
                                    spill_split_bits);
+        const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
-        std::cout << "Built index: " << idx_path << " (runs=" << heads.size() << ", n=" << n
-                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ")\n";
+        std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs() << ", n=" << n
+                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ", load_s=" << load_s
+                  << ", build_s=" << build_s << ")\n";
         return 0;
     }
 
@@ -603,17 +683,9 @@ int main(int argc, char** argv) {
         TmsBuildOptions opts;
         bool with_phi = false;
         std::string minima_path, lcp_bin_path;
-        auto split_arg = [](const char* v) {
-            const ulint b = std::stoull(v);
-            return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
-        };
         for (int i = npos; i < argc; ++i) {
             if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
-                opts.lf_split = split_arg(argv[++i]);
-                if (opts.lf_split == orbit::NO_SPLITTING) {
-                    std::cerr << "--lf-split must be positive: LF is always split and balanced\n";
-                    return 1;
-                }
+                if (!lf_split_arg(argv[++i], opts.lf_split)) return 1;
             }
             else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
             else if (strcmp(argv[i], "--no-phi-inv") == 0) opts.phi_inv = false;

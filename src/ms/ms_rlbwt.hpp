@@ -10,7 +10,9 @@
  *
  * Has facilities for splitting rows so that minimal or near-minimal LCPs can
  * be used as run boundaries to the maximum degree possible.  This in turn
- * allows for more compression of interior LCPs.
+ * allows for more compression of interior LCPs.  The rows are then cut into
+ * Orbit's split and balanced LF intervals (apply_lf_splitting), which keeps
+ * each LF step's fast-forward short and the length and offset columns narrow.
  *
  * Author: Ben Langmead (ben.langmead@gmail.com)
  * Date: Feb 17, 2026
@@ -31,6 +33,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <array>
 #include <tuple>
 #include <random>
@@ -317,6 +320,146 @@ retained_lcp_pairs(const std::vector<std::vector<ulint>>& lcps_per_run, bool min
         all_pairs[i] = detail::compressed_to_pairs(full);
     }
     return all_pairs;
+}
+
+/**
+ * Keep only the pairs of one row's retained LCPs (element 0 its top) that a
+ * query can need, by the rule of lcp_keep_mask, where bottom is the top LCP
+ * of the row below, if there is one.  The offsets without a pair count as
+ * holding values above every stored one.
+ */
+inline void prune_lcp_pairs(RunLcpPairs& p, std::optional<ulint> bottom, bool minima_only) {
+    if (p.size() < 2) return;
+    std::vector<bool> keep(p.size(), false);
+    keep[0] = true;
+    if (!minima_only) {
+        const ulint m = bottom ? std::max(p[0].second, *bottom) : p[0].second;
+        for (size_t j = 1; j < p.size(); ++j) keep[j] = p[j].second < m;
+    } else {
+        ulint m = p[0].second;
+        for (size_t j = 1; j < p.size(); ++j)
+            if (p[j].second < m) { keep[j] = true; m = p[j].second; }
+        m = bottom ? *bottom : std::numeric_limits<ulint>::max();
+        for (size_t j = p.size() - 1; j >= 1; --j)
+            if (p[j].second < m) { keep[j] = true; m = p[j].second; }
+    }
+    size_t w = 0;
+    for (size_t j = 0; j < p.size(); ++j)
+        if (keep[j]) p[w++] = p[j];
+    p.resize(w);
+}
+
+/**
+ * The lengths of the rows into which Orbit's LF splitting sp cuts an RLBWT
+ * with the given run heads and lengths, in row order.  Splitting only cuts
+ * runs, so each run's rows are consecutive and their lengths sum to its.
+ */
+inline std::vector<ulint> lf_split_row_lengths(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
+                                               const orbit::split_params& sp) {
+    using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+    const Enc enc = Enc::lf_interval_encoding(heads, lens, sp);
+    std::vector<ulint> rows(static_cast<size_t>(enc.intervals()));
+    for (ulint k = 0; k < enc.intervals(); ++k) rows[k] = enc.get_length(k);
+    return rows;
+}
+
+/**
+ * Throw unless sp splits LF, with length capping or balancing: an ms index's
+ * LF is always split.
+ */
+inline void check_lf_split(const orbit::split_params& sp) {
+    const bool caps = sp.length_capping.has_value() && *sp.length_capping > 0;
+    const bool balances = sp.balancing.has_value() && *sp.balancing > 0;
+    if (!caps && !balances)
+        throw std::invalid_argument("LF must be split, with length capping or balancing; unsplit LF is not supported");
+}
+
+/**
+ * Cut the runs of an RLBWT into the rows of Orbit's LF splitting sp, so that
+ * the move structure, built on those rows as they are, gets split and
+ * balanced LF intervals, each with LCP data of its own.  sp must split (see
+ * check_lf_split).  heads and lens become the rows'
+ * and pairs, each run's retained LCP pairs (as from retained_lcp_pairs or a
+ * minima file), become each row's.  Rows may be runs already cut by
+ * apply_lcp_splitting; they are cut further.
+ *
+ * A row cut from inside a run at offset a needs a top LCP, which the
+ * retained pairs need not hold.  It gets max(u, d), where u is the minimum of
+ * the run's values at offsets up to a, top included, and d the minimum of
+ * those from a on together with the next run's top.  Both are exact from
+ * the retained pairs, and u, d <= LCP[a].  This leaves every result the
+ * same.  A reposition walks through rows whose character is not the
+ * target's, so a walk up that crosses offset a of a run goes on to the run's
+ * top, and its minimum includes that of [0, a], at most u.  Likewise a walk
+ * down that crosses a crosses the rest of the run and the top of the next,
+ * with a minimum of at most d.  Taking the minimum with a value no smaller
+ * changes nothing.
+ * Each row's pairs are then pruned with prune_lcp_pairs.
+ */
+inline void apply_lf_splitting(std::vector<uchar>& heads, std::vector<ulint>& lens, std::vector<RunLcpPairs>& pairs,
+                               const orbit::split_params& sp, bool minima_only = false) {
+    check_lf_split(sp);
+    if (pairs.size() != heads.size() || lens.size() != heads.size())
+        throw std::invalid_argument("heads, lens and LCP pairs must have one entry per run");
+    const std::vector<ulint> rows = lf_split_row_lengths(heads, lens, sp);
+    std::vector<uchar> nh;
+    std::vector<ulint> nl;
+    std::vector<RunLcpPairs> np;
+    nh.reserve(rows.size());
+    nl.reserve(rows.size());
+    np.reserve(rows.size());
+    std::vector<ulint> starts, tops, suffix_min;
+    size_t k = 0;
+    for (size_t i = 0; i < heads.size(); ++i) {
+        const std::optional<ulint> next_top =
+            i + 1 < pairs.size() ? std::optional<ulint>(pairs[i + 1][0].second) : std::nullopt;
+        // The offsets in run i at which its rows start.
+        starts.clear();
+        for (ulint covered = 0; covered < lens[i]; covered += rows[k++]) {
+            if (k >= rows.size()) throw std::logic_error("LF split rows do not cover the runs");
+            starts.push_back(covered);
+        }
+        if (std::accumulate(rows.begin() + static_cast<ptrdiff_t>(k - starts.size()),
+                            rows.begin() + static_cast<ptrdiff_t>(k), ulint{0}) != lens[i])
+            throw std::logic_error("an LF split row crosses a run boundary");
+        RunLcpPairs& p = pairs[i];
+        if (starts.size() == 1) {
+            nh.push_back(heads[i]);
+            nl.push_back(lens[i]);
+            np.push_back(std::move(p));
+            continue;
+        }
+        // suffix_min[j]: minimum of the values of pairs j onward.
+        suffix_min.assign(p.size() + 1, LCP_GAP);
+        for (size_t j = p.size(); j-- > 0;) suffix_min[j] = std::min(suffix_min[j + 1], p[j].second);
+        tops.assign(starts.size(), 0);
+        tops[0] = p[0].second;
+        ulint prefix_min = p[0].second;
+        size_t j = 1;  // the first pair not yet in prefix_min
+        for (size_t s = 1; s < starts.size(); ++s) {
+            size_t first_at = j;  // the first pair at or after starts[s]
+            while (first_at < p.size() && p[first_at].first < starts[s]) ++first_at;
+            for (; j < p.size() && p[j].first <= starts[s]; ++j) prefix_min = std::min(prefix_min, p[j].second);
+            ulint d = suffix_min[first_at];
+            if (next_top) d = std::min(d, *next_top);
+            tops[s] = d == LCP_GAP ? prefix_min : std::max(prefix_min, d);
+        }
+        size_t at = 1;  // the next interior pair to place
+        for (size_t s = 0; s < starts.size(); ++s) {
+            const ulint lo = starts[s], hi = s + 1 < starts.size() ? starts[s + 1] : lens[i];
+            RunLcpPairs row{{0, tops[s]}};
+            for (; at < p.size() && p[at].first < hi; ++at)
+                if (p[at].first > lo) row.emplace_back(p[at].first - lo, p[at].second);
+            prune_lcp_pairs(row, s + 1 < starts.size() ? std::optional<ulint>(tops[s + 1]) : next_top, minima_only);
+            nh.push_back(heads[i]);
+            nl.push_back(hi - lo);
+            np.push_back(std::move(row));
+        }
+    }
+    if (k != rows.size()) throw std::logic_error("LF split rows do not match the runs");
+    heads = std::move(nh);
+    lens = std::move(nl);
+    pairs = std::move(np);
 }
 
 /**

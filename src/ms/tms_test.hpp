@@ -6,6 +6,7 @@
 #define _TMS_TEST_HPP
 
 #include "orbit/common.hpp"
+#include <random>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,9 @@ struct TextBwt {
 
 /** Build a TextBwt from s, which must not contain '$'.  Quadratic worst case. */
 TextBwt make_text_bwt(const std::string& s);
+
+/** Texts from the families that found bugs in TeraMS, plus haplotype sets. */
+std::vector<std::string> fuzz_texts(std::mt19937& rng);
 
 /** Matching statistics of P against T by substring search. */
 std::vector<ulint> naive_ms(const std::string& T, const std::string& P);
