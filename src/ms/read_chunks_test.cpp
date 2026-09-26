@@ -3,7 +3,9 @@
  * with segment sizes from 1 byte up, so that segment boundaries fall at
  * every byte offset of its records, and with several caps on records and
  * bytes per chunk; every split must give the same records as one segment
- * holding the whole input.  The inputs cover FASTA, FASTQ and one sequence
+ * holding the whole input.  ReadCutter is checked the same way, with
+ * blocks of every size from 1 byte up, including its numbering of reads
+ * given one per line.  The inputs cover FASTA, FASTQ and one sequence
  * per line, with CRLF line endings, blank lines, lower case, quality
  * strings of '@', and odd records at the end.  Build with the address and
  * undefined behavior sanitizers (make test-reader).
@@ -25,6 +27,24 @@ static bool split(const std::string& data, size_t read_size, size_t max_records,
     while (chunker.next(c, max_records, max_bytes)) {
         const size_t n = parse_chunk(c, names, seqs);
         if (n == 0) return false;  // a chunk must hold a record
+        for (size_t i = 0; i < n; ++i) out.emplace_back(names[i], seqs[i]);
+    }
+    return true;
+}
+
+// The same with ReadCutter, blocks of about `target` bytes.
+static bool cut(const std::string& data, size_t target, Records& out) {
+    std::istringstream in(data);
+    ReadCutter cutter(in);
+    ReadBuffer buf;
+    ReadChunk c;
+    std::vector<std::string> names, seqs;
+    out.clear();
+    size_t numbered = 0;
+    while (cutter.next(buf, c, target)) {
+        if (c.format == ReadFormat::PLAIN && c.first != numbered) return false;  // reads numbered in order
+        const size_t n = parse_chunk(c, names, seqs);
+        numbered += n;
         for (size_t i = 0; i < n; ++i) out.emplace_back(names[i], seqs[i]);
     }
     return true;
@@ -58,7 +78,14 @@ static std::vector<std::pair<std::string, std::string>> inputs() {
     fa += ">end";
     fq += "@t\nAC";
     txt += "acgt";
-    return {{"fasta", fa}, {"fastq", fq}, {"plain", txt},
+    // One sequence per line with no carriage returns or blank lines, which
+    // ReadCutter counts a word at a time.
+    std::string lf;
+    for (const auto& q : seqs)
+        if (!q.empty()) lf += q + "\n";
+    std::string big = ">big\n" + std::string(5000, 'A') + "\n>small\nC\n";
+    return {{"fasta", fa}, {"fastq", fq}, {"plain", txt}, {"plain lf", lf}, {"plain lf blank", "\n" + lf + "\n\nAC"},
+            {"long record", big},
             {"blank lines only", "\n\r\n\n"}, {"fastq header only", "@only\n"}, {"empty", ""}};
 }
 
@@ -80,6 +107,12 @@ int main() {
                                       << " differs\n";
                     }
                 }
+        for (size_t target = 1; target <= 300; ++target) {
+            ++cases;
+            if (!cut(data, target, got) || got != ref) {
+                if (++failures <= 10) std::cerr << name << ": cutter target=" << target << " differs\n";
+            }
+        }
         std::cout << name << ": " << ref.size() << " records\n";
     }
     std::cout << cases << " splits, " << failures << " failures\n";

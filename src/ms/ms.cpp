@@ -19,11 +19,13 @@
 #include "perf_counters.hpp"
 #include "parallel_blocks.hpp"
 #include "read_chunks.hpp"
+#include <zlib.h>
 #include <iostream>
 #include <string>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -163,6 +165,23 @@ static bool lf_split_arg(const char* v, orbit::split_params& sp) {
     return false;
 }
 
+/** Sets out to in compressed as one gzip member at the given level. */
+static void gzip_member(const std::string& in, std::string& out, int level) {
+    z_stream z{};
+    if (deflateInit2(&z, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        throw std::runtime_error("deflateInit2 failed");
+    out.resize(deflateBound(&z, static_cast<uLong>(in.size())));
+    z.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+    z.avail_in = static_cast<uInt>(in.size());
+    z.next_out = reinterpret_cast<Bytef*>(&out[0]);
+    z.avail_out = static_cast<uInt>(out.size());
+    const int r = deflate(&z, Z_FINISH);
+    const size_t n = z.total_out;
+    deflateEnd(&z);
+    if (r != Z_STREAM_END) throw std::runtime_error("deflate failed");
+    out.resize(n);
+}
+
 // One block's results, owned by one query thread.
 struct QueryResults {
     std::vector<std::vector<ulint>> ms;
@@ -235,7 +254,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     }
     std::string idx_path = argv[0], reads_path = argv[1], out_path;
     bool write_output = true;
-    size_t interleave = 32, threads = 1, block_reads = 0;
+    size_t interleave = 32, threads = 1, block_reads = 0, block_bytes = 0;
+    bool reader_thread = true;
+    int gzip_level = -2;  // -2: from the output name; -1: none
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
@@ -245,6 +266,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             threads = static_cast<size_t>(std::stoull(argv[++i]));
         else if (strcmp(argv[i], "--block-reads") == 0 && i + 1 < argc)
             block_reads = static_cast<size_t>(std::stoull(argv[++i]));
+        else if (strcmp(argv[i], "--gzip-level") == 0 && i + 1 < argc)
+            gzip_level = std::stoi(argv[++i]);
+        else if (strcmp(argv[i], "--block-bytes") == 0 && i + 1 < argc)
+            block_bytes = static_cast<size_t>(std::stoull(argv[++i]));
+        else if (strcmp(argv[i], "--reader") == 0 && i + 1 < argc) {
+            const std::string r = argv[++i];
+            if (r == "thread") reader_thread = true;
+            else if (r == "lock") reader_thread = false;
+            else { std::cerr << "Unknown reader: " << r << "\n"; return 1; }
+        }
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const std::string m = argv[++i];
@@ -268,6 +299,12 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
     }
     threads = resolve_thread_count(threads);
+    // Output named *.gz is gzip-compressed, each block as a gzip member by
+    // the thread that formats it; members written one after another form one
+    // gzip file.
+    if (gzip_level == -2)
+        gzip_level = out_path.size() > 3 && out_path.compare(out_path.size() - 3, 3, ".gz") == 0 ? 1 : -1;
+    if (gzip_level > 9) gzip_level = 9;
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
     auto opt = read(idx_path);
@@ -300,11 +337,28 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     // block, and keeps blocks small enough to spread over many threads.
     if (block_reads == 0) block_reads = std::max<size_t>(2048, 16 * interleave);
     constexpr size_t block_bases = size_t(1) << 24;
-    ReadPrefetcher reads(*in, block_reads, block_bases, 2 * threads + 2);
+    // Two ways to split the input: a reading thread that finds records and
+    // keeps chunks ready (--reader thread), or query threads that take turns
+    // reading a block of bytes into their own buffers and cutting it after
+    // its last whole record (--reader lock).  Blocks from the second are
+    // sized in bytes, from the mean record size seen so far, to hold about
+    // block_reads reads (or block_bytes bytes, if given).
+    std::optional<ReadPrefetcher> prefetcher;
+    std::optional<ReadCutter> cutter;
+    if (reader_thread) prefetcher.emplace(*in, block_reads, block_bases, 2 * threads + 2);
+    else cutter.emplace(*in);
+    std::atomic<size_t> seen_records{0}, seen_bytes{0};
+    auto target_bytes = [&]() -> size_t {
+        if (block_bytes > 0) return block_bytes;
+        const size_t r = seen_records.load(std::memory_order_relaxed), b = seen_bytes.load(std::memory_order_relaxed);
+        const size_t per = r > 0 ? std::max<size_t>(b / r, 1) : 160;
+        return std::min(std::max<size_t>(block_reads * per, size_t(1) << 16), block_bases);
+    };
 
-    // A block's records are found under the input lock and parsed by the
+    // A block's records are found by one thread at a time and parsed by the
     // thread that queries them.
     struct Block {
+        ReadBuffer buf;
         ReadChunk chunk;
         std::vector<std::string> names, seqs;
     };
@@ -337,17 +391,22 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     struct Worker {
         QueryResults r, one;
         PerfCounters perf;
-        double query_s = 0.0;
+        double query_s = 0.0, parse_s = 0.0, format_s = 0.0;
         size_t reads = 0, bases = 0;
+        std::string packed;
         std::function<void(Worker&, Block&, std::string&)> body;
         void process(Block& b, std::string& text) { body(*this, b, text); }
     };
     auto body = [&](Worker& w, Block& b, std::string& text) {
+        auto tp = clock::now();
         const size_t n = parse_chunk(b.chunk, b.names, b.seqs);
         b.names.resize(n);
         b.seqs.resize(n);
+        w.parse_s += std::chrono::duration<double>(clock::now() - tp).count();
         w.reads += n;
         for (const auto& sq : b.seqs) w.bases += sq.size();
+        seen_records.fetch_add(n, std::memory_order_relaxed);
+        seen_bytes.fetch_add(b.chunk.size, std::memory_order_relaxed);
         auto timed = [&](auto&& f) {
             auto tq = clock::now();
             w.perf.start();
@@ -377,11 +436,18 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         } else {
             timed([&] { query_many(idx, b.seqs, interleave, w.r); });
         }
-        if (write_output)
+        if (write_output) {
+            auto tf = clock::now();
             for (size_t j = 0; j < b.seqs.size(); ++j) format(text, b.names[j], w.r, j);
+            if (gzip_level >= 0) {
+                gzip_member(text, w.packed, gzip_level);
+                text.swap(w.packed);
+            }
+            w.format_s += std::chrono::duration<double>(clock::now() - tf).count();
+        }
     };
     PerfCounters perf;
-    double query_s = 0.0, wait_s = 0.0;
+    double query_s = 0.0, wait_s = 0.0, parse_s = 0.0, format_s = 0.0;
     size_t n_reads = 0, n_bases = 0;
 #ifdef TMS_STATS
     TmsStats tms_total;
@@ -395,7 +461,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         [&](size_t) { Worker w; w.body = body; return w; },
         [&](Block& b) {
             auto tr = clock::now();
-            const bool got = reads.next(b.chunk);
+            const bool got = reader_thread ? prefetcher->next(b.chunk) : cutter->next(b.buf, b.chunk, target_bytes());
             wait_s += std::chrono::duration<double>(clock::now() - tr).count();
             return got;
         },
@@ -405,6 +471,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         [&](Worker& w) {
             perf.add(w.perf);
             query_s += w.query_s;
+            parse_s += w.parse_s;
+            format_s += w.format_s;
             n_reads += w.reads;
             n_bases += w.bases;
 #ifdef TMS_STATS
@@ -440,12 +508,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
               << " walk_down/rep=" << double(ms_total.walk_down) / ms_total.repositions << "\n";
 #endif
     perf.report(std::cerr, n_bases);
-    // query_s sums the threads' time in queries; read_s is the reading
-    // thread's time reading input and finding its records; input_wait_s is
-    // the time a query thread waited for input with none ready; wall_ns_per_base is
+    // query_s sums the threads' time in queries, parse_s their time
+    // parsing reads, and format_s their time formatting (and compressing)
+    // output.  With a reading thread, read_s is its time reading
+    // input and finding records, and input_wait_s the time query threads
+    // waited for input with none ready.  With --reader lock, read_s is the
+    // time the input lock was held, and input_wait_s is the same; wall_ns_per_base is
     // the elapsed time of the whole read, query and write phase per base.
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
-              << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << reads.busy_seconds()
+              << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << (reader_thread ? prefetcher->busy_seconds() : wait_s)
+              << " parse_s=" << parse_s << " format_s=" << format_s
               << " input_wait_s=" << wait_s
               << " total_s=" << total_s
               << " query_ns_per_base=" << (n_bases ? query_s * 1e9 / n_bases : 0.0)
