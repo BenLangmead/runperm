@@ -91,6 +91,19 @@ for f in m.fa m.fq m.txt; do
         cmp -s ref.out o.out || { echo "differs: $f t=$t b=$b"; fails=$((fails + 1)); }
     done; done
 done
+# A record much longer than the reader's 4 MB segments.
+python3 -c "
+import random; r = random.Random(5)
+with open('long.fa', 'w') as f:
+    f.write('>a\\nACGTTGCA\\n>big\\n')
+    s = ''.join(r.choice('ACGT') for _ in range(10000000))
+    for i in range(0, len(s), 80): f.write(s[i:i + 80] + '\\n')
+    f.write('>c\\nGATTACA\\n')
+"
+$M batch mini.idx long.fa -o ref.out --threads 1 2> /dev/null
+[ $(wc -l < ref.out) -eq 3 ] || { echo "long record: wrong line count"; fails=$((fails + 1)); }
+$M batch mini.idx long.fa -o o.out --threads 3 --block-reads 1 2> /dev/null
+cmp -s ref.out o.out || { echo "differs: long record"; fails=$((fails + 1)); }
 # Empty reads are skipped only by the one-per-line format.
 cut -f2 ref.m.fa | grep -v '^$' > a.txt
 head -n 3000 ref.m.fq | cut -f2 | grep -v '^$' > b.txt

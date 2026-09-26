@@ -1,9 +1,9 @@
 /**
  * Reads for batch queries, split into chunks of whole records so that
- * several threads can parse them.  ReadChunker::next, called by one thread
- * at a time, only finds record boundaries (a scan for line ends) and copies
- * the chunk's bytes; parse_chunk, which any thread may call, turns a chunk
- * into names and upper-cased sequences.
+ * several threads can parse them.  ReadChunker::next only finds record
+ * boundaries (a scan for line ends); ReadPrefetcher runs it on a thread of
+ * its own; and parse_chunk, which any thread may call, turns a chunk into
+ * names and upper-cased sequences.
  *
  * The input is FASTA, FASTQ, or one sequence per line, chosen by the first
  * non-empty line ('>' FASTA, '@' FASTQ, else one per line).  Lines may end
@@ -24,6 +24,12 @@
 #define _READ_CHUNKS_HPP
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <cstddef>
 #include <cstring>
 #include <istream>
@@ -33,9 +39,17 @@
 
 enum class ReadFormat { UNKNOWN, FASTA, FASTQ, PLAIN };
 
+/** A block of input bytes, shared by the chunks that point into it. */
+struct ReadSegment {
+    std::unique_ptr<char[]> data;
+    size_t size = 0;
+};
+
 /** The bytes of whole records, and the number of records before them. */
 struct ReadChunk {
-    std::string bytes;
+    std::shared_ptr<const ReadSegment> seg;  // keeps data alive
+    const char* data = nullptr;
+    size_t size = 0;
     size_t first = 0;
     ReadFormat format = ReadFormat::UNKNOWN;
 };
@@ -70,8 +84,8 @@ inline void append_upper(std::string& s, const char* b, size_t len) {
  */
 inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, std::vector<std::string>& seqs) {
     using namespace read_chunks_detail;
-    const char* p = c.bytes.data();
-    const char* const end = p + c.bytes.size();
+    const char* p = c.data;
+    const char* const end = p + c.size;
     size_t n = 0;
     // Next line [lb, le), with p moved past its line ending.
     const char *lb = nullptr, *le = nullptr;
@@ -131,135 +145,230 @@ inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, s
     return n;
 }
 
-/** Splits an input stream into chunks of whole records. */
+/**
+ * Splits an input stream into chunks of whole records.  The input is read
+ * into segments, and a chunk is a range of one segment, shared with the
+ * chunk rather than copied.  A record left incomplete at the end of a
+ * segment is copied to the start of the next one.
+ */
 class ReadChunker {
 public:
     explicit ReadChunker(std::istream& in, size_t read_size = size_t(1) << 22) : in_(in), read_size_(read_size) {}
 
     /**
-     * Moves the next records into c: at most max_records of them, and no
-     * more once the chunk holds max_bytes bytes.  Returns false when the
-     * input holds no more records.
+     * Sets c to the next records: at most max_records of them, and no more
+     * once the chunk holds max_bytes bytes.  Returns false when the input
+     * holds no more records.
      */
     bool next(ReadChunk& c, size_t max_records, size_t max_bytes) {
         using namespace read_chunks_detail;
-        // Drop the bytes of earlier chunks once they are most of the
-        // buffer, so each byte is moved at most about once.
-        if (pos_ > size_ / 2) {
-            std::memmove(buf_.get(), buf_.get() + pos_, size_ - pos_);
-            size_ -= pos_;
-            pos_ = 0;
-        }
-        if (format_ == ReadFormat::UNKNOWN && !detect()) return false;
-        const size_t start = pos_;
-        size_t at = pos_, records = 0;
-        size_t lb, le;
-        auto blank = [&](size_t b, size_t e) { return content_len(buf_.get() + b, buf_.get() + e) == 0; };
-        while (records < max_records && at - start < max_bytes) {
-            if (format_ == ReadFormat::PLAIN) {
-                if (!line(at, lb, le)) break;
-                at = after(le);
-                if (!blank(lb, le)) ++records;
-            } else if (format_ == ReadFormat::FASTQ) {
-                size_t at2 = at;
-                bool found = false;
-                while (line(at2, lb, le)) {
-                    at2 = after(le);
-                    if (!blank(lb, le)) { found = true; break; }
-                }
-                if (!found) { at = at2; break; }
-                if (!line(at2, lb, le)) { at = at2; break; }  // a header without a sequence is dropped
-                at2 = after(le);
-                for (int i = 0; i < 2 && line(at2, lb, le); ++i) at2 = after(le);
-                at = at2;
-                ++records;
-            } else {
-                size_t at2 = at;
-                bool found = false;
-                while (line(at2, lb, le)) {
-                    at2 = after(le);
-                    if (!blank(lb, le)) { found = true; break; }
-                }
-                if (!found) { at = at2; break; }
-                // Lines up to the next header.
-                while (line(at2, lb, le) && !(le > lb && buf_[lb] == '>')) at2 = after(le);
-                at = at2;
-                ++records;
+        for (;;) {
+            if (format_ == ReadFormat::UNKNOWN) {
+                const int d = detect();
+                if (d == END) return false;
+                if (d == MORE) { refill(); continue; }
             }
-        }
-        if (records == 0) {
+            const char* const buf = seg_ ? seg_->data.get() : nullptr;
+            auto blank = [&](size_t b, size_t e) { return content_len(buf + b, buf + e) == 0; };
+            const size_t start = pos_;
+            size_t at = pos_, records = 0, lb, le;
+            int r = FOUND;
+            while (records < max_records && at - start < max_bytes) {
+                size_t at2 = at;
+                if (format_ == ReadFormat::PLAIN) {
+                    if ((r = line(at2, lb, le)) != FOUND) break;
+                    at = after(le);
+                    if (!blank(lb, le)) ++records;
+                    continue;
+                }
+                // FASTQ and FASTA: skip blank lines, then a header.
+                while ((r = line(at2, lb, le)) == FOUND && blank(lb, le)) at2 = after(le);
+                if (r != FOUND) {
+                    if (r == END) at = at2;
+                    break;
+                }
+                at2 = after(le);
+                if (format_ == ReadFormat::FASTQ) {
+                    // Sequence, then '+' and qualities if present.
+                    if ((r = line(at2, lb, le)) != FOUND) {
+                        if (r == END) at = at2;  // a header without a sequence is dropped
+                        break;
+                    }
+                    at2 = after(le);
+                    for (int i = 0; i < 2 && (r = line(at2, lb, le)) == FOUND; ++i) at2 = after(le);
+                    if (r == MORE) break;
+                } else {
+                    // Lines up to the next header.
+                    while ((r = line(at2, lb, le)) == FOUND && !(le > lb && buf[lb] == '>')) at2 = after(le);
+                    if (r == MORE) break;
+                }
+                at = at2;
+                ++records;
+                r = FOUND;
+            }
+            if (records > 0) {
+                c.seg = seg_;
+                c.data = buf + start;
+                c.size = at - start;
+                c.first = count_;
+                c.format = format_;
+                count_ += records;
+                pos_ = at;
+                return true;
+            }
             pos_ = at;
-            return false;
+            if (r != MORE) return false;
+            refill();
         }
-        c.bytes.assign(buf_.get() + start, at - start);
-        c.first = count_;
-        c.format = format_;
-        count_ += records;
-        pos_ = at;
-        return true;
     }
 
 private:
-    // Finds the line starting at b: [lb, le) with le at its '\n' or at the
-    // end of the input.  Reads more input as needed.  False at the end.
-    bool line(size_t b, size_t& lb, size_t& le) {
-        for (;;) {
-            if (b < size_) {
-                const void* nl = std::memchr(buf_.get() + b, '\n', size_ - b);
-                if (nl) {
-                    lb = b;
-                    le = size_t(static_cast<const char*>(nl) - buf_.get());
-                    return true;
-                }
-            }
-            if (eof_) {
-                if (b >= size_) return false;
-                lb = b;
-                le = size_;
-                return true;
-            }
-            fill();
-        }
-    }
-    size_t after(size_t le) const { return le < size_ ? le + 1 : le; }
+    enum { FOUND, MORE, END };
 
-    // Appends up to read_size bytes of input to the buffer.
-    void fill() {
-        if (size_ + read_size_ > cap_) {
-            const size_t cap = std::max(2 * cap_, size_ + read_size_);
-            std::unique_ptr<char[]> b(new char[cap]);
-            if (size_ > 0) std::memcpy(b.get(), buf_.get(), size_);
-            buf_ = std::move(b);
-            cap_ = cap;
+    // Finds the line starting at b: [lb, le) with le at its '\n', or at the
+    // end of the input.  MORE when the segment ends before a line end and
+    // input remains, END at the end of the input.
+    int line(size_t b, size_t& lb, size_t& le) const {
+        const size_t size = seg_ ? seg_->size : 0;
+        if (b < size) {
+            const char* buf = seg_->data.get();
+            const void* nl = std::memchr(buf + b, '\n', size - b);
+            if (nl) {
+                lb = b;
+                le = size_t(static_cast<const char*>(nl) - buf);
+                return FOUND;
+            }
         }
-        in_.read(buf_.get() + size_, static_cast<std::streamsize>(read_size_));
+        if (!eof_) return MORE;
+        if (b >= size) return END;
+        lb = b;
+        le = size;
+        return FOUND;
+    }
+    size_t after(size_t le) const { return le < seg_->size ? le + 1 : le; }
+
+    // Starts a new segment with the unread bytes of the current one and
+    // more input.  Chunks of the old segment keep it alive.
+    void refill() {
+        const size_t carry = seg_ ? seg_->size - pos_ : 0;
+        // Reading at least as much as is carried keeps the copying of a
+        // record longer than read_size linear in its length.
+        const size_t want = std::max(read_size_, carry);
+        auto seg = std::make_shared<ReadSegment>();
+        seg->data.reset(new char[carry + want]);
+        if (carry > 0) std::memcpy(seg->data.get(), seg_->data.get() + pos_, carry);
+        in_.read(seg->data.get() + carry, static_cast<std::streamsize>(want));
         const size_t got = static_cast<size_t>(in_.gcount());
-        size_ += got;
-        if (got < read_size_) eof_ = true;
+        seg->size = carry + got;
+        if (got < want) eof_ = true;
+        seg_ = std::move(seg);
+        pos_ = 0;
     }
 
     // Sets the format from the first non-empty line.
-    bool detect() {
+    int detect() {
         size_t at = pos_, lb, le;
-        while (line(at, lb, le)) {
-            if (read_chunks_detail::content_len(buf_.get() + lb, buf_.get() + le) > 0) {
-                const char c = buf_[lb];
+        int r;
+        while ((r = line(at, lb, le)) == FOUND) {
+            const char* buf = seg_->data.get();
+            if (read_chunks_detail::content_len(buf + lb, buf + le) > 0) {
+                const char c = buf[lb];
                 format_ = c == '>' ? ReadFormat::FASTA : c == '@' ? ReadFormat::FASTQ : ReadFormat::PLAIN;
-                return true;
+                return FOUND;
             }
             at = after(le);
         }
-        return false;
+        pos_ = at;
+        return r;
     }
 
     std::istream& in_;
     size_t read_size_;
-    std::unique_ptr<char[]> buf_;  // input bytes [0, size_), of which [pos_, size_) are unread
-    size_t size_ = 0, cap_ = 0;
+    std::shared_ptr<ReadSegment> seg_;  // bytes [pos_, seg_->size) are unread
     size_t pos_ = 0;
     size_t count_ = 0;
     bool eof_ = false;
     ReadFormat format_ = ReadFormat::UNKNOWN;
+};
+
+/**
+ * Runs a ReadChunker on its own thread, which keeps up to `capacity`
+ * chunks ready.  Keeping the input buffer on one thread avoids moving it
+ * between the cores of the threads that take chunks.
+ */
+class ReadPrefetcher {
+public:
+    ReadPrefetcher(std::istream& in, size_t max_records, size_t max_bytes, size_t capacity)
+        : chunker_(in), max_records_(max_records), max_bytes_(max_bytes), capacity_(std::max<size_t>(capacity, 1)),
+          thread_([this] { run(); }) {}
+    ~ReadPrefetcher() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    /** Takes the next chunk, waiting for one; false at the end of the input. */
+    bool next(ReadChunk& c) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return !ready_.empty() || done_; });
+        if (!ready_.empty()) {
+            c = std::move(ready_.front());
+            ready_.pop_front();
+            cv_.notify_all();
+            return true;
+        }
+        if (error_) std::rethrow_exception(error_);
+        return false;
+    }
+
+    /** Seconds the reading thread spent reading and splitting input. */
+    double busy_seconds() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return busy_s_;
+    }
+
+private:
+    void run() {
+        using clock = std::chrono::steady_clock;
+        double busy = 0.0;
+        try {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    cv_.wait(lk, [&] { return stop_ || ready_.size() < capacity_; });
+                    if (stop_) break;
+                }
+                auto t0 = clock::now();
+                ReadChunk c;
+                const bool got = chunker_.next(c, max_records_, max_bytes_);
+                busy += std::chrono::duration<double>(clock::now() - t0).count();
+                if (!got) break;
+                std::lock_guard<std::mutex> lk(mu_);
+                ready_.push_back(std::move(c));
+                cv_.notify_all();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(mu_);
+            error_ = std::current_exception();
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        done_ = true;
+        busy_s_ = busy;
+        cv_.notify_all();
+    }
+
+    ReadChunker chunker_;
+    size_t max_records_, max_bytes_, capacity_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<ReadChunk> ready_;
+    bool done_ = false, stop_ = false;
+    double busy_s_ = 0.0;
+    std::exception_ptr error_;
+    std::thread thread_;  // last, so it starts after the members it uses
 };
 
 #endif /* _READ_CHUNKS_HPP */
