@@ -142,9 +142,9 @@ public:
      */
     bool next(ReadChunk& c, size_t max_records, size_t max_bytes) {
         using namespace read_chunks_detail;
-        // Drop the bytes of earlier chunks, so the buffer holds about one
-        // chunk and one read_size of input.
-        if (pos_ > 0) {
+        // Drop the bytes of earlier chunks once they are most of the
+        // buffer, so each byte is moved at most about once.
+        if (pos_ > buf_.size() / 2) {
             buf_.erase(0, pos_);
             pos_ = 0;
         }
