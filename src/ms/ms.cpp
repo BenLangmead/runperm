@@ -416,7 +416,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         }
     };
     PerfCounters perf;
-    double query_s = 0.0;
+    double query_s = 0.0, read_s = 0.0;
 #ifdef TMS_STATS
     TmsStats tms_total;
 #endif
@@ -428,6 +428,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         threads, 4 * threads,
         [&](size_t) { Worker w; w.body = body; return w; },
         [&](Block& b) {
+            auto tr = clock::now();
             b.names.resize(block_reads);
             b.seqs.resize(block_reads);
             size_t n = 0, bases = 0;
@@ -436,6 +437,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             b.seqs.resize(n);
             n_reads += n;
             n_bases += bases;
+            read_s += std::chrono::duration<double>(clock::now() - tr).count();
             return n > 0;
         },
         [&](const std::string& text) {
@@ -477,10 +479,11 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
               << " walk_down/rep=" << double(ms_total.walk_down) / ms_total.repositions << "\n";
 #endif
     perf.report(std::cerr, n_bases);
-    // query_s sums the threads' time in queries; wall_ns_per_base is the
-    // elapsed time of the whole read, query and write phase per base.
+    // query_s sums the threads' time in queries; read_s is the time spent
+    // reading and parsing input, which is serialized; wall_ns_per_base is
+    // the elapsed time of the whole read, query and write phase per base.
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
-              << " index_load_s=" << load_s << " query_s=" << query_s
+              << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << read_s
               << " total_s=" << total_s
               << " query_ns_per_base=" << (n_bases ? query_s * 1e9 / n_bases : 0.0)
               << " wall_ns_per_base=" << (n_bases ? total_s * 1e9 / n_bases : 0.0) << "\n";
