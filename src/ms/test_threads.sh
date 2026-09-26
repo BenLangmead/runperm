@@ -35,11 +35,11 @@ cd "$W"
 fails=0
 while read -r cmd idx opts; do
     $M $cmd $idx reads.fa $opts -o ref.out --interleave 0 2> err.txt || { echo "failed: $cmd $opts"; cat err.txt; exit 1; }
-    for k in 0 1 7 32; do for t in 1 2 3 8 17; do for b in 1 13 1000; do for rd in thread lock; do
-        $M $cmd $idx reads.fa $opts -o o.out --interleave $k --threads $t --block-reads $b --reader $rd 2> err.txt \
-            || { echo "failed: $cmd $opts k=$k t=$t b=$b reader=$rd"; cat err.txt; fails=$((fails + 1)); continue; }
-        cmp -s ref.out o.out || { echo "differs: $cmd $opts k=$k t=$t b=$b reader=$rd"; fails=$((fails + 1)); }
-    done; done; done; done
+    for k in 0 1 7 32; do for t in 1 2 3 8 17; do for b in 1 13 1000; do
+        $M $cmd $idx reads.fa $opts -o o.out --interleave $k --threads $t --block-reads $b 2> err.txt \
+            || { echo "failed: $cmd $opts k=$k t=$t b=$b"; cat err.txt; fails=$((fails + 1)); continue; }
+        cmp -s ref.out o.out || { echo "differs: $cmd $opts k=$k t=$t b=$b"; fails=$((fails + 1)); }
+    done; done; done
     echo "checked $cmd $opts"
 done <<'CMDS'
 batch mini.idx
@@ -91,8 +91,8 @@ for f in m.fa m.fq m.txt; do
         cmp -s ref.out o.out || { echo "differs: $f t=$t b=$b"; fails=$((fails + 1)); }
     done; done
     for t in 1 3 8; do for bb in 1 7 100 5000 0; do
-        $M batch mini.idx $f -o o.out --threads $t --reader lock --block-bytes $bb 2> /dev/null
-        cmp -s ref.out o.out || { echo "differs: $f t=$t reader=lock block-bytes=$bb"; fails=$((fails + 1)); }
+        $M batch mini.idx $f -o o.out --threads $t --block-bytes $bb 2> /dev/null
+        cmp -s ref.out o.out || { echo "differs: $f t=$t block-bytes=$bb"; fails=$((fails + 1)); }
     done; done
 done
 # A record much longer than the reader's 4 MB segments.
@@ -109,15 +109,15 @@ $M batch mini.idx long.fa -o ref.out --threads 1 2> /dev/null
 $M batch mini.idx long.fa -o o.out --threads 3 --block-reads 1 2> /dev/null
 cmp -s ref.out o.out || { echo "differs: long record"; fails=$((fails + 1)); }
 for bb in 1 1000; do
-    $M batch mini.idx long.fa -o o.out --threads 3 --reader lock --block-bytes $bb 2> /dev/null
-    cmp -s ref.out o.out || { echo "differs: long record, reader=lock block-bytes=$bb"; fails=$((fails + 1)); }
+    $M batch mini.idx long.fa -o o.out --threads 3 --block-bytes $bb 2> /dev/null
+    cmp -s ref.out o.out || { echo "differs: long record, block-bytes=$bb"; fails=$((fails + 1)); }
 done
 # Output named *.gz is one gzip member per block, and decompresses to the
 # plain output.
-for t in 1 4; do for rd in thread lock; do
-    $M batch mini.idx m.fq -o o.gz --threads $t --reader $rd --block-reads 50 2> /dev/null
-    gzip -dc o.gz | cmp -s - ref.m.fq || { echo "differs: gzip output t=$t reader=$rd"; fails=$((fails + 1)); }
-done; done
+for t in 1 4; do
+    $M batch mini.idx m.fq -o o.gz --threads $t --block-reads 50 2> /dev/null
+    gzip -dc o.gz | cmp -s - ref.m.fq || { echo "differs: gzip output t=$t"; fails=$((fails + 1)); }
+done
 # Empty reads are skipped only by the one-per-line format.
 cut -f2 ref.m.fa | grep -v '^$' > a.txt
 head -n 3000 ref.m.fq | cut -f2 | grep -v '^$' > b.txt
