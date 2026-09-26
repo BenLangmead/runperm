@@ -29,9 +29,17 @@ debug: ms
 tms_chain_bench: tms_chain_bench.cpp $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp
 
-.PHONY: test test-threads all clean debug bench
+.PHONY: test test-threads test-reader all clean debug bench
 test: ms
 	./ms test ../../data
+
+# Read chunking at every segment boundary, under the address and undefined
+# behavior sanitizers
+read_chunks_test: read_chunks_test.cpp read_chunks.hpp
+	$(CXX) -std=c++17 -I. -O1 -g -pthread -fsanitize=address,undefined -fno-sanitize-recover=all -o read_chunks_test read_chunks_test.cpp
+
+test-reader: read_chunks_test
+	./read_chunks_test
 
 # Output identity across interleave, thread count and block size
 test-threads: ms
@@ -40,4 +48,4 @@ test-threads: ms
 all: ms
 
 clean:
-	rm -f ms ms-bench ms-stats tms_chain_bench
+	rm -f ms ms-bench ms-stats tms_chain_bench read_chunks_test

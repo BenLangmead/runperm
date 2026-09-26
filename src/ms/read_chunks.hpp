@@ -217,7 +217,9 @@ public:
             const size_t start = pos_;
             size_t at = pos_, records = 0, lb, le;
             int r = FOUND;
-            while (records < max_records && at - start < max_bytes) {
+            // The byte cap ends a chunk only once it holds a record, since
+            // blank lines use bytes without adding records.
+            while (records < max_records && (records == 0 || at - start < max_bytes)) {
                 size_t at2 = at;
                 if (format_ == ReadFormat::PLAIN) {
                     if ((r = line(at2, lb, le)) != FOUND) break;
