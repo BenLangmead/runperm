@@ -18,6 +18,7 @@
 #include "tms_test.hpp"
 #include "perf_counters.hpp"
 #include "parallel_blocks.hpp"
+#include "read_chunks.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -137,68 +138,6 @@ static void usage(const char* prog) {
               << "  probe-internal DATA_DIR FIRST_ROW LAST_ROW\n"
               << "                  Base index: decode spillover, verify 3 query types consistent.\n";
 }
-
-/**
- * Streaming reader for FASTA, FASTQ, or one sequence per line, chosen by the
- * first non-empty line.  Sequences are upper-cased; FASTA records may span
- * several lines.
- */
-class ReadStream {
-public:
-    explicit ReadStream(std::istream& in) : in_(in) {}
-
-    bool next(std::string& name, std::string& seq) {
-        name.clear();
-        seq.clear();
-        std::string line;
-        if (!have_line_) {
-            do {
-                if (!get_line(line)) return false;
-            } while (line.empty());
-            pending_ = line;
-            have_line_ = true;
-        }
-        if (format_ == 0) format_ = (pending_[0] == '>') ? 1 : (pending_[0] == '@') ? 2 : 3;
-        ++count_;
-        if (format_ == 3) {
-            seq = pending_;
-            name = "read" + std::to_string(count_);
-            have_line_ = false;
-        } else if (format_ == 2) {
-            name = header_name(pending_);
-            if (!get_line(seq)) return false;
-            get_line(line);  // +
-            get_line(line);  // qualities
-            have_line_ = false;
-        } else {
-            name = header_name(pending_);
-            have_line_ = false;
-            while (get_line(line)) {
-                if (!line.empty() && line[0] == '>') { pending_ = line; have_line_ = true; break; }
-                seq += line;
-            }
-        }
-        for (auto& ch : seq) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        return true;
-    }
-
-private:
-    // One line without its line ending, so CRLF files read like LF files.
-    bool get_line(std::string& line) {
-        if (!std::getline(in_, line)) return false;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        return true;
-    }
-    static std::string header_name(const std::string& h) {
-        size_t end = h.find_first_of(" \t\r", 1);
-        return h.substr(1, end == std::string::npos ? std::string::npos : end - 1);
-    }
-    std::istream& in_;
-    std::string pending_;
-    bool have_line_ = false;
-    int format_ = 0;  // 1 FASTA, 2 FASTQ, 3 plain
-    size_t count_ = 0;
-};
 
 /**
  * The split parameters for --lf-split or --phi-split B: Orbit's default
@@ -351,15 +290,18 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     }
     std::ios::sync_with_stdio(false);
 
-    // A block ends at block_reads reads or once it holds block_bases bases,
-    // so that long reads do not make a block's per-base results large.  The
+    // A block ends at block_reads reads or once it holds block_bases bytes
+    // of input, so that long reads do not make a block's per-base results
+    // large.  The
     // default keeps K reads in flight for all but the end of a block.
     if (block_reads == 0) block_reads = std::max<size_t>(1024, 64 * interleave);
     constexpr size_t block_bases = size_t(1) << 24;
-    ReadStream reads(*in);
-    size_t n_reads = 0, n_bases = 0;
+    ReadChunker reads(*in);
 
+    // A block's records are found under the input lock and parsed by the
+    // thread that queries them.
     struct Block {
+        ReadChunk chunk;
         std::vector<std::string> names, seqs;
     };
     // With --positions, a tab-separated field holds the positions (-1 for
@@ -392,10 +334,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         QueryResults r;
         PerfCounters perf;
         double query_s = 0.0;
+        size_t reads = 0, bases = 0;
         std::function<void(Worker&, Block&, std::string&)> body;
         void process(Block& b, std::string& text) { body(*this, b, text); }
     };
     auto body = [&](Worker& w, Block& b, std::string& text) {
+        const size_t n = parse_chunk(b.chunk, b.names, b.seqs);
+        b.names.resize(n);
+        b.seqs.resize(n);
+        w.reads += n;
+        for (const auto& sq : b.seqs) w.bases += sq.size();
         auto timed = [&](auto&& f) {
             auto tq = clock::now();
             w.perf.start();
@@ -417,6 +365,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     };
     PerfCounters perf;
     double query_s = 0.0, read_s = 0.0;
+    size_t n_reads = 0, n_bases = 0;
 #ifdef TMS_STATS
     TmsStats tms_total;
 #endif
@@ -429,16 +378,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         [&](size_t) { Worker w; w.body = body; return w; },
         [&](Block& b) {
             auto tr = clock::now();
-            b.names.resize(block_reads);
-            b.seqs.resize(block_reads);
-            size_t n = 0, bases = 0;
-            while (n < block_reads && bases < block_bases && reads.next(b.names[n], b.seqs[n])) bases += b.seqs[n++].size();
-            b.names.resize(n);
-            b.seqs.resize(n);
-            n_reads += n;
-            n_bases += bases;
+            const bool got = reads.next(b.chunk, block_reads, block_bases);
             read_s += std::chrono::duration<double>(clock::now() - tr).count();
-            return n > 0;
+            return got;
         },
         [&](const std::string& text) {
             if (write_output) out->write(text.data(), static_cast<std::streamsize>(text.size()));
@@ -446,6 +388,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         [&](Worker& w) {
             perf.add(w.perf);
             query_s += w.query_s;
+            n_reads += w.reads;
+            n_bases += w.bases;
 #ifdef TMS_STATS
             tms_total += tms_stats;
 #endif
@@ -480,7 +424,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #endif
     perf.report(std::cerr, n_bases);
     // query_s sums the threads' time in queries; read_s is the time spent
-    // reading and parsing input, which is serialized; wall_ns_per_base is
+    // reading input and finding its records, which is serialized; wall_ns_per_base is
     // the elapsed time of the whole read, query and write phase per base.
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
               << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << read_s

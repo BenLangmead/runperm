@@ -49,4 +49,53 @@ tms-batch mini.tms --mode phi --positions
 tms-batch mini.tms --report smem-all
 tms-batch mini.tms --mode dual --report smem-one
 CMDS
+# The same reads as multi-line FASTA, FASTQ and one per line, with CRLF
+# line endings, blank lines, lower case, and odd records at the end: output
+# must not depend on thread count or block size, and the sequences' values
+# must agree across formats.
+python3 - "$W" <<'PY'
+import random, sys
+d = sys.argv[1]
+t = open(d + '/text.txt').read().strip().replace('%', '').replace('$', '')
+r = random.Random(11)
+reads = []
+for i in range(3000):
+    L = r.choice([0, 1, 20, 150, 150, 300, 1000])
+    p = r.randrange(len(t) - L)
+    s = ''.join(c if r.random() > 0.01 else r.choice('acgtnACGTN') for c in t[p:p + L])
+    reads.append(s.lower() if r.random() < 0.2 else s)
+def nl(): return '\r\n' if r.random() < 0.3 else '\n'
+with open(d + '/m.fa', 'w', newline='') as f:
+    f.write(nl() * 2)
+    for i, s in enumerate(reads):
+        f.write('>r%d%s desc%s' % (i, r.choice(['', ' x', '\ty']), nl()))
+        w = r.choice([60, 77, 5000])
+        for j in range(0, len(s), w): f.write(s[j:j + w] + nl())
+        if r.random() < 0.1: f.write(nl())
+with open(d + '/m.fq', 'w', newline='') as f:
+    for i, s in enumerate(reads):
+        if r.random() < 0.05: f.write(nl())
+        f.write('@q%d extra%s%s%s+%s%s%s' % (i, nl(), s, nl(), nl(), '@' * len(s), nl()))
+    f.write('@trunc\nACGT\n@dangling\n')
+with open(d + '/m.txt', 'w', newline='') as f:
+    for s in reads:
+        f.write(s + nl())
+        if r.random() < 0.05: f.write(nl())
+    f.write('ACGTACGTNNacgt')
+PY
+for f in m.fa m.fq m.txt; do
+    $M batch mini.idx $f -o ref.out 2> err.txt || { echo "failed: $f"; cat err.txt; exit 1; }
+    cp ref.out ref.$f
+    for t in 1 3 8; do for b in 1 7 1000; do
+        $M batch mini.idx $f -o o.out --threads $t --block-reads $b 2> /dev/null
+        cmp -s ref.out o.out || { echo "differs: $f t=$t b=$b"; fails=$((fails + 1)); }
+    done; done
+done
+# Empty reads are skipped only by the one-per-line format.
+cut -f2 ref.m.fa | grep -v '^$' > a.txt
+head -n 3000 ref.m.fq | cut -f2 | grep -v '^$' > b.txt
+head -n $(wc -l < a.txt) ref.m.txt | cut -f2 > c.txt
+cmp -s a.txt b.txt && cmp -s a.txt c.txt || { echo "formats disagree"; fails=$((fails + 1)); }
+echo "checked read formats"
+
 if [ $fails -eq 0 ]; then echo "All thread checks PASSED"; else echo "$fails thread checks FAILED"; exit 1; fi
