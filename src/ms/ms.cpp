@@ -74,14 +74,14 @@ static void usage(const char* prog) {
               << "              threads, each with its own K reads in flight (default 1; 0 uses\n"
               << "              every CPU the process may run on).  Each thread takes a block\n"
               << "              of about B reads at a time (--block-reads, default\n"
-              << "              max(2048, 16K)), sized in bytes from the reads seen so far,\n"
+              << "              max(512, 16K)), sized in bytes from the reads seen so far,\n"
               << "              or of N bytes (--block-bytes).  Output named *.gz is written\n"
               << "              gzip-compressed, by all threads (--gzip-level, default 1).\n"
               << "              Results and their order do not depend on K, T or B.  On a\n"
-              << "              machine with several memory nodes (sockets), threads on every\n"
-              << "              node read one copy of the index: interleave its memory (Linux:\n"
-              << "              numactl --interleave=all), or run one process per node on part\n"
-              << "              of the reads (numactl -N i -m i).  A summary goes to stderr:\n"
+              << "              machine with several memory nodes (sockets), the index's\n"
+              << "              memory is interleaved over the nodes (Linux), unless numactl\n"
+              << "              sets a memory policy, as when running one process per node on\n"
+              << "              part of the reads (numactl -N i -m i).  A summary goes to stderr:\n"
               << "              query_ns_per_base is the threads' summed query time per base,\n"
               << "              and wall_ns_per_base the elapsed time per base.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--minima FILE]\n"
@@ -304,7 +304,10 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     if (gzip_level > 9) gzip_level = 9;
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
-    auto opt = read(idx_path);
+    auto opt = [&] {
+        InterleavedAllocation spread;
+        return read(idx_path);
+    }();
     if (!opt) {
         std::cerr << "Failed to load index: " << idx_path << "\n";
         return 1;
@@ -336,7 +339,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     // make a block's per-base results large.  The default keeps K reads in
     // flight for all but the end of a block, and keeps blocks small enough
     // to spread over many threads.
-    if (block_reads == 0) block_reads = std::max<size_t>(2048, 16 * interleave);
+    if (block_reads == 0) block_reads = std::max<size_t>(512, 16 * interleave);
     constexpr size_t max_block_bytes = size_t(1) << 24;
     ReadCutter cutter(*in);
     std::atomic<size_t> seen_records{0}, seen_bytes{0};

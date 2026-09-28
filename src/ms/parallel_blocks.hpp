@@ -12,8 +12,8 @@
  * more than max_ahead blocks past the next one to write, which bounds the
  * memory held by finished blocks when one block is slow.
  *
- * Threads are not pinned to cores; on machines with several memory nodes,
- * place memory with the operating system's tools (see the usage text).
+ * Threads are not pinned to cores.  On machines with several memory nodes,
+ * InterleavedAllocation spreads the index over all of them (see below).
  */
 
 #ifndef _PARALLEL_BLOCKS_HPP
@@ -30,6 +30,8 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 /**
@@ -52,6 +54,47 @@ inline size_t resolve_thread_count(size_t n) {
     const unsigned hw = std::thread::hardware_concurrency();
     return hw > 0 ? hw : 1;
 }
+
+/**
+ * While it exists, the pages that the constructing thread allocates are
+ * spread round-robin over the memory nodes the process may use, so that
+ * threads on every node draw on the bandwidth of all nodes' memory rather
+ * than of one node's.  By default Linux places each page on the node of the
+ * thread that first touches it, which puts an index loaded by one thread on
+ * one node.  It acts only on Linux with more than one allowed node, and only
+ * when the thread has the default memory policy, so that placement chosen
+ * with numactl (for example one process per node) is kept.  Elsewhere it
+ * does nothing.
+ */
+class InterleavedAllocation {
+public:
+    InterleavedAllocation() {
+#if defined(__linux__) && defined(SYS_get_mempolicy) && defined(SYS_set_mempolicy)
+        constexpr int mpol_default = 0, mpol_interleave = 3, mpol_f_mems_allowed = 4;
+        constexpr unsigned long bits = 1024;
+        int mode = -1;
+        if (syscall(SYS_get_mempolicy, &mode, nullptr, 0UL, nullptr, 0UL) != 0 || mode != mpol_default) return;
+        unsigned long mask[bits / (8 * sizeof(unsigned long))] = {};
+        if (syscall(SYS_get_mempolicy, nullptr, mask, bits, nullptr, static_cast<unsigned long>(mpol_f_mems_allowed)) != 0)
+            return;
+        int nodes = 0;
+        for (unsigned long w : mask) nodes += __builtin_popcountl(w);
+        if (nodes < 2) return;
+        // The kernel reads maxnode - 1 bits of the mask.
+        active_ = syscall(SYS_set_mempolicy, mpol_interleave, mask, bits + 1) == 0;
+#endif
+    }
+    ~InterleavedAllocation() {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+        if (active_) syscall(SYS_set_mempolicy, 0, nullptr, 0UL);
+#endif
+    }
+    InterleavedAllocation(const InterleavedAllocation&) = delete;
+    InterleavedAllocation& operator=(const InterleavedAllocation&) = delete;
+
+private:
+    bool active_ = false;
+};
 
 /**
  * Runs the pipeline on `threads` threads (the calling thread alone when it
