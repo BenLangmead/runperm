@@ -291,7 +291,6 @@ inline MSIndexSpillLCP<SP> build(std::vector<uchar>&& heads_in, std::vector<ulin
     const size_t runs = heads.size();
     if (lens_in.size() != runs) throw std::invalid_argument("heads and lens must have one entry per run");
     auto phase = [&](const char* name) { if (o.report) mem_report::phase(name, runs); };
-    orbit::int_vector rows = split_row_lengths(heads, lens_in, o.lf_split);
     // The run lengths, packed.
     orbit::int_vector lens;
     {
@@ -301,6 +300,7 @@ inline MSIndexSpillLCP<SP> build(std::vector<uchar>&& heads_in, std::vector<ulin
         for (size_t i = 0; i < runs; ++i) lens.set(i, lens_in[i]);
         std::vector<ulint>().swap(lens_in);
     }
+    orbit::int_vector rows = split_row_lengths(heads, lens, o.lf_split);
     const size_t R = rows.size();
     phase("ms_split_rows");
 

@@ -772,6 +772,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         TmsBuildOptions opts;
+        opts.report = true;
         bool with_phi = false;
         std::string minima_path, lcp_bin_path;
         for (int i = npos; i < argc; ++i) {
@@ -851,22 +852,36 @@ int main(int argc, char** argv) {
                     }
                 }
             } else if (with_phi) {
+                // Only each run's top is kept, so the file is read a run at a time.
                 ulint n = 0;
                 for (ulint l : lens) n += l;
-                std::vector<RunLcpPairs> pairs;
-                if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
+                rlbwt_io::MinimaReader rd;
+                RunLcpPairs p;
+                bool ok = rd.open(minima_path, heads.size(), n, err);
+                tops.reserve(heads.size());
+                for (size_t i = 0; ok && i < heads.size(); ++i) {
+                    ok = rd.next(p, err);
+                    if (ok) tops.push_back(p[0].second);
+                }
+                if (!ok || !rd.finish(err)) {
                     std::cerr << "Failed to load minima: " << err << "\n";
                     return 1;
                 }
-                tops.reserve(pairs.size());
-                for (const auto& p : pairs) tops.push_back(p[0].second);
             }
+        }
+        // The run lengths, packed.
+        orbit::int_vector run_lens;
+        {
+            ulint max_len = 0;
+            for (ulint l : lens) max_len = std::max(max_len, l);
+            run_lens = orbit::int_vector(lens.size(), orbit::bit_width(max_len));
+            for (size_t i = 0; i < lens.size(); ++i) run_lens.set(i, lens[i]);
+            std::vector<ulint>().swap(lens);
         }
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         mem_report::phase("tms_load", heads.size());
         auto t1 = clock::now();
-        TmsIndex idx(heads, lens, opts, with_phi ? &tops : nullptr);
-        mem_report::phase("tms_assemble", heads.size());
+        TmsIndex idx(heads, run_lens, opts, with_phi ? &tops : nullptr);
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
         std::ofstream out(idx_path, std::ios::binary);

@@ -28,7 +28,7 @@ public:
         enc.set_initial_values(n, rlbwt_heads.size(), max_length, sp);
         int_vector_t img_rank_inv = get_LF_img_rank_inv_packed<int_vector_t>(rlbwt_heads, head_counts);
 
-        enc.init_img_rank_inv(rlbwt_run_lengths, img_rank_inv);
+        enc.init_img_rank_inv(rlbwt_run_lengths, std::move(img_rank_inv));
 
         enc.alphabet_ = alphabet_t(head_counts);
         enc.init_heads(rlbwt_heads, rlbwt_run_lengths);
