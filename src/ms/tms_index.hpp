@@ -75,6 +75,7 @@
 
 #include "orbit/rlbwt.hpp"
 #include "orbit/common.hpp"
+#include "mem_report.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -169,8 +170,11 @@ public:
             std::vector<ulint> row_lens;
             union_rows(heads, lens, opts.lf_split, row_heads, row_lens);
             cols.resize(row_lens.size());
+            mem_report::phase("tms_union_rows", heads.size());
             fill_psi(row_heads, row_lens, cols);
+            mem_report::phase("tms_fill_psi", heads.size());
             lf_enc = Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING);
+            mem_report::phase("tms_lf_enc", heads.size());
         } else {
             lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
             cols.resize(lf_enc.intervals());
@@ -178,6 +182,7 @@ public:
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
             build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, cols);
+            mem_report::phase("tms_build_phi", heads.size());
             has_phi_ = true;
             has_phi_inv_ = opts.phi_inv;
         }

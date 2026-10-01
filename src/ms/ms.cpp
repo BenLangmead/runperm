@@ -12,6 +12,7 @@
 #include "inspect.hpp"
 #include "ms_test.hpp"
 #include "rlbwt_io.hpp"
+#include "mem_report.hpp"
 #include "tms_index.hpp"
 #include "tms_query.hpp"
 #include "tms_smem.hpp"
@@ -706,11 +707,13 @@ int main(int argc, char** argv) {
         }
         ulint n = 0;
         for (ulint l : lens) n += l;
+        mem_report::phase("load_rlbwt", heads.size());
         if (!minima_path.empty()) {
             if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
                 std::cerr << "Failed to load minima: " << err << "\n";
                 return 1;
             }
+            mem_report::phase("read_minima", heads.size());
         } else {
             // Which interior values a run keeps depends on the next run's top,
             // so each run's pairs are made once the next run is read.
@@ -734,15 +737,19 @@ int main(int argc, char** argv) {
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         auto t1 = clock::now();
         apply_lf_splitting(heads, lens, pairs, lf_split, minima_only);
+        mem_report::phase("lf_split", runs);
         auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
             build_spill_data_from_pairs(std::move(pairs), percentile_k, coalesce, false, spill_align, spill_split_bits);
+        mem_report::phase("spill_data", runs);
         MSIndexSpillLCP<false> idx(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub, spill_align,
                                    spill_split_bits);
+        mem_report::phase("assemble", runs);
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
+        mem_report::phase("write", runs);
         std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs() << ", n=" << n
                   << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ", load_s=" << load_s
                   << ", build_s=" << build_s << ")\n";
@@ -861,8 +868,10 @@ int main(int argc, char** argv) {
             }
         }
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+        mem_report::phase("tms_load", heads.size());
         auto t1 = clock::now();
         TmsIndex idx(heads, lens, opts, with_phi ? &tops : nullptr);
+        mem_report::phase("tms_assemble", heads.size());
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
         std::ofstream out(idx_path, std::ios::binary);
@@ -871,6 +880,7 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
+        mem_report::phase("tms_write", heads.size());
         idx.describe(std::cout);
         std::cout << "Built tms index: " << idx_path << " (runs=" << heads.size() << ", bytes=" << bytes
                   << ", load_s=" << load_s << ", build_s=" << build_s << ")\n";
