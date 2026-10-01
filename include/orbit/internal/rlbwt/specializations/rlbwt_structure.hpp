@@ -73,6 +73,23 @@ public:
         return structure; 
     }
 
+    /**
+     * As find_structure(permutation), for a table whose last columns (the
+     * data columns of an integrated permutation) take the given widths and
+     * hold 0, to be written in place with set.
+     */
+    template<typename rlbwt_permutation_t, size_t num_data_cols>
+    static packed_vector<columns> find_structure_with_data(const rlbwt_permutation_t& permutation,
+                                                           const std::array<uchar, num_data_cols>& data_widths) {
+        assert(permutation.get_heads().size() == permutation.intervals());
+        auto widths = get_move_widths(permutation.domain(), permutation.intervals(), permutation.max_length(), permutation.sigma());
+        base::set_data_widths(widths, data_widths);
+        packed_vector<columns> structure(permutation.intervals(), widths);
+        base::populate_structure(structure, permutation);
+        set_characters(structure, permutation.get_heads());
+        return structure;
+    }
+
     uchar get_character(size_t i) const {
         return base::table.template get<cols_traits::CHARACTER>(i);
     }

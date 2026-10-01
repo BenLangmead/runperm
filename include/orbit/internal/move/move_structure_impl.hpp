@@ -50,6 +50,27 @@ public:
         return structure;
     }
 
+    /**
+     * As find_structure, for a table whose last columns, past the base ones
+     * (the data columns of an integrated permutation), take the given widths
+     * and hold 0, to be written in place with set.
+     */
+    template<typename interval_encoding_t, size_t num_data_cols>
+    static packed_vector<columns> find_structure_with_data(const interval_encoding_t& enc,
+                                                           const std::array<uchar, num_data_cols>& data_widths) {
+        auto widths = get_move_widths(enc.domain(), enc.intervals(), enc.max_length());
+        set_data_widths(widths, data_widths);
+        packed_vector<columns> structure(enc.intervals(), widths);
+        populate_structure(structure, enc);
+        return structure;
+    }
+
+    /** Write column col of row i. */
+    template<columns col>
+    void set(size_t i, ulint val) {
+        table.template set<col>(i, val);
+    }
+
     // === Interval Start/Length Accessors ===
     template <typename C = columns>
     std::enable_if_t<!cols_traits_for<C>::RELATIVE, ulint>
@@ -295,6 +316,15 @@ protected:
         return widths;
     }
     
+    // Give the last num_data_cols columns the widths data_widths.
+    template<size_t num_data_cols>
+    static void set_data_widths(std::array<uchar, num_cols>& widths, const std::array<uchar, num_data_cols>& data_widths) {
+        static_assert(num_data_cols <= num_cols, "more data columns than columns");
+        for (size_t j = 0; j < num_data_cols; ++j) {
+            widths[num_cols - num_data_cols + j] = data_widths[j];
+        }
+    }
+
     template<typename interval_encoding_t>
     static void populate_structure(packed_vector<columns>& structure, const interval_encoding_t& enc) {
         size_t start_val = 0;

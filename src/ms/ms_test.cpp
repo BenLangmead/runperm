@@ -20,6 +20,7 @@
 #include <optional>
 #include <stdexcept>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -1013,6 +1014,129 @@ bool test_lf_split(const std::string& data_dir) {
     return true;
 }
 
+/** The bytes MSIndexSpillLCP::serialize writes for idx. */
+template <bool SP>
+static std::string index_bytes(MSIndexSpillLCP<SP>& idx) {
+    std::ostringstream out(std::ios::binary);
+    idx.serialize(out);
+    return out.str();
+}
+
+/**
+ * The index the step-by-step build makes (apply_lcp_splitting,
+ * retained_lcp_pairs, apply_lf_splitting, build_spill_data_from_pairs and
+ * the MSIndexSpillLCP constructor), which ms_build must reproduce.
+ */
+template <bool SP>
+static MSIndexSpillLCP<SP> stepwise_index(std::vector<uchar> heads, std::vector<ulint> lens,
+                                          std::vector<std::vector<ulint>> lcps, const ms_io::BuildOptions& o) {
+    apply_lcp_splitting(heads, lens, lcps, o.split_threshold, o.minima_only);
+    auto pairs = retained_lcp_pairs(lcps, o.minima_only);
+    apply_lf_splitting(heads, lens, pairs, o.lf_split, o.minima_only);
+    auto [run_data, spill, max_top, max_sub, skinny, jumbo] = build_spill_data_from_pairs(
+        std::move(pairs), o.percentile_k, o.coalesce, false, o.spill_align, o.spill_split_bits);
+    return MSIndexSpillLCP<SP>(heads, lens, run_data, std::move(spill), max_top, max_sub, o.spill_align,
+                               o.spill_split_bits);
+}
+
+/**
+ * The streaming build (ms_build) must write the same bytes as the
+ * step-by-step one, from full LCP vectors, from retained pairs and from a
+ * minima file, for every combination of build options and LF splits tried,
+ * on the fuzz texts and minishred.
+ */
+bool test_streaming_build(const std::string& data_dir) {
+    std::cout << "Testing the streaming build against the step-by-step build" << std::endl;
+    std::vector<LfSplitInput> inputs;
+    std::mt19937 rng(2029);
+    for (const auto& s : tms_test::fuzz_texts(rng)) {
+        auto t = tms_test::make_text_bwt(s);
+        inputs.push_back({"fuzz text of length " + std::to_string(s.size()), t.heads, t.lens, t.lcps_per_run});
+    }
+    {
+        LfSplitInput in{"minishred", {}, {}, {}};
+        if (!tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", in.heads, in.lens, in.lcps)) {
+            std::cout << "  DID NOT RUN" << std::endl;
+            return false;
+        }
+        inputs.push_back(std::move(in));
+    }
+    std::vector<ms_io::BuildOptions> configs;
+    for (bool minima : {false, true})
+        for (bool coalesce : {false, true})
+            for (double pk : {0.5, 0.9, 0.98, 1.0})
+                for (auto [align, bits] : {std::pair<ulint, uchar>{0, 0}, {0, 6}, {4, 2}, {8, 0}})
+                    for (ulint split : {SPLIT_THRESHOLD_NEVER, ulint{1}}) {
+                        ms_io::BuildOptions o;
+                        o.minima_only = minima;
+                        o.coalesce = coalesce;
+                        o.percentile_k = pk;
+                        o.spill_align = align;
+                        o.spill_split_bits = bits;
+                        o.split_threshold = split;
+                        configs.push_back(o);
+                    }
+    const std::vector<orbit::split_params> splits = {
+        orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, orbit::DEFAULT_BALANCING),
+        orbit::split_params(std::nullopt, 2),
+        orbit::split_params(2.0, 4),
+    };
+    size_t checks = 0;
+    for (const auto& in : inputs) {
+        for (size_t c = 0; c < configs.size(); ++c) {
+            for (size_t s = 0; s < splits.size(); ++s) {
+                // Every combination on the fuzz texts; a sample on minishred, which is larger.
+                if (&in == &inputs.back() && (c * splits.size() + s) % 7 != 0) continue;
+                ms_io::BuildOptions o = configs[c];
+                o.lf_split = splits[s];
+                auto want = stepwise_index<false>(in.heads, in.lens, in.lcps, o);
+                auto got = ms_io::build_ms_index_spill<false>(in.heads, in.lens, in.lcps, o);
+                if (index_bytes(got) != index_bytes(want)) {
+                    std::cout << "  FAILED for " << in.name << ", config " << c << ", split " << s << std::endl;
+                    assert(false && "the streaming build must write the step-by-step build's bytes");
+                    return false;
+                }
+                if (c % 5 == 0) {
+                    auto want_sp = stepwise_index<true>(in.heads, in.lens, in.lcps, o);
+                    auto got_sp = ms_io::build_ms_index_spill<true>(in.heads, in.lens, in.lcps, o);
+                    if (index_bytes(got_sp) != index_bytes(want_sp)) {
+                        std::cout << "  FAILED with absolute positions for " << in.name << ", config " << c
+                                  << ", split " << s << std::endl;
+                        assert(false && "the streaming build must write the step-by-step build's bytes");
+                        return false;
+                    }
+                }
+                ++checks;
+            }
+        }
+        // As build-rlbwt with a minima file: retained pairs in memory and in a file.
+        ms_io::BuildOptions o;
+        o.minima_only = true; o.percentile_k = 0.9; o.coalesce = true; o.spill_split_bits = 6;
+        const auto pairs = retained_lcp_pairs(in.lcps, true);
+        auto want = stepwise_index<false>(in.heads, in.lens, in.lcps, o);
+        const std::string want_bytes = index_bytes(want);
+        auto from_pairs = ms_build::build(std::vector<uchar>(in.heads), std::vector<ulint>(in.lens),
+                                          ms_build::pairs_source(pairs), ms_io::build_options(o));
+        ulint n = 0;
+        for (ulint l : in.lens) n += l;
+        const std::string mp = data_dir + "/.ms_test_stream.min";
+        assert(rlbwt_io::write_minima(mp, pairs, n));
+        ms_build::Stats st;
+        auto from_file = ms_build::build(std::vector<uchar>(in.heads), std::vector<ulint>(in.lens),
+                                         ms_build::minima_source(mp, in.heads.size(), n), ms_io::build_options(o), &st);
+        std::remove(mp.c_str());
+        if (index_bytes(from_pairs) != want_bytes || index_bytes(from_file) != want_bytes ||
+            st.rows != from_file.move_runs() || st.skinny + st.jumbo != st.rows) {
+            std::cout << "  FAILED from retained pairs for " << in.name << std::endl;
+            assert(false && "the streaming build from pairs must write the step-by-step build's bytes");
+            return false;
+        }
+        checks += 2;
+    }
+    std::cout << "  " << checks << " builds on " << inputs.size() << " inputs PASSED" << std::endl;
+    return true;
+}
+
 }  // anonymous namespace
 
 namespace ms_test {
@@ -1054,6 +1178,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_ms_query_vs_naive_mutated(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_rlbwt_input_path(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!test_streaming_build(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_index_file_roundtrip(data_dir)) all_ran = false;
     std::cout << std::endl;

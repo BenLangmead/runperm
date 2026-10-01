@@ -101,6 +101,26 @@ public:
     permutation_impl(const container1_t& lengths, const container2_t& images, const split_params& sp = split_params())
     : permutation_impl(lengths, images, sp, std::vector<data_tuple>(lengths.size())) {}
 
+    /** Tag of the constructor that leaves the data columns to be written in place. */
+    struct in_place_data_t {};
+    static constexpr in_place_data_t in_place_data{};
+
+    /**
+     * Build from an encoding with each data column's width given and its
+     * values 0, to be written in place with set_data.  The base columns go
+     * straight into the final rows, so neither a table of run data nor a
+     * structure of the base columns alone is made.  The result equals that
+     * of the constructor from an encoding and run data with the same widths.
+     * Integrated data columns only.
+     */
+    template<typename interval_encoding_t>
+    permutation_impl(const interval_encoding_t& enc, const std::array<uchar, num_run_cols>& data_widths, in_place_data_t) {
+        static_assert(integrated_move_structure, "data is written in place only into an integrated move structure");
+        split_params_ = enc.get_split_params();
+        move_structure = move_structure_perm(move_structure_perm::find_structure_with_data(enc, data_widths),
+                                             enc.domain(), enc.runs());
+    }
+
     // Intended constructor for manual splitting of run data.  Data columns
     // marked in zero_width get width 0: they take no bits and read as 0, so
     // their run data must be 0.
@@ -433,6 +453,20 @@ public:
              std::enable_if_t<!std::is_same_v<dc, empty_data_columns>, int> = 0>
     ulint get(position position) const {
         return get<col>(position.interval);
+    }
+
+    /** Write data column col of an interval; the value must fit the column's width.  Integrated only. */
+    template<data_columns col>
+    void set_data(ulint interval, ulint value) {
+        static_assert(integrated_move_structure, "data is written in place only into an integrated move structure");
+        move_structure.template set<cols_traits::template data_column<col>()>(interval, value);
+    }
+
+    /** The width of data column col.  Integrated only. */
+    template<data_columns col>
+    uchar data_width() const {
+        static_assert(integrated_move_structure, "data is written in place only into an integrated move structure");
+        return move_structure.get_widths()[static_cast<size_t>(cols_traits::template data_column<col>())];
     }
 
     template<class dc = data_columns_t,

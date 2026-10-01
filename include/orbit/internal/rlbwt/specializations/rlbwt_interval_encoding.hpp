@@ -16,14 +16,17 @@ public:
 
     rlbwt_interval_encoding_impl() = default;
 
-    static rlbwt_interval_encoding_impl lf_interval_encoding(const std::vector<uchar>& rlbwt_heads, const std::vector<ulint>& rlbwt_run_lengths, const split_params& sp = split_params()) {
+    // The heads and lengths may be any containers indexed by run, such as
+    // std::vector or a packed int_vector.
+    template<typename heads_t, typename lengths_t>
+    static rlbwt_interval_encoding_impl lf_interval_encoding(const heads_t& rlbwt_heads, const lengths_t& rlbwt_run_lengths, const split_params& sp = split_params()) {
         assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
 
         rlbwt_interval_encoding_impl enc;
 
         auto [head_counts, n, max_length] = get_LF_head_counts(rlbwt_heads, rlbwt_run_lengths);
         enc.set_initial_values(n, rlbwt_heads.size(), max_length, sp);
-        std::vector<ulint> img_rank_inv = get_LF_img_rank_inv(rlbwt_heads, head_counts);
+        int_vector_t img_rank_inv = get_LF_img_rank_inv_packed<int_vector_t>(rlbwt_heads, head_counts);
 
         enc.init_img_rank_inv(rlbwt_run_lengths, img_rank_inv);
 

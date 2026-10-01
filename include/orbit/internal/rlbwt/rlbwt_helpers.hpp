@@ -36,7 +36,8 @@ inline std::tuple<std::vector<size_t>, std::vector<size_t>, ulint> get_LF_char_c
     return {char_count, head_ranks, bwt_length};
 }
 
-inline std::tuple<std::vector<size_t>, size_t, ulint> get_LF_head_counts(const std::vector<uchar> &rlbwt_heads, const std::vector<ulint> &rlbwt_run_lengths) {
+template<typename heads_t, typename lengths_t>
+inline std::tuple<std::vector<size_t>, size_t, ulint> get_LF_head_counts(const heads_t &rlbwt_heads, const lengths_t &rlbwt_run_lengths) {
     assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
 
     std::vector<size_t> head_counts(MAX_ALPHABET_SIZE, 0);
@@ -88,6 +89,23 @@ inline std::vector<ulint> get_LF_img_rank_inv(const std::vector<uchar> &rlbwt_he
         ++seen_heads[c];
     }
 
+    return img_rank_inv;
+}
+
+// As get_LF_img_rank_inv, in a packed vector of int_vector_t, from heads in
+// any container indexed by run.
+template<typename int_vector_t, typename heads_t>
+inline int_vector_t get_LF_img_rank_inv_packed(const heads_t &rlbwt_heads, const std::vector<size_t> &head_counts) {
+    const size_t r = rlbwt_heads.size();
+    int_vector_t img_rank_inv(r, bit_width(r == 0 ? 0 : r - 1));
+    std::vector<size_t> next(head_counts.size(), 0);
+    for (size_t i = 0, seen = 0; i < head_counts.size(); i++) {
+        next[i] = seen;
+        seen += head_counts[i];
+    }
+    for (size_t i = 0; i < r; i++) {
+        img_rank_inv[next[static_cast<uchar>(rlbwt_heads[i])]++] = i;
+    }
     return img_rank_inv;
 }
 

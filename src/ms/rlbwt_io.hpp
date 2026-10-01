@@ -97,69 +97,54 @@ inline bool load_rlbwt(const std::string& heads_path, const std::string& lens_pa
 }
 
 /**
- * Read a TeraLCP -ominima file (format TLMSM v1, documented in TeraTools
- * src/TeraLCP/MS_MINIMA_FORMAT.md) into per-run pairs: element 0 of each run
- * is (0, top) and the rest are the stored interior (offset, value) pairs in
- * increasing offset order.  expected_runs and expected_n are checked against
- * the header.
+ * Sequential reader of a TeraLCP -ominima file (format TLMSM v1, documented
+ * in TeraTools src/TeraLCP/MS_MINIMA_FORMAT.md), one run at a time, so that
+ * a build can stream the file instead of holding every run's pairs.  next()
+ * gives a run's pairs: element 0 is (0, top) and the rest are the stored
+ * interior (offset, value) pairs in increasing offset order.  finish()
+ * checks that the file ends after the last run and that the pair count
+ * matches the header.  On failure a call returns false and sets err.
  */
-inline bool read_minima(const std::string& path, size_t expected_runs, ulint expected_n,
-                        std::vector<std::vector<std::pair<ulint, ulint>>>& runs, std::string& err) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.good()) { err = "cannot open " + path; return false; }
-    std::array<unsigned char, 48> h{};
-    in.read(reinterpret_cast<char*>(h.data()), 48);
-    if (!in.good()) { err = "short header in " + path; return false; }
-    static const unsigned char magic[8] = {0x93, 'T', 'L', 'M', 'S', 'M', 0x00, 0x01};
-    if (std::memcmp(h.data(), magic, 8) != 0) { err = path + " is not a TLMSM v1 minima file"; return false; }
-    auto u64 = [&](size_t at) { ulint v = 0; for (int b = 7; b >= 0; --b) v = (v << 8) | h[at + b]; return v; };
-    const unsigned flags = h[8];
-    const ulint r = u64(16), n = u64(24), total_pairs = u64(32);
-    if (flags & 4) {
-        err = "minima file run numbering differs from its input's (sentinel runs were split); "
-              "use heads/lens written by TeraLCP for the same input";
-        return false;
-    }
-    if (r != expected_runs) {
-        err = "minima file has " + std::to_string(r) + " runs but the RLBWT has " + std::to_string(expected_runs);
-        return false;
-    }
-    if (n != expected_n) {
-        err = "minima file has n = " + std::to_string(n) + " but the RLBWT has n = " + std::to_string(expected_n);
-        return false;
-    }
-    std::vector<unsigned char> buf(1 << 20);
-    size_t have = 0, pos = 0;
-    bool eof = false;
-    auto byte = [&](unsigned char& c) {
-        if (pos == have) {
-            if (eof) return false;
-            in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
-            have = static_cast<size_t>(in.gcount());
-            pos = 0;
-            if (have < buf.size()) eof = true;
-            if (have == 0) return false;
+class MinimaReader {
+public:
+    /** Open path and check its header against expected_runs and expected_n. */
+    bool open(const std::string& path, size_t expected_runs, ulint expected_n, std::string& err) {
+        in_.open(path, std::ios::binary);
+        if (!in_.good()) { err = "cannot open " + path; return false; }
+        std::array<unsigned char, 48> h{};
+        in_.read(reinterpret_cast<char*>(h.data()), 48);
+        if (!in_.good()) { err = "short header in " + path; return false; }
+        static const unsigned char magic[8] = {0x93, 'T', 'L', 'M', 'S', 'M', 0x00, 0x01};
+        if (std::memcmp(h.data(), magic, 8) != 0) { err = path + " is not a TLMSM v1 minima file"; return false; }
+        auto u64 = [&](size_t at) { ulint v = 0; for (int b = 7; b >= 0; --b) v = (v << 8) | h[at + b]; return v; };
+        const unsigned flags = h[8];
+        const ulint r = u64(16), n = u64(24);
+        total_pairs_ = u64(32);
+        if (flags & 4) {
+            err = "minima file run numbering differs from its input's (sentinel runs were split); "
+                  "use heads/lens written by TeraLCP for the same input";
+            return false;
         }
-        c = buf[pos++];
+        if (r != expected_runs) {
+            err = "minima file has " + std::to_string(r) + " runs but the RLBWT has " + std::to_string(expected_runs);
+            return false;
+        }
+        if (n != expected_n) {
+            err = "minima file has n = " + std::to_string(n) + " but the RLBWT has n = " + std::to_string(expected_n);
+            return false;
+        }
+        runs_ = static_cast<size_t>(r);
+        buf_.resize(1 << 20);
         return true;
-    };
-    auto uleb = [&](ulint& v) {
-        v = 0;
-        unsigned shift = 0;
-        unsigned char c;
-        do {
-            if (!byte(c) || shift > 63) return false;
-            v |= static_cast<ulint>(c & 0x7f) << shift;
-            shift += 7;
-        } while (c & 0x80);
-        return true;
-    };
-    runs.assign(static_cast<size_t>(r), {});
-    ulint pairs_seen = 0;
-    for (size_t i = 0; i < r; ++i) {
+    }
+
+    /** Read the next run's pairs into run, replacing its contents. */
+    template <typename Pairs>
+    bool next(Pairs& run, std::string& err) {
+        const size_t i = done_;
         ulint top, count;
-        if (!uleb(top) || !uleb(count)) { err = "truncated record " + std::to_string(i); return false; }
-        auto& run = runs[i];
+        if (done_ == runs_ || !uleb(top) || !uleb(count)) { err = "truncated record " + std::to_string(i); return false; }
+        run.clear();
         run.reserve(static_cast<size_t>(count) + 1);
         run.emplace_back(0, top);
         ulint off = 0;
@@ -169,12 +154,65 @@ inline bool read_minima(const std::string& path, size_t expected_runs, ulint exp
             off += gap;
             run.emplace_back(off, val);
         }
-        pairs_seen += count;
+        pairs_seen_ += count;
+        ++done_;
+        return true;
     }
-    unsigned char extra;
-    if (byte(extra)) { err = "trailing bytes after the last record"; return false; }
-    if (pairs_seen != total_pairs) { err = "pair count does not match the header"; return false; }
-    return true;
+
+    /** Check the end of the file, after the last run. */
+    bool finish(std::string& err) {
+        unsigned char extra;
+        if (byte(extra)) { err = "trailing bytes after the last record"; return false; }
+        if (pairs_seen_ != total_pairs_) { err = "pair count does not match the header"; return false; }
+        return true;
+    }
+
+    size_t runs() const { return runs_; }
+
+private:
+    std::ifstream in_;
+    std::vector<unsigned char> buf_;
+    size_t have_ = 0, pos_ = 0, runs_ = 0, done_ = 0;
+    bool eof_ = false;
+    ulint total_pairs_ = 0, pairs_seen_ = 0;
+
+    bool byte(unsigned char& c) {
+        if (pos_ == have_) {
+            if (eof_) return false;
+            in_.read(reinterpret_cast<char*>(buf_.data()), static_cast<std::streamsize>(buf_.size()));
+            have_ = static_cast<size_t>(in_.gcount());
+            pos_ = 0;
+            if (have_ < buf_.size()) eof_ = true;
+            if (have_ == 0) return false;
+        }
+        c = buf_[pos_++];
+        return true;
+    }
+    bool uleb(ulint& v) {
+        v = 0;
+        unsigned shift = 0;
+        unsigned char c;
+        do {
+            if (!byte(c) || shift > 63) return false;
+            v |= static_cast<ulint>(c & 0x7f) << shift;
+            shift += 7;
+        } while (c & 0x80);
+        return true;
+    }
+};
+
+/**
+ * Read a TeraLCP -ominima file into per-run pairs (see MinimaReader), with
+ * expected_runs and expected_n checked against the header.
+ */
+inline bool read_minima(const std::string& path, size_t expected_runs, ulint expected_n,
+                        std::vector<std::vector<std::pair<ulint, ulint>>>& runs, std::string& err) {
+    MinimaReader rd;
+    if (!rd.open(path, expected_runs, expected_n, err)) return false;
+    runs.assign(rd.runs(), {});
+    for (auto& run : runs)
+        if (!rd.next(run, err)) return false;
+    return rd.finish(err);
 }
 
 /**

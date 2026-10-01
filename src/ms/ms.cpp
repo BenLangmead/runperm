@@ -7,6 +7,7 @@
  */
 
 #include "ms_rlbwt.hpp"
+#include "ms_build.hpp"
 #include "tsv.hpp"
 #include "serialize.hpp"
 #include "inspect.hpp"
@@ -626,18 +627,22 @@ int main(int argc, char** argv) {
         }
         const size_t runs = bwt_heads.size();
         apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, split_threshold, minima_only);
-        auto pairs = retained_lcp_pairs(lcps_per_run, minima_only);
-        std::vector<std::vector<ulint>>().swap(lcps_per_run);
-        apply_lf_splitting(bwt_heads, bwt_run_lengths, pairs, lf_split, minima_only);
-        auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] = build_spill_data_from_pairs(
-            std::move(pairs), percentile_k, coalesce, false /* coalesce_lcp_separately */, spill_align, spill_split_bits);
-        MSIndexSpillLCP<false> idx(bwt_heads, bwt_run_lengths, run_data, std::move(spill_vectors), max_top, max_sub, spill_align, spill_split_bits);
+        ms_build::Options bo;
+        bo.percentile_k = percentile_k;
+        bo.coalesce = coalesce;
+        bo.spill_align = spill_align;
+        bo.spill_split_bits = spill_split_bits;
+        bo.minima_only = minima_only;
+        bo.lf_split = lf_split;
+        ms_build::Stats st;
+        auto idx = ms_build::build(std::move(bwt_heads), std::move(bwt_run_lengths),
+                                   ms_build::lcp_vectors_source(lcps_per_run, minima_only), bo, &st);
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
         std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs()
-                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ")\n";
+                  << ", skinny=" << st.skinny << ", jumbo=" << st.jumbo << ")\n";
         return 0;
     }
 
@@ -699,7 +704,6 @@ int main(int argc, char** argv) {
         auto t0 = clock::now();
         std::vector<uchar> heads;
         std::vector<ulint> lens;
-        std::vector<RunLcpPairs> pairs;
         std::string err;
         if (!rlbwt_io::load_rlbwt(heads_path, lens_path, heads, lens, err)) {
             std::cerr << "Failed to load RLBWT: " << err << "\n";
@@ -708,50 +712,41 @@ int main(int argc, char** argv) {
         ulint n = 0;
         for (ulint l : lens) n += l;
         mem_report::phase("load_rlbwt", heads.size());
-        if (!minima_path.empty()) {
-            if (!rlbwt_io::read_minima(minima_path, heads.size(), n, pairs, err)) {
-                std::cerr << "Failed to load minima: " << err << "\n";
-                return 1;
-            }
-            mem_report::phase("read_minima", heads.size());
-        } else {
-            // Which interior values a run keeps depends on the next run's top,
-            // so each run's pairs are made once the next run is read.
-            pairs.resize(heads.size());
-            std::vector<ulint> prev, kept;
-            auto finish = [&](size_t i, const std::vector<ulint>* next) {
-                compress_lcps(prev, next, kept, minima_only);
-                pairs[i] = detail::compressed_to_pairs(kept);
-            };
-            const bool ok = rlbwt_io::for_each_run_lcps(lcp_bin_path, lens, [&](size_t i, const std::vector<ulint>& v) {
-                if (i > 0) finish(i - 1, &v);
-                prev = v;
-            }, err);
-            if (!ok) {
-                std::cerr << "Failed to load LCPs: " << err << "\n";
-                return 1;
-            }
-            finish(heads.size() - 1, nullptr);
-        }
         const size_t runs = heads.size();
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         auto t1 = clock::now();
-        apply_lf_splitting(heads, lens, pairs, lf_split, minima_only);
-        mem_report::phase("lf_split", runs);
-        auto [run_data, spill_vectors, max_top, max_sub, skinny_count, jumbo_count] =
-            build_spill_data_from_pairs(std::move(pairs), percentile_k, coalesce, false, spill_align, spill_split_bits);
-        mem_report::phase("spill_data", runs);
-        MSIndexSpillLCP<false> idx(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub, spill_align,
-                                   spill_split_bits);
-        mem_report::phase("assemble", runs);
+        ms_build::Options bo;
+        bo.percentile_k = percentile_k;
+        bo.coalesce = coalesce;
+        bo.spill_align = spill_align;
+        bo.spill_split_bits = spill_split_bits;
+        bo.minima_only = minima_only;
+        bo.lf_split = lf_split;
+        bo.report = true;
+        ms_build::Stats st;
+        std::optional<MSIndexSpillLCP<false>> idx;
+        try {
+            if (!minima_path.empty()) {
+                idx = ms_build::build(std::move(heads), std::move(lens), ms_build::minima_source(minima_path, runs, n),
+                                      bo, &st);
+            } else {
+                // The LCP file is read by run, so its source keeps the run lengths.
+                const std::vector<ulint> run_lens = lens;
+                idx = ms_build::build(std::move(heads), std::move(lens),
+                                      ms_build::lcp_bin_source(lcp_bin_path, run_lens, minima_only), bo, &st);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to build: " << e.what() << "\n";
+            return 1;
+        }
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
-        if (!ms_serialize::write_index(idx_path, idx)) {
+        if (!ms_serialize::write_index(idx_path, *idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
         }
         mem_report::phase("write", runs);
-        std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs() << ", n=" << n
-                  << ", skinny=" << skinny_count << ", jumbo=" << jumbo_count << ", load_s=" << load_s
+        std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx->move_runs() << ", n=" << n
+                  << ", skinny=" << st.skinny << ", jumbo=" << st.jumbo << ", load_s=" << load_s
                   << ", build_s=" << build_s << ")\n";
         return 0;
     }
