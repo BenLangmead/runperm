@@ -33,9 +33,14 @@
  *  - With psi, a table of F block starts.  An F block starts at a row start
  *    (the image of the first run of its character), so a row's F character
  *    is the block its index falls in.
- *  - Optionally, phi over text positions, starts-based (rows store absolute
- *    starts), with an integrated PLCP column holding PLCP at each interval's
- *    start.
+ *  - Optionally, phi over text positions, with an integrated PLCP column
+ *    holding PLCP at each interval's start, in two forms over the same
+ *    intervals: lengths-based (rows store lengths) and starts-based (rows
+ *    store absolute starts).  A phi point of the lengths-based form is an
+ *    interval and offset, enough for matching statistics; the starts-based
+ *    form also gives its text position, which positions and SMEM reports
+ *    need, at the cost of a wider row.  The file holds both, and a load
+ *    reads only the one its query needs.
  *  - Optionally, with phi, phi_inv over text positions (SA[j] to SA[j + 1]),
  *    starts-based, with an integrated PLCPB column: the LCP of the row with
  *    the row below, at each interval's start.  Inside a phi_inv interval
@@ -86,6 +91,7 @@
 #include <streambuf>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -115,6 +121,9 @@ enum class TmsLayout { FULL, PSI, PHI };
  */
 struct TmsParts {
     bool psi = false, phi = false, phi_inv = false;
+    // With phi, phi's starts-based form rather than its lengths-based form.
+    // An index that holds phi holds both forms.
+    bool phi_starts = false;
 };
 
 /** Splitting parameters for each move structure of a TmsIndex. */
@@ -135,11 +144,18 @@ public:
     using LF = orbit::rlbwt::lf_permutation<TmsLFCols, true, false>;
     using Phi = orbit::rlbwt::phi_permutation_impl<TmsPhiCols, true, true, orbit::move_vector>;
     using PhiInv = orbit::rlbwt::phi_inv_permutation_impl<TmsPhiInvCols, true, true, orbit::move_vector>;
+    // phi's lengths-based form, over the same intervals as Phi.
+    using PhiLen = orbit::permutation_impl<TmsPhiCols, true, false, false, orbit::move_columns, orbit::move_structure,
+                                           orbit::move_vector>;
     using LFPos = typename LF::position;
     // A psi point: an LF position whose F character and psi step psi reads.
     using FLPos = LFPos;
     using PhiPos = typename Phi::position;
     using PhiInvPos = typename PhiInv::position;
+    // A phi point of the lengths-based form: an interval and offset, without a text position.
+    using PhiLenPos = typename PhiLen::position;
+    template <bool Starts>
+    using PhiPosOf = std::conditional_t<Starts, PhiPos, PhiLenPos>;
     using position = LFPos;
     // The most F blocks after the first: one per character of the
     // alphabet but the smallest.
@@ -178,7 +194,7 @@ public:
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
             build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, cols);
-            has_phi_ = true;
+            has_phi_ = has_phi_starts_ = has_phi_len_ = true;
             has_phi_inv_ = opts.phi_inv;
         }
         // The columns of parts the index lacks hold zeros and take no bits.
@@ -201,10 +217,13 @@ public:
     /**
      * Write the index in Orbit's packed serialization, host byte order: a
      * header with the parts the index holds, LF, with psi the table of F
-     * block starts, and then each part's structure present, phi and phi_inv,
-     * after its size in bytes so that load() can skip it.
+     * block starts, and then each part's structure present, phi (lengths-based,
+     * then starts-based) and phi_inv, after its size in bytes so that load()
+     * can skip it.  Throws if the index was loaded with only one form of phi.
      */
     size_t serialize(std::ostream& out) {
+        if (has_phi_ && !(has_phi_len_ && has_phi_starts_))
+            throw std::logic_error("an index loaded with one form of phi cannot be written");
         size_t bytes = 0;
         out.write(MAGIC, 4);
         const uint32_t v = VERSION, flags = parts_flags(parts());
@@ -219,7 +238,10 @@ public:
             }
             bytes += F_BLOCKS * sizeof(uint64_t);
         }
-        if (has_phi_) bytes += serialize_sized(phi_, out);
+        if (has_phi_) {
+            bytes += serialize_sized(phi_len_, out);
+            bytes += serialize_sized(phi_, out);
+        }
         if (has_phi_inv_) bytes += serialize_sized(phi_inv_, out);
         return bytes;
     }
@@ -237,8 +259,14 @@ public:
     bool has_psi() const { return has_psi_; }
     bool has_phi() const { return has_phi_; }
     bool has_phi_inv() const { return has_phi_inv_; }
-    /** The parts the index holds, or those loaded if load() skipped some. */
-    TmsParts parts() const { return TmsParts{has_psi_, has_phi_, has_phi_inv_}; }
+    /** Whether phi's starts-based form, and its lengths-based form, are present. */
+    bool has_phi_starts() const { return has_phi_starts_; }
+    bool has_phi_lengths() const { return has_phi_len_; }
+    /**
+     * The parts the index holds, or those loaded if load() skipped some;
+     * phi_starts says whether the starts-based form of phi is present.
+     */
+    TmsParts parts() const { return TmsParts{has_psi_, has_phi_, has_phi_inv_, has_phi_starts_}; }
     /** The name of the layout with the given parts: full, psi, phi, or none (LF alone). */
     static std::string layout_name(const TmsParts& p) {
         return p.psi && p.phi ? "full" : p.psi ? "psi" : p.phi ? "phi" : "none";
@@ -303,21 +331,31 @@ public:
     void prefetch_psi(ulint i) const { lf_.prefetch(i); }
     ulint psi_intervals() const { return lf_.intervals(); }
 
-    // phi side.  The text position of a phi point is its idx.
-    /** phi point of the text position of LF interval k's head row. */
-    PhiPos phi_at_head(ulint k) const {
-        PhiPos p;
+    // phi side.  The text position of a phi point of the starts-based form
+    // is its idx.  The functions that take a phi point serve either form,
+    // and the others take the form as Starts.
+    /** phi point of the text position of LF interval k's head row, unresolved. */
+    template <bool Starts = true>
+    PhiPosOf<Starts> phi_at_head(ulint k) const {
+        PhiPosOf<Starts> p;
         p.interval = lf_.template get<TmsLFCols::PHI_INT>(k);
         p.offset = lf_.template get<TmsLFCols::PHI_OFF>(k);
-        p.idx = 0;  // set by resolve_phi
+        if constexpr (Starts) p.idx = 0;  // set by resolve_phi
         return p;
     }
-    /** Fill in the text position of a phi point from its interval and offset. */
+    /** Resolve a phi point whose offset may run past its interval, filling in its text position. */
     PhiPos resolve_phi(PhiPos p) const { return phi_.finish_next(p); }
+    PhiLenPos resolve_phi(PhiLenPos p) const { return phi_len_.finish_next(p); }
     PhiPos phi(PhiPos p) { return phi_.phi(p); }
     PhiPos start_phi(PhiPos p) const { return phi_.start_next(p); }
+    PhiLenPos start_phi(PhiLenPos p) const { return phi_len_.start_next(p); }
     PhiPos finish_phi(PhiPos p) const { return phi_.finish_next(p); }
-    void prefetch_phi(ulint i) const { phi_.prefetch(i); }
+    PhiLenPos finish_phi(PhiLenPos p) const { return phi_len_.finish_next(p); }
+    template <bool Starts = true>
+    void prefetch_phi(ulint i) const {
+        if constexpr (Starts) phi_.prefetch(i);
+        else phi_len_.prefetch(i);
+    }
     /** The phi point one text position to the left, wrapping at position 0. */
     PhiPos phi_left(PhiPos p) {
         if (p.offset > 0) {
@@ -327,9 +365,18 @@ public:
         }
         return phi_.up(p);
     }
+    PhiLenPos phi_left(PhiLenPos p) {
+        if (p.offset > 0) {
+            --p.offset;
+            return p;
+        }
+        return phi_len_.up(p);
+    }
     /** PLCP at a phi point: the LCP of its row with the row above. */
     ulint plcp(PhiPos p) const { return phi_.template get<TmsPhiCols::PLCP>(p.interval) - p.offset; }
-    ulint phi_intervals() const { return phi_.intervals(); }
+    ulint plcp(PhiLenPos p) const { return phi_len_.template get<TmsPhiCols::PLCP>(p.interval) - p.offset; }
+    /** phi's intervals, the same in both forms. */
+    ulint phi_intervals() const { return has_phi_starts_ ? phi_.intervals() : phi_len_.intervals(); }
     /** The first text position of phi interval i. */
     ulint phi_start(ulint i) const { return phi_.get_start(i); }
     /** The phi point of text position x, by binary search over interval starts narrowed by the start table. */
@@ -410,7 +457,7 @@ public:
         auto pick = [&](const auto& perm) {
             return shift < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(shift);
         };
-        if (has_phi_) phi_table_ = StartTable(phi_, pick(phi_));
+        if (has_phi_starts_) phi_table_ = StartTable(phi_, pick(phi_));
         if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_));
     }
     /** Bytes the start tables take. */
@@ -685,9 +732,16 @@ public:
         widths(w);
         os << " row_bits=" << row_bits(w) << "\n";
         double total = double(row_bits(w)) * lf_.intervals();
-        if (has_phi_) {
+        if (has_phi_len_) {
+            const auto& pw = phi_len_.get_widths();
+            os << "phi (lengths): intervals=" << phi_len_.intervals() << " widths(len,ptr,off,plcp)=";
+            widths(pw);
+            os << " row_bits=" << row_bits(pw) << "\n";
+            total += double(row_bits(pw)) * phi_len_.intervals();
+        }
+        if (has_phi_starts_) {
             const auto& pw = phi_.get_widths();
-            os << "phi: intervals=" << phi_.intervals() << " widths(start,ptr,off,plcp)=";
+            os << "phi (starts): intervals=" << phi_.intervals() << " widths(start,ptr,off,plcp)=";
             widths(pw);
             os << " row_bits=" << row_bits(pw) << "\n";
             total += double(row_bits(pw)) * phi_.intervals();
@@ -704,14 +758,16 @@ public:
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 6;
+    static constexpr uint32_t VERSION = 7;
     // Header flags for the parts an index holds.
     static constexpr uint32_t FLAG_PHI = 1, FLAG_PHI_INV = 2, FLAG_PSI = 4;
 
     LF lf_;
     Phi phi_;
+    PhiLen phi_len_;
     PhiInv phi_inv_;
-    bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false;
+    // has_phi_: the PHI columns and at least one form of phi.
+    bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false, has_phi_starts_ = false, has_phi_len_ = false;
     // Start tables of phi and phi_inv, built when phi_inv is present.
     StartTable phi_table_, phi_inv_table_;
     std::array<bool, 256> occurs_{};
@@ -786,8 +842,8 @@ private:
 
     /**
      * load() with the parts in *need, or every part the index holds if need
-     * is null.  phi_inv, whose start tables take time to build, is read only
-     * with phi.
+     * is null, when both forms of phi are read.  phi_inv, whose start tables
+     * take time to build, is read only with phi.
      */
     void load(std::istream& in, const TmsParts* need) {
         char magic[4] = {};
@@ -797,7 +853,8 @@ private:
         in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
         if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
         if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
-        const TmsParts held{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0};
+        const TmsParts held{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0,
+                            (flags & FLAG_PHI) != 0};
         const TmsParts want = need ? *need : held;
         check_parts(held, want);
         lf_.load(in);
@@ -811,7 +868,12 @@ private:
         has_psi_ = want.psi;
         has_phi_ = want.phi;
         has_phi_inv_ = want.phi && want.phi_inv;
-        if (held.phi) load_sized(phi_, in, has_phi_);
+        has_phi_starts_ = want.phi && want.phi_starts;
+        has_phi_len_ = want.phi && (!need || !want.phi_starts);
+        if (held.phi) {
+            load_sized(phi_len_, in, has_phi_len_);
+            load_sized(phi_, in, has_phi_starts_);
+        }
         if (held.phi_inv && has_phi_inv_) load_sized(phi_inv_, in, true);
         if (!in.good()) throw std::runtime_error("truncated tms index");
         compute_occurs();
@@ -979,18 +1041,19 @@ private:
     }
 
     /**
-     * A starts-based permutation over text positions whose intervals start at
-     * starts (sorted, starting at 0) with the given images, and one integrated
-     * column holding an LCP value that drops by one per position inside an
-     * interval, sampled at each start.  Split intervals get the sample minus
-     * their distance from the original start.  Also returns the starts of the
-     * split intervals.
+     * The split intervals of a permutation over text positions whose
+     * intervals start at starts (sorted, starting at 0) with the given
+     * images, and for each one integrated column holding an LCP value that
+     * drops by one per position inside an interval, sampled at each start.
+     * Split intervals get the sample minus their distance from the original
+     * start.  Each Perm type in Perms is built from them, in that order,
+     * followed by the starts of the split intervals.
      */
-    template <typename Perm, typename Cols>
-    static std::pair<Perm, std::vector<ulint>> sampled_permutation(const std::vector<ulint>& starts,
-                                                                   const std::vector<ulint>& images,
-                                                                   const std::vector<ulint>& samples, ulint n,
-                                                                   const orbit::split_params& sp) {
+    template <typename Cols, typename... Perms>
+    static std::tuple<Perms..., std::vector<ulint>> sampled_permutation(const std::vector<ulint>& starts,
+                                                                       const std::vector<ulint>& images,
+                                                                       const std::vector<ulint>& samples, ulint n,
+                                                                       const orbit::split_params& sp) {
         if (starts.empty() || starts[0] != 0) throw std::logic_error("a permutation over text positions must start at 0");
         std::vector<ulint> lengths(starts.size());
         ulint max_length = 0;
@@ -1011,7 +1074,7 @@ private:
             split_starts[i] = s;
             s += enc.get_length(i);
         }
-        return {Perm(enc, cols), std::move(split_starts)};
+        return {Perms(enc, cols)..., std::move(split_starts)};
     }
 
     /**
@@ -1082,7 +1145,8 @@ private:
                  return top[k];
              });
         std::vector<ulint> split_starts;
-        std::tie(phi_, split_starts) = sampled_permutation<Phi, TmsPhiCols>(starts, images, samples, n, sp);
+        std::tie(phi_, phi_len_, split_starts) =
+            sampled_permutation<TmsPhiCols, Phi, PhiLen>(starts, images, samples, n, sp);
         for (ulint k = 0; k < lf_count; ++k) {
             const ulint p = sa_head[k];
             const ulint i = static_cast<ulint>(std::upper_bound(split_starts.begin(), split_starts.end(), p) -
@@ -1102,7 +1166,7 @@ private:
                  if (top[k + 1] == NOT_A_RUN_HEAD) throw std::logic_error("a true run head must start an original run");
                  return top[k + 1];
              });
-        std::tie(phi_inv_, split_starts) = sampled_permutation<PhiInv, TmsPhiInvCols>(starts, images, samples, n, sp);
+        std::tie(phi_inv_, split_starts) = sampled_permutation<TmsPhiInvCols, PhiInv>(starts, images, samples, n, sp);
     }
 
     static constexpr ulint NOT_A_RUN_HEAD = std::numeric_limits<ulint>::max();

@@ -47,14 +47,16 @@ enum class TmsReport {
 /**
  * The parts of a TmsIndex (see TmsParts) that tms_query_batch in a mode, with
  * or without positions, and then a report, read.  Positions and SMEM reports
- * need the toehold, which phi keeps; walking the rows of an SMEM for
- * SMEM_ALL needs phi_inv.
+ * need the toehold's text position, which phi's starts-based form gives;
+ * matching statistics alone walk the narrower lengths-based form.  Walking
+ * the rows of an SMEM for SMEM_ALL needs phi_inv.
  */
 inline TmsParts tms_query_parts(TmsMode mode, bool positions, TmsReport report) {
     TmsParts p;
     p.psi = mode != TmsMode::PHI;
     p.phi = mode != TmsMode::PSI || positions || report != TmsReport::MS;
     p.phi_inv = report == TmsReport::SMEM_ALL;
+    p.phi_starts = positions || report != TmsReport::MS;
     return p;
 }
 

@@ -162,15 +162,18 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * ColumnAccess).  out_len[j] receives the statistics for patterns[j]; if positions is true,
  * out_pos[j] receives for each one a text position where it occurs
  * (TMS_NO_POS with a statistic of 0).  PHI, PHISKIP, DUAL and positions need
- * an index with phi, and PSI, PHISKIP and DUAL one with psi.
+ * an index with phi, and PSI, PHISKIP and DUAL one with psi.  PhiStarts
+ * says which form of phi the walks and the toehold use; positions need the
+ * starts-based form.
  */
-template <TmsMode Mode, bool Positions, class Access>
+template <TmsMode Mode, bool Positions, bool PhiStarts, class Access>
 inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vector<std::string>& patterns, size_t k,
                                  std::vector<std::vector<ulint>>& out_len,
                                  std::vector<std::vector<ulint>>* out_pos) {
     using LFPos = TmsIndex::LFPos;
     using FLPos = TmsIndex::FLPos;
-    using PhiPos = TmsIndex::PhiPos;
+    using PhiPos = TmsIndex::PhiPosOf<PhiStarts>;
+    static_assert(PhiStarts || !Positions, "positions need phi's starts-based form");
     constexpr bool Toehold = Positions || Mode != TmsMode::PSI;
     constexpr ulint INF = std::numeric_limits<ulint>::max();
     enum : uint8_t { STEP, SCAN, WALK, PRED_POS };
@@ -217,7 +220,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     if constexpr (Positions) out_pos->resize(patterns.size());
     if (k == 0) k = 1;
     PhiPos init_ph{};
-    if constexpr (Toehold) init_ph = idx.resolve_phi(idx.phi_at_head(0));
+    if constexpr (Toehold) init_ph = idx.resolve_phi(idx.template phi_at_head<PhiStarts>(0));
     std::vector<Slot> slots(k);
     size_t next = 0;
     auto start = [&](Slot& s) {
@@ -276,7 +279,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                 x.value = std::min(x.phi_min, cap);
             } else {
                 x.p = idx.start_phi(p);
-                idx.prefetch_phi(x.p.interval);
+                idx.template prefetch_phi<PhiStarts>(x.p.interval);
             }
         }
     };
@@ -292,7 +295,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         if constexpr (Toehold) {
             s.ph = idx.phi_left(s.ph);
             // The next move left from offset 0 reads the row above.
-            if (s.ph.offset == 0) idx.prefetch_phi(s.ph.interval > 0 ? s.ph.interval - 1 : idx.phi_intervals() - 1);
+            if (s.ph.offset == 0)
+                idx.template prefetch_phi<PhiStarts>(s.ph.interval > 0 ? s.ph.interval - 1 : idx.phi_intervals() - 1);
         }
         if constexpr (Positions) s.ms_pos[s.i - 1] = s.ph.idx;
         s.state = STEP;
@@ -395,13 +399,18 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                                 acc.prefetch_psi(s.down.q.interval);
                                 if (s.d < last_run) acc.prefetch_psi(s.d + 1);
                             }
-                            if (s.down.phi_on) { s.down.p = idx.phi_at_head(s.d); idx.prefetch_phi(s.down.p.interval); }
+                            if (s.down.phi_on) {
+                                s.down.p = idx.template phi_at_head<PhiStarts>(s.d);
+                                idx.template prefetch_phi<PhiStarts>(s.down.p.interval);
+                            }
                         }
                     }
                     if constexpr (Toehold) {
                         // Rows the new toehold is read from, whichever side wins.
-                        if (found_up) idx.prefetch_phi(idx.phi_at_head(s.u + 1).interval);
-                        if (found_down) idx.prefetch_phi(idx.phi_at_head(s.d).interval);
+                        if (found_up)
+                            idx.template prefetch_phi<PhiStarts>(idx.template phi_at_head<PhiStarts>(s.u + 1).interval);
+                        if (found_down)
+                            idx.template prefetch_phi<PhiStarts>(idx.template phi_at_head<PhiStarts>(s.d).interval);
                     }
                     s.state = WALK;
                 } else {
@@ -435,8 +444,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                         if constexpr (Toehold) {
                             // The tail's text position is one phi step from
                             // the next interval head's.
-                            s.ph = idx.start_phi(idx.phi_at_head(s.u + 1));
-                            idx.prefetch_phi(s.ph.interval);
+                            s.ph = idx.start_phi(idx.template phi_at_head<PhiStarts>(s.u + 1));
+                            idx.template prefetch_phi<PhiStarts>(s.ph.interval);
                             s.pos = from;
                             s.state = PRED_POS;
                         } else {
@@ -447,7 +456,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                         from.interval = s.d - 1;
                         from = idx.down(from);
                         s.len = s.down.value;
-                        if constexpr (Toehold) s.ph = idx.resolve_phi(idx.phi_at_head(s.d));
+                        if constexpr (Toehold) s.ph = idx.resolve_phi(idx.template phi_at_head<PhiStarts>(s.d));
                         consume(s, start_LF(from));
                         advanced = true;
                     }
@@ -470,12 +479,17 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
                             bool packed = true) {
     if ((mode != TmsMode::PSI || out_pos) && !idx.has_phi())
         throw std::invalid_argument("this mode or positions need an index built with phi");
+    if (out_pos && !idx.has_phi_starts())
+        throw std::invalid_argument("positions need phi's starts-based form, which this index was loaded without");
     if (mode != TmsMode::PHI && !idx.has_psi()) throw std::invalid_argument("this mode needs an index with psi");
     auto run = [&](auto m) {
         constexpr TmsMode M = decltype(m)::value;
         auto with = [&](const auto acc) {
-            if (out_pos) tms_query_batch_impl<M, true>(idx, acc, patterns, k, out_len, out_pos);
-            else tms_query_batch_impl<M, false>(idx, acc, patterns, k, out_len, nullptr);
+            // Without positions, phi's lengths-based form when present: its
+            // rows are narrower.
+            if (out_pos) tms_query_batch_impl<M, true, true>(idx, acc, patterns, k, out_len, out_pos);
+            else if (idx.has_phi_lengths()) tms_query_batch_impl<M, false, false>(idx, acc, patterns, k, out_len, nullptr);
+            else tms_query_batch_impl<M, false, true>(idx, acc, patterns, k, out_len, nullptr);
         };
         const TmsIndex::PackedAccess pa = idx.packed_access();
         if (packed && pa.fits()) with(pa);
