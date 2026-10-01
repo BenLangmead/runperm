@@ -12,6 +12,7 @@
 #include "tsv.hpp"
 #include "rlbwt_io.hpp"
 #include "tms_test.hpp"
+#include "fmd_test.hpp"
 #include <cstdio>
 #include <iostream>
 #include <cassert>
@@ -1060,6 +1061,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_ms_query_batch(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_lf_split(data_dir)) all_ran = false;
+    std::cout << std::endl;
+    if (!fmd_test::run_all_tests(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (all_ran) {
         std::cout << "All ms_test checks PASSED" << std::endl;

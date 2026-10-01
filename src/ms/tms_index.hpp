@@ -75,6 +75,7 @@
 
 #include "orbit/rlbwt.hpp"
 #include "orbit/common.hpp"
+#include "ms_alphabet.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -132,7 +133,7 @@ struct TmsBuildOptions {
 
 class TmsIndex {
 public:
-    using LF = orbit::rlbwt::lf_permutation<TmsLFCols, true, false>;
+    using LF = orbit::rlbwt::lf_permutation<TmsLFCols, true, false, ms_alpha::alphabet>;
     using Phi = orbit::rlbwt::phi_permutation_impl<TmsPhiCols, true, true, orbit::move_vector>;
     using PhiInv = orbit::rlbwt::phi_inv_permutation_impl<TmsPhiInvCols, true, true, orbit::move_vector>;
     using LFPos = typename LF::position;
@@ -143,21 +144,24 @@ public:
     using position = LFPos;
     // The most F blocks after the first: one per character of the
     // alphabet but the smallest.
-    static constexpr size_t F_BLOCKS = orbit::nucleotide::SIGMA - 1;
+    static constexpr size_t F_BLOCKS = ms_alpha::alphabet::SIGMA - 1;
 
     TmsIndex() = default;
 
     /**
      * Build from run heads (index codes: orbit::TERMINATOR, orbit::SEPARATOR,
-     * or a nucleotide) and run lengths.  If run_tops is given, it holds the
-     * LCP value at each run's head row (0 for row 0), and the index also gets
-     * phi (and phi_inv if opts.phi_inv); this walks LF over all n rows.
+     * a nucleotide or ms_alpha::TEXT_N) and run lengths.  There may be many
+     * terminators (one per string of a collection, as in an FMD), so that
+     * LF has several cycles; LF and psi do not depend on that.  If run_tops
+     * is given, it holds the LCP value at each run's head row (0 for row 0),
+     * and the index also gets phi (and phi_inv if opts.phi_inv); this walks
+     * LF over all n rows from row 0 and so needs a single terminator.
      * opts.layout says which parts to build: the psi layout takes no
      * run_tops, and the phi layout needs them.  opts.lf_split must split.
      */
     TmsIndex(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
              const TmsBuildOptions& opts = TmsBuildOptions{}, const std::vector<ulint>* run_tops = nullptr) {
-        using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+        using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
         if (opts.layout == TmsLayout::PSI && run_tops) throw std::invalid_argument("a psi layout takes no LCP values");
         if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
         check_lf_split(opts.lf_split);
@@ -704,7 +708,7 @@ public:
 
 private:
     static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 6;
+    static constexpr uint32_t VERSION = 7;
     // Header flags for the parts an index holds.
     static constexpr uint32_t FLAG_PHI = 1, FLAG_PHI_INV = 2, FLAG_PSI = 4;
 
@@ -866,7 +870,7 @@ private:
     static void union_rows(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
                            const orbit::split_params& sp, std::vector<uchar>& row_heads,
                            std::vector<ulint>& row_lens) {
-        using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+        using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
         const Enc split = Enc::lf_interval_encoding(heads, lens, sp);
         const ulint m = split.intervals();
         // Call f(k, c) for each split interval k in row order, with c its byte.
@@ -1044,7 +1048,7 @@ private:
                 ulint covered = 0;
                 while (covered < lens[r]) covered += lf_enc.get_length(k++);
             }
-            orbit::rlbwt::lf_move<false> lf(lf_enc);
+            orbit::rlbwt::lf_move<false, ms_alpha::alphabet> lf(lf_enc);
             const ulint n = lf.domain();
             auto pos = lf.first();
             ulint sa = n - 1;
@@ -1055,7 +1059,8 @@ private:
                 pos = lf.LF(pos);
             }
             if (pos != lf.first() || std::find(seen.begin(), seen.end(), false) != seen.end())
-                throw std::runtime_error("LF is not a single cycle; phi needs one terminator");
+                throw std::runtime_error("LF is not a single cycle (a string collection, such as an FMD, with one "
+                                         "terminator per string); building phi by an LF walk needs one terminator");
         }
         const ulint n = lf_enc.domain();
         const auto& lf_heads = lf_enc.get_heads();

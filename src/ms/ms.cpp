@@ -16,6 +16,7 @@
 #include "tms_query.hpp"
 #include "tms_smem.hpp"
 #include "tms_test.hpp"
+#include "fmd_test.hpp"
 #include "perf_counters.hpp"
 #include "parallel_blocks.hpp"
 #include "read_chunks.hpp"
@@ -128,7 +129,10 @@ static void usage(const char* prog) {
               << "              phi_inv walks list positions at once (K = 0: one SMEM at a\n"
               << "              time).  Results do not depend on the mode or K.\n"
               << "  tms-text   INDEX_PATH\n"
-              << "              Print the indexed text, read back with LF.\n"
+              << "              Print the indexed text, read back with LF.  For a string\n"
+              << "              collection (one terminator per string, as in an FMD), print\n"
+              << "              each string and its $, one per line, in the BWT order of\n"
+              << "              their terminators.  An FMD's N prints as N.\n"
               << "  tms-inspect INDEX_PATH\n"
               << "              Print the structures' sizes and column widths.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
@@ -139,6 +143,8 @@ static void usage(const char* prog) {
               << "Diagnostics and debugging:\n"
               << "  test           [DATA_DIR]\n"
               << "                  Run built-in tests (default DATA_DIR is ./data).\n"
+              << "  fmd-test       [DATA_DIR]\n"
+              << "                  Run only the string-collection (FMD) and large-n tests.\n"
               << "  discover       [DATA_DIR]\n"
               << "                  Find patterns where index types disagree with base.\n"
               << "  investigate    DATA_DIR PATTERN [INDEX_TYPE] [TRACE_STEP]\n"
@@ -530,7 +536,7 @@ int main(int argc, char** argv) {
 
 #ifdef NDEBUG
     // The test suites check their results with assert.
-    if (cmd == "test" || cmd == "tms-test") {
+    if (cmd == "test" || cmd == "tms-test" || cmd == "fmd-test") {
         std::cerr << cmd << " needs assertions; build with make (not make bench)\n";
         return 1;
     }
@@ -891,18 +897,54 @@ int main(int argc, char** argv) {
         const TmsParts lf_only;
         auto opt = read_tms_index(argv[0], &lf_only);
         if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
-        // Row 0 holds text position n - 1, so the s-th row LF visits from it
-        // has BWT character T[n - 2 - s].
+        auto show = [](uchar c) {
+            return c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : c == ms_alpha::TEXT_N ? 'N'
+                                                                                     : static_cast<char>(c);
+        };
         const ulint n = opt->domain();
-        std::string t(n, '\0');
-        auto pos = opt->first();
-        for (ulint st = 0; st < n; ++st) {
-            const uchar c = opt->get_character(pos.interval);
-            t[(2 * n - 2 - st) % n] = c == orbit::TERMINATOR ? '$' : c == orbit::SEPARATOR ? '%' : static_cast<char>(c);
-            pos = opt->LF_step(pos);
+        ulint m = 0;
+        for (ulint i = 0; i < opt->move_runs(); ++i)
+            if (opt->get_character(i) == orbit::TERMINATOR) m += opt->get_length(i);
+        if (m <= 1) {
+            // One text, so LF is one cycle.  Row 0 holds text position
+            // n - 1, so the s-th row LF visits from it has BWT character
+            // T[n - 2 - s].
+            std::string t(n, '\0');
+            auto pos = opt->first();
+            for (ulint st = 0; st < n; ++st) {
+                t[(2 * n - 2 - st) % n] = show(opt->get_character(pos.interval));
+                pos = opt->LF_step(pos);
+            }
+            std::cout << t << "\n";
+            return 0;
         }
-        std::cout << t << "\n";
+        // A string collection, with one terminator per string, whose LF may
+        // have several cycles.  The k-th of the first m rows is the suffix
+        // that is only some string's terminator, so LF from it reads that
+        // string backward, up to the row whose BWT character is a terminator.
+        std::string t, line;
+        auto row = opt->first();
+        for (ulint k = 0; k < m; ++k) {
+            if (k > 0) {
+                if (row.offset + 1 < opt->get_length(row.interval)) ++row.offset;
+                else row = opt->down(row);  // the next interval's first row
+            }
+            t.clear();
+            for (auto pos = row;;) {
+                const uchar c = opt->get_character(pos.interval);
+                if (c == orbit::TERMINATOR) break;
+                t.push_back(show(c));
+                pos = opt->LF_step(pos);
+            }
+            line.assign(t.rbegin(), t.rend());
+            std::cout << line << "$\n";
+        }
         return 0;
+    }
+
+    if (cmd == "fmd-test") {
+        std::string data_dir = (argc > 0 && argv[0][0] != '-') ? argv[0] : "./data";
+        return fmd_test::run_all_tests(data_dir) ? 0 : 1;
     }
 
     if (cmd == "tms-test") {

@@ -3,18 +3,28 @@
  * LENS, one little-endian unsigned integer per run of a fixed width (5 bytes
  * in the Movi pipeline's form; the width is inferred from the file sizes).
  *
- * Head bytes are mapped to the codes the index uses: the end-of-text sentinel
- * (0x00 in the Movi form, 0x0a in the TeraLCP form, or # or $) becomes
- * orbit::TERMINATOR,
- * the sequence separator '%' becomes orbit::SEPARATOR, and A, C, G, T are kept.
- * This preserves the sort order sentinel < separator < A < C < G < T that the
- * BWT was built with.
+ * Head bytes are mapped to the codes the index uses: an end-of-string
+ * sentinel (0x00 in the Movi form, 0x0a in the TeraLCP form, or # or $)
+ * becomes orbit::TERMINATOR, the sequence separator '%' becomes
+ * orbit::SEPARATOR, A, C, G, T are kept, and 0x7f, an N in a text whose BWT
+ * sorts N after T (as fmd2rlbwt writes a ropebwt3 FMD's N; see
+ * tools/fmd2rlbwt/FMD_RUNS.md), becomes ms_alpha::TEXT_N, which no read
+ * character matches.  This preserves the sort order
+ * sentinel < separator < A < C < G < T < N that the BWT was built with.  The
+ * byte 'N' is refused: it sorts before T, and which order its BWT used is
+ * not known.
+ *
+ * A BWT of one text has one sentinel; a BWT of a string collection, such as
+ * an FMD, has one per string, all mapped to orbit::TERMINATOR, so that LF
+ * ranks them like any other character (the k-th sentinel in BWT order maps
+ * to row k), as an FM-index of a collection does.
  */
 
 #ifndef _MS_RLBWT_IO_HPP
 #define _MS_RLBWT_IO_HPP
 
 #include "orbit/common.hpp"
+#include "ms_alphabet.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +45,7 @@ inline bool map_head_byte(uchar b, uchar& code) {
         case 0x00: case 0x0a: case '#': case '$': code = orbit::TERMINATOR; return true;
         case '%': code = orbit::SEPARATOR; return true;
         case 'A': case 'C': case 'G': case 'T': code = b; return true;
+        case ms_alpha::TEXT_N: code = ms_alpha::TEXT_N; return true;
         default: return false;
     }
 }
@@ -42,7 +53,7 @@ inline bool map_head_byte(uchar b, uchar& code) {
 /**
  * Load HEADS and LENS.  On failure returns false and sets err.  Adjacent runs
  * with the same head are left as they are; the caller's LCP data must use the
- * same run numbering.
+ * same run numbering.  At least one sentinel is required.
  */
 inline bool load_rlbwt(const std::string& heads_path, const std::string& lens_path,
                        std::vector<uchar>& heads, std::vector<ulint>& lens, std::string& err) {
@@ -89,8 +100,8 @@ inline bool load_rlbwt(const std::string& heads_path, const std::string& lens_pa
         heads[i] = code;
         if (lens[i] == 0) { err = "zero-length run " + std::to_string(i); return false; }
     }
-    if (sentinels != 1) {
-        err = "expected exactly one sentinel position, found " + std::to_string(sentinels);
+    if (sentinels == 0) {
+        err = "no sentinel: expected at least one end-of-string run head";
         return false;
     }
     return true;

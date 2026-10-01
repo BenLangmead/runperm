@@ -23,6 +23,7 @@
 
 #include "orbit/rlbwt.hpp"
 #include "orbit/common.hpp"
+#include "ms_alphabet.hpp"
 #include "ms_constants.hpp"
 #include <cassert>
 #include <iostream>
@@ -377,7 +378,7 @@ inline void prune_lcp_pairs(RunLcpPairs& p, std::optional<ulint> bottom, bool mi
  */
 inline std::vector<ulint> lf_split_row_lengths(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
                                                const orbit::split_params& sp) {
-    using Enc = orbit::rlbwt::rlbwt_interval_encoding<>;
+    using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
     const Enc enc = Enc::lf_interval_encoding(heads, lens, sp);
     std::vector<ulint> rows(static_cast<size_t>(enc.intervals()));
     for (ulint k = 0; k < enc.intervals(); ++k) rows[k] = enc.get_length(k);
@@ -672,14 +673,14 @@ build_spill_data(const std::vector<std::vector<ulint>>& lcps_per_run,
 }
 
 enum class LCPRunCols { TOP_LCP, COUNT };
-template <bool SP> using MSIndexTopLCP = orbit::rlbwt::lf_permutation<LCPRunCols, true, SP>;
+template <bool SP> using MSIndexTopLCP = orbit::rlbwt::lf_permutation<LCPRunCols, true, SP, ms_alpha::alphabet>;
 
 /**
  * The main index class that combines the run permutation and spillover data.
  */
 template <bool StoreAbsolutePositions = false>
 class MSIndexSpillLCP {
-    using IndexImpl = orbit::rlbwt::lf_permutation<LCPSpillRunCols, true, StoreAbsolutePositions>;
+    using IndexImpl = orbit::rlbwt::lf_permutation<LCPSpillRunCols, true, StoreAbsolutePositions, ms_alpha::alphabet>;
     IndexImpl idx_;
     std::vector<SpilloverVector> spill_vectors_;
     ulint max_lcp_top_ = 0, max_lcp_min_sub_ = 0;
