@@ -117,7 +117,7 @@ static void usage(const char* prog) {
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
               << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
-              << "            [--max-smem-positions N]\n"
+              << "            [--max-smem-positions N] [--phi-starts]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
               << "              the others need phi).  Only the index's structures that the\n"
@@ -136,7 +136,11 @@ static void usage(const char* prog) {
               << "              BWT row order, while c still counts all of them (default: list\n"
               << "              all).  With smem-all, K also sets how many of its phi and\n"
               << "              phi_inv walks list positions at once (K = 0: one SMEM at a\n"
-              << "              time).  Results do not depend on the mode or K.\n"
+              << "              time).  Matching statistics without positions or SMEMs load\n"
+              << "              phi's lengths-based form, whose rows are narrower; --phi-starts\n"
+              << "              loads its starts-based form instead, as positions and SMEM\n"
+              << "              reports do.  Results do not depend on the mode, K or\n"
+              << "              --phi-starts.\n"
               << "  tms-text   INDEX_PATH\n"
               << "              Print the indexed text, read back with LF.  For a string\n"
               << "              collection (one terminator per string, as in an FMD), print\n"
@@ -220,6 +224,7 @@ static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::strin
 // queries start.
 static TmsMode g_tms_mode = TmsMode::PSI;
 static bool g_tms_positions = false;
+static bool g_tms_phi_starts = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
 static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
@@ -289,6 +294,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         else if (strcmp(argv[i], "--block-bytes") == 0 && i + 1 < argc)
             block_bytes = static_cast<size_t>(std::stoull(argv[++i]));
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const std::string m = argv[++i];
             if (m == "psi") g_tms_mode = TmsMode::PSI;
@@ -772,7 +778,8 @@ int main(int argc, char** argv) {
         // Load only the parts the query reads; the load refuses an index
         // that lacks one.
         return run_batch<TmsIndex>(argc, argv, [](const std::string& path) {
-            const TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
+            TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
+            need.phi_starts = need.phi_starts || (need.phi && g_tms_phi_starts);
             return read_tms_index(path, &need);
         });
     }

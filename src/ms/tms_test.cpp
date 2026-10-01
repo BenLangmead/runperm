@@ -578,7 +578,7 @@ void check_phi_inv(const TextBwt& t, const TmsBuildOptions& o) {
     // Loaded without phi_inv, phi has no start table.
     std::stringstream again(ss.str());
     TmsIndex phi_only;
-    phi_only.load(again, TmsParts{true, true, false});
+    phi_only.load(again, TmsParts{true, true, false, true});
     assert(!phi_only.has_phi_inv() && phi_only.start_table_bytes() == 0);
     check_walker(phi_only.phi_walker(), n, [&](ulint i) { return phi_only.phi_start(i); }, phi_only.phi_intervals(),
                  [&](TmsIndex::PhiPos p) { return phi_only.phi(p); }, [&](TmsIndex::PhiPos p) { return phi_only.plcp(p); });
@@ -911,6 +911,16 @@ bool test_layouts(const std::string& data_dir) {
             const TmsParts phi_need = tms_query_parts(TmsMode::PHI, true, TmsReport::SMEM_ALL);
             TmsIndex full_psi = round_trip(full, &psi_need), full_phi = round_trip(full, &phi_need);
             assert(parts_are(full_psi, true, false, false) && parts_are(full_phi, false, true, true));
+            // Matching statistics alone load phi's lengths-based form, and
+            // positions and SMEMs its starts-based form; a whole load has both.
+            const TmsParts phi_ms_need = tms_query_parts(TmsMode::PHI, false, TmsReport::MS);
+            assert(!phi_ms_need.phi_starts && phi_need.phi_starts);
+            TmsIndex full_phi_len = round_trip(full, &phi_ms_need), phi_len = round_trip(phi_built, &phi_ms_need);
+            for (const TmsIndex* x : {&full_phi_len, &phi_len})
+                assert(parts_are(*x, false, true, false) && x->has_phi_lengths() && !x->has_phi_starts());
+            assert(full_phi.has_phi_starts() && !full_phi.has_phi_lengths());
+            assert(phi.has_phi_starts() && phi.has_phi_lengths() && full.has_phi_starts() && full.has_phi_lengths());
+            assert(full_phi_len.phi_intervals() == full.phi_intervals());
 
             for (size_t k : {1, 7, 32}) {
                 for (bool packed : {true, false}) {
@@ -924,6 +934,10 @@ bool test_layouts(const std::string& data_dir) {
                             const auto want_phi = query_output(full, pats, k, TmsMode::PHI, positions, report, packed);
                             std::vector<TmsIndex*> xs = {&phi, &full_phi, &phi_built};
                             if (report != TmsReport::SMEM_ALL) xs.push_back(&phi_noinv);
+                            if (!positions && report == TmsReport::MS) {
+                                xs.push_back(&full_phi_len);
+                                xs.push_back(&phi_len);
+                            }
                             for (TmsIndex* x : xs) {
                                 if (query_output(*x, pats, k, TmsMode::PHI, positions, report, packed) != want_phi) {
                                     std::cout << "  FAILED: phi layout output differs, k " << k << std::endl;
@@ -952,6 +966,9 @@ bool test_layouts(const std::string& data_dir) {
             assert(throws<std::invalid_argument>([&] { tms_query(phi, "ACGT"); }, "psi"));
             assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PHI); }, "phi"));
             assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PSI, &pos); }, "phi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi_len, pats, 8, len, TmsMode::PHI, &pos); },
+                                                 "starts-based"));
+            assert(throws<std::logic_error>([&] { round_trip(phi_len); }, "one form of phi"));
             tms_query_batch(phi_noinv, pats, 8, len, TmsMode::PHI, &pos);
             std::vector<TmsSmemHits> hits;
             assert(throws<std::invalid_argument>(
@@ -1002,6 +1019,12 @@ bool test_lf_rows(const std::string& data_dir) {
             TmsIndex full = round_trip(full_built), psi = round_trip(psi_built);
             const TmsParts psi_need = tms_query_parts(TmsMode::PSI, false, TmsReport::MS);
             TmsIndex full_psi = round_trip(full_built, &psi_need);
+            // Every mode's matching statistics walk phi's lengths-based form
+            // when it is present, so a load with only the starts-based form
+            // checks that both forms agree.
+            const TmsParts starts_need{true, true, false, true};
+            TmsIndex full_starts = round_trip(full_built, &starts_need);
+            assert(full_starts.has_phi_starts() && !full_starts.has_phi_lengths());
             assert(full.move_runs() == psi.move_runs() && full.move_runs() >= phi.move_runs() &&
                    full.move_runs() <= 2 * phi.move_runs());
             rows += full.move_runs();
@@ -1020,7 +1043,10 @@ bool test_lf_rows(const std::string& data_dir) {
                             for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
                                 if (big && report == TmsReport::SMEM_ONE) continue;
                                 const auto want = query_output(ref, pats, k, mode, positions, report, packed);
-                                if (query_output(full, pats, k, mode, positions, report, packed) != want) {
+                                const bool differs = query_output(full, pats, k, mode, positions, report, packed) != want ||
+                                                     (!positions && report == TmsReport::MS &&
+                                                      query_output(full_starts, pats, k, mode, false, report, packed) != want);
+                                if (differs) {
                                     std::cout << "  FAILED: output depends on the LF split, mode " << int(mode) << ", k "
                                               << k << ", packed " << packed << std::endl;
                                     assert(false && "output must not depend on the LF split");
@@ -1227,6 +1253,13 @@ bool test_phi_import() {
                     if (layout == TmsLayout::PHI && mode != TmsMode::PHI) continue;
                     std::vector<std::vector<ulint>> len, pos;
                     tms_query_batch(idx, pats, 8, len, mode, &pos, true);
+                    // Matching statistics alone walk phi's lengths-based form.
+                    const TmsParts ms_need = tms_query_parts(mode, false, TmsReport::MS);
+                    TmsIndex lengths_only = round_trip(built, &ms_need);
+                    assert(lengths_only.has_phi_lengths() == (mode != TmsMode::PSI) && !lengths_only.has_phi_starts());
+                    std::vector<std::vector<ulint>> len_lengths;
+                    tms_query_batch(lengths_only, pats, 8, len_lengths, mode, nullptr, true);
+                    assert(len_lengths == len && "phi's two forms give the same matching statistics");
                     std::vector<TmsSmemHits> hits;
                     tms_report_smems_batch(idx, len, pos, 0, TmsReport::SMEM_ALL, 8, hits);
                     for (size_t j = 0; j < pats.size(); ++j) {
