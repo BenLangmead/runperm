@@ -15,6 +15,7 @@
 #include "rlbwt_io.hpp"
 #include "mem_report.hpp"
 #include "tms_index.hpp"
+#include "phi_samples_io.hpp"
 #include "tms_query.hpp"
 #include "tms_smem.hpp"
 #include "tms_test.hpp"
@@ -87,13 +88,19 @@ static void usage(const char* prog) {
               << "              part of the reads (numactl -N i -m i).  A summary goes to stderr:\n"
               << "              query_ns_per_base is the threads' summed query time per base,\n"
               << "              and wall_ns_per_base the elapsed time per base.\n"
-              << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--minima FILE]\n"
-              << "            [--lcp-bin FILE] [--lf-split B] [--phi-split B] [--no-phi-inv]\n"
+              << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--phi FILE]\n"
+              << "            [--minima FILE] [--lcp-bin FILE] [--lf-split B] [--phi-split B]\n"
+              << "            [--no-phi-inv]\n"
               << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
-              << "              input, and with --minima (a TeraLCP -ominima file, of which only\n"
-              << "              each run's top LCP is used) or --lcp-bin (one 64-bit LCP per row)\n"
-              << "              also phi and phi_inv (phi_inv unless --no-phi-inv; it is needed\n"
-              << "              only for tms-batch --report smem-all).  --layout keeps only what\n"
+              << "              input, and with LCP input also phi and phi_inv (phi_inv unless\n"
+              << "              --no-phi-inv; it is needed only for tms-batch --report smem-all).\n"
+              << "              --phi takes a TeraLCP -ophi file, the suffix array and LCP samples\n"
+              << "              of every run, and builds phi from them in O(r) space; the RLBWT\n"
+              << "              may then have one terminator per string, as an FMD's runs do.\n"
+              << "              --minima (a TeraLCP -ominima file, of which only each run's top\n"
+              << "              LCP is used) or --lcp-bin (one 64-bit LCP per row) instead walk LF\n"
+              << "              over all n rows to find the suffix array samples, which needs a\n"
+              << "              BWT with one terminator.  --layout keeps only what\n"
               << "              some queries read: full (the default) keeps everything; psi keeps\n"
               << "              LF and psi, takes no LCP input, and serves only --mode psi without\n"
               << "              --positions or an SMEM report; phi keeps LF, phi and phi_inv,\n"
@@ -780,7 +787,7 @@ int main(int argc, char** argv) {
         TmsBuildOptions opts;
         opts.report = true;
         bool with_phi = false;
-        std::string minima_path, lcp_bin_path;
+        std::string minima_path, lcp_bin_path, phi_path;
         for (int i = npos; i < argc; ++i) {
             if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
                 if (!lf_split_arg(argv[++i], opts.lf_split)) return 1;
@@ -797,20 +804,26 @@ int main(int argc, char** argv) {
             else if (from_tsv && strcmp(argv[i], "--phi") == 0) with_phi = true;
             else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
             else if (!from_tsv && strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
+            else if (!from_tsv && strcmp(argv[i], "--phi") == 0 && i + 1 < argc) { phi_path = argv[++i]; with_phi = true; }
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
+        if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
+            std::cerr << "give at most one of --phi, --minima and --lcp-bin\n";
+            return 1;
+        }
         if (opts.layout == TmsLayout::PSI && with_phi) {
-            std::cerr << "--layout psi takes no LCP input (" << (from_tsv ? "--phi" : "--minima or --lcp-bin") << ")\n";
+            std::cerr << "--layout psi takes no LCP input (" << (from_tsv ? "--phi" : "--phi, --minima or --lcp-bin") << ")\n";
             return 1;
         }
         if (opts.layout == TmsLayout::PHI && !with_phi) {
-            std::cerr << "--layout phi needs LCP input (" << (from_tsv ? "--phi" : "--minima or --lcp-bin") << ")\n";
+            std::cerr << "--layout phi needs LCP input (" << (from_tsv ? "--phi" : "--phi, --minima or --lcp-bin") << ")\n";
             return 1;
         }
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
         std::vector<uchar> heads;
         std::vector<ulint> lens, tops;
+        TmsPhiSamples samples;
         if (from_tsv) {
             std::vector<std::vector<ulint>> lcps;
             if (!tsv::load_tsv(argv[0], heads, lens, lcps)) {
@@ -825,7 +838,14 @@ int main(int argc, char** argv) {
                 std::cerr << "Failed to load RLBWT: " << err << "\n";
                 return 1;
             }
-            if (with_phi && !lcp_bin_path.empty()) {
+            if (!phi_path.empty()) {
+                ulint n = 0;
+                for (ulint l : lens) n += l;
+                if (!phi_samples_io::read_phi_samples(phi_path, n, TmsPhiSamples::records_for(heads, lens), samples, err)) {
+                    std::cerr << "Failed to load phi samples: " << err << "\n";
+                    return 1;
+                }
+            } else if (with_phi && !lcp_bin_path.empty()) {
                 // One little-endian 64-bit LCP per row, optionally after a
                 // 64-bit row count (msbench prep's form); keep each run head's.
                 std::ifstream lin(lcp_bin_path, std::ios::binary | std::ios::ate);
@@ -894,7 +914,8 @@ int main(int argc, char** argv) {
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         mem_report::phase("tms_load", heads.size());
         auto t1 = clock::now();
-        TmsIndex idx(heads, run_lens, opts, with_phi ? &run_tops : nullptr);
+        TmsIndex idx = phi_path.empty() ? TmsIndex(heads, run_lens, opts, with_phi ? &run_tops : nullptr)
+                                        : TmsIndex(heads, run_lens, opts, std::move(samples));
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
         std::ofstream out(idx_path, std::ios::binary);

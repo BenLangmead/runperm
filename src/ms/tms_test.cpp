@@ -11,6 +11,7 @@
 #include "ms_rlbwt.hpp"
 #include "tsv.hpp"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <iostream>
 #include <numeric>
@@ -1036,6 +1037,237 @@ bool test_lf_rows(const std::string& data_dir) {
     return true;
 }
 
+namespace {
+
+/** A text of several strings, each ended by its own terminator. */
+struct MultiText {
+    std::string str;  // the strings, each followed by '$'
+    std::vector<uchar> text;
+    std::vector<ulint> sa, isa, lcp;
+    std::vector<uchar> heads;  // maximal runs: adjacent terminators form one run
+    std::vector<ulint> lens;
+};
+
+/**
+ * The text S_0 $ S_1 $ ... S_{k-1} $ with distinct terminators, $_i < $_j for
+ * i < j, all smaller than every other character, as in a ropebwt3 FMD and as
+ * TeraLCP numbers its positions.  LCP never extends over a terminator.
+ */
+MultiText make_multi_text(const std::vector<std::string>& strings) {
+    MultiText t;
+    for (const auto& w : strings) t.str += w + "$";
+    const size_t n = t.str.size();
+    t.text.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        t.text[i] = t.str[i] == '$' ? orbit::TERMINATOR : t.str[i] == '%' ? orbit::SEPARATOR : static_cast<uchar>(t.str[i]);
+    const auto& x = t.text;
+    t.sa.resize(n);
+    std::iota(t.sa.begin(), t.sa.end(), 0);
+    std::sort(t.sa.begin(), t.sa.end(), [&](ulint a, ulint b) {
+        while (x[a] == x[b] && x[a] != orbit::TERMINATOR) { ++a; ++b; }
+        // Two terminators compare by string, that is by position.
+        if (x[a] == orbit::TERMINATOR && x[b] == orbit::TERMINATOR) return a < b;
+        return x[a] < x[b];
+    });
+    t.isa.resize(n);
+    for (size_t j = 0; j < n; ++j) t.isa[t.sa[j]] = j;
+    t.lcp.assign(n, 0);
+    for (size_t j = 1; j < n; ++j) {
+        ulint a = t.sa[j - 1], b = t.sa[j], l = 0;
+        while (x[a + l] == x[b + l] && x[a + l] != orbit::TERMINATOR) ++l;
+        t.lcp[j] = l;
+    }
+    for (size_t j = 0; j < n; ++j) {
+        const uchar c = x[t.sa[j] == 0 ? n - 1 : t.sa[j] - 1];
+        if (j == 0 || c != t.heads.back()) {
+            t.heads.push_back(c);
+            t.lens.push_back(0);
+        }
+        ++t.lens.back();
+    }
+    return t;
+}
+
+/** The samples TeraLCP -ophi writes for a BWT with this suffix array and LCP array. */
+TmsPhiSamples samples_for(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
+                          const std::vector<ulint>& sa, const std::vector<ulint>& lcp) {
+    std::vector<std::array<ulint, 3>> recs;
+    ulint row = 0;
+    for (size_t r = 0; r < heads.size(); ++r) {
+        if (heads[r] == orbit::TERMINATOR)
+            for (ulint j = 0; j < lens[r]; ++j) recs.push_back({sa[row + j], sa[row + j], lcp[row + j]});
+        else
+            recs.push_back({sa[row], sa[row + lens[r] - 1], lcp[row]});
+        row += lens[r];
+    }
+    ulint max_top = 0;
+    for (const auto& x : recs) max_top = std::max(max_top, x[2]);
+    TmsPhiSamples s(recs.size(), sa.size(), max_top);
+    for (size_t i = 0; i < recs.size(); ++i) {
+        s.head.set(i, recs[i][0]);
+        s.tail.set(i, recs[i][1]);
+        s.top.set(i, recs[i][2]);
+    }
+    return s;
+}
+
+/** samples without its last record. */
+TmsPhiSamples drop_last(const TmsPhiSamples& samples, ulint n) {
+    const size_t m = samples.size() - 1;
+    ulint max_top = 0;
+    for (size_t i = 0; i < m; ++i) max_top = std::max<ulint>(max_top, samples.top[i]);
+    TmsPhiSamples s(m, n, max_top);
+    for (size_t i = 0; i < m; ++i) {
+        s.head.set(i, samples.head[i]);
+        s.tail.set(i, samples.tail[i]);
+        s.top.set(i, samples.top[i]);
+    }
+    return s;
+}
+
+/** phi, PLCP, phi_inv and PLCPB of idx at every text position, against the suffix and LCP arrays. */
+void check_phi_against(TmsIndex& idx, const std::vector<ulint>& sa, const std::vector<ulint>& isa,
+                       const std::vector<ulint>& lcp) {
+    const ulint n = sa.size();
+    for (ulint p = 0; p < n; ++p) {
+        const ulint j = isa[p];
+        auto a = idx.phi_at(p);
+        assert(a.idx == p && idx.plcp(a) == lcp[j] && "PLCP at a located phi point");
+        assert(idx.phi(a).idx == sa[j == 0 ? n - 1 : j - 1] && "phi(SA[j]) = SA[j - 1]");
+        if (!idx.has_phi_inv()) continue;
+        auto b = idx.phi_inv_at(p);
+        assert(b.idx == p && idx.plcpb(b) == (j + 1 < n ? lcp[j + 1] : 0) && "PLCPB is the LCP with the row below");
+        assert(idx.phi_inv(b).idx == sa[j + 1 < n ? j + 1 : 0] && "phi_inv(SA[j]) = SA[j + 1]");
+    }
+}
+
+}  // namespace
+
+/**
+ * Indexes whose phi and phi_inv come from per-run suffix array and LCP
+ * samples (as TeraLCP -ophi writes them) instead of a walk of LF.  With one
+ * terminator they answer every query exactly as indexes built by the walk, in
+ * the full and phi layouts and for each split variant, also after
+ * serialization.  With many terminators, where rank-based LF does not follow
+ * the text across a terminator and so the walk cannot be used, phi and
+ * phi_inv are right at every text position, matching statistics equal naive
+ * ones, every reported position is an occurrence, and SMEM_ALL lists every
+ * occurrence.  Samples that do not fit the RLBWT, and samples with the psi
+ * layout, are refused.
+ */
+bool test_phi_import() {
+    std::cout << "Testing phi and phi_inv from imported samples" << std::endl;
+    std::mt19937 rng(61);
+    size_t compared = 0, multi_checked = 0;
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    for (const auto& s : fuzz_texts(rng)) {
+        TextBwt t = make_text_bwt(s);
+        std::vector<ulint> tops;
+        for (const auto& l : t.lcps_per_run) tops.push_back(l[0]);
+        auto pats = fuzz_patterns(t.str, rng, 30);
+        for (TmsBuildOptions o : split_variants()) {
+            for (TmsLayout layout : {TmsLayout::FULL, TmsLayout::PHI}) {
+                o.layout = layout;
+                TmsIndex walked(t.heads, t.lens, o, &tops),
+                    built(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
+                TmsIndex imported = round_trip(built);
+                assert(imported.phi_intervals() == walked.phi_intervals());
+                assert(imported.phi_inv_intervals() == walked.phi_inv_intervals());
+                check_phi_against(imported, t.sa, t.isa, t.lcp);
+                for (TmsMode mode : modes) {
+                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI) continue;
+                    for (bool positions : {false, true})
+                        for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
+                            const auto want = query_output(walked, pats, 8, mode, positions, report, true);
+                            if (query_output(imported, pats, 8, mode, positions, report, true) != want) {
+                                std::cout << "  FAILED: imported phi answers differently, text of length " << s.size()
+                                          << std::endl;
+                                assert(false && "imported phi must answer as walked phi does");
+                                return false;
+                            }
+                            ++compared;
+                        }
+                }
+            }
+        }
+    }
+
+    // Many terminators: string collections with repeats and duplicates.
+    for (int k = 0; k < 40; ++k) {
+        std::vector<std::string> strings;
+        const int count = 1 + rng() % 12;
+        for (int i = 0; i < count; ++i) {
+            if (!strings.empty() && rng() % 4 == 0) {
+                strings.push_back(strings[rng() % strings.size()]);
+                continue;
+            }
+            std::string w(1 + rng() % (k % 3 == 0 ? 6 : 80), 'A');
+            for (auto& c : w) c = "ACGT"[rng() % (k % 5 == 0 ? 2 : 4)];
+            if (!strings.empty() && rng() % 3 == 0) {
+                w = strings[rng() % strings.size()];
+                if (!w.empty()) w[rng() % w.size()] = "ACGT"[rng() % 4];
+            }
+            strings.push_back(w);
+        }
+        MultiText t = make_multi_text(strings);
+        std::vector<std::string> pats;
+        for (const auto& P : fuzz_patterns(t.str, rng, 30)) {
+            std::string q = P;
+            for (auto& c : q)
+                if (c == '$') c = 'A';
+            pats.push_back(q);
+        }
+        for (TmsBuildOptions o : split_variants()) {
+            for (TmsLayout layout : {TmsLayout::FULL, TmsLayout::PHI}) {
+                o.layout = layout;
+                TmsIndex built(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
+                TmsIndex idx = round_trip(built);
+                check_phi_against(idx, t.sa, t.isa, t.lcp);
+                for (TmsMode mode : modes) {
+                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI) continue;
+                    std::vector<std::vector<ulint>> len, pos;
+                    tms_query_batch(idx, pats, 8, len, mode, &pos, true);
+                    std::vector<TmsSmemHits> hits;
+                    tms_report_smems_batch(idx, len, pos, 0, TmsReport::SMEM_ALL, 8, hits);
+                    for (size_t j = 0; j < pats.size(); ++j) {
+                        const auto want = naive_ms(t.str, pats[j]);
+                        assert(len[j] == want && "matching statistics with many terminators");
+                        for (size_t i = 0; i < want.size(); ++i)
+                            if (want[i] > 0)
+                                assert(t.str.compare(pos[j][i], want[i], pats[j], i, want[i]) == 0 &&
+                                       "a reported position is an occurrence");
+                        size_t at = 0;
+                        for (const auto& h : hits[j].smems) {
+                            const std::string m = pats[j].substr(h.start, h.len);
+                            ulint occ = 0;
+                            for (size_t p = t.str.find(m); p != std::string::npos; p = t.str.find(m, p + 1)) ++occ;
+                            assert(h.count == occ && h.listed == occ && "SMEM_ALL counts every occurrence");
+                            std::vector<ulint> listed(hits[j].pos.begin() + at, hits[j].pos.begin() + at + h.listed);
+                            at += h.listed;
+                            std::sort(listed.begin(), listed.end());
+                            assert(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
+                            for (ulint p : listed) assert(t.str.compare(p, h.len, m) == 0);
+                        }
+                        multi_checked += want.size();
+                    }
+                }
+            }
+        }
+        // Samples for another RLBWT, and samples with a psi layout, are refused.
+        const ulint n = t.text.size();
+        assert(throws<std::invalid_argument>(
+            [&] { TmsIndex(t.heads, t.lens, TmsBuildOptions{}, drop_last(samples_for(t.heads, t.lens, t.sa, t.lcp), n)); },
+            "records"));
+        TmsBuildOptions psi_opts;
+        psi_opts.layout = TmsLayout::PSI;
+        assert(throws<std::invalid_argument>(
+            [&] { TmsIndex(t.heads, t.lens, psi_opts, samples_for(t.heads, t.lens, t.sa, t.lcp)); }, "psi layout"));
+    }
+    std::cout << "  " << compared << " batches against walked phi, " << multi_checked
+              << " values with many terminators PASSED" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -1055,6 +1287,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_layouts(data_dir);
     std::cout << std::endl;
     test_lf_rows(data_dir);
+    std::cout << std::endl;
+    test_phi_import();
     std::cout << std::endl;
     std::cout << (all_ran ? "All tms_test checks PASSED" : "SOME TMS TESTS NOT RUN") << std::endl;
     return all_ran;

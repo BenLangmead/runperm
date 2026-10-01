@@ -48,9 +48,11 @@
  * (u, length - 1) and its head (d, 0).
  *
  * LF, its rows and the PSI columns come from the run heads and lengths alone
- * in O(r) time and space.  phi also needs the LCP value at each run head and
- * a walk over all n rows.  LF and phi each take their own splitting
- * parameters.
+ * in O(r) time and space.  phi and phi_inv come either from per-run suffix
+ * array and LCP samples (TmsPhiSamples, as TeraLCP -ophi writes them), in
+ * O(r log r) time and O(r) space, or from the LCP value at each run head and
+ * a walk of LF over all n rows, which needs a BWT with one terminator.  LF and
+ * phi each take their own splitting parameters.
  *
  * An index is built with one of three layouts (TmsLayout), so that it holds
  * only what its queries read:
@@ -80,6 +82,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <numeric>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -117,6 +120,33 @@ enum class TmsLayout { FULL, PSI, PHI };
  */
 struct TmsParts {
     bool psi = false, phi = false, phi_inv = false;
+};
+
+/**
+ * Suffix array and LCP samples from which a TmsIndex builds phi and phi_inv
+ * without walking LF, in the record order of TeraLCP's -ophi output
+ * (src/TeraLCP/PHI_EXPORT_FORMAT.md in TeraTools): one record per BWT run,
+ * except that a run of the terminator (orbit::TERMINATOR, the end of each
+ * string) has one record per row.  Record i holds, for its rows s to e, the
+ * text positions head[i] = SA[s] and tail[i] = SA[e], and top[i] = LCP[s], the
+ * LCP with the row above (0 for row 0), where a common prefix never extends
+ * over a terminator.  The three are packed.
+ */
+struct TmsPhiSamples {
+    orbit::int_vector head, tail, top;
+    TmsPhiSamples() = default;
+    /** Room for records records of a text of length n whose tops are at most max_top. */
+    TmsPhiSamples(size_t records, ulint n, ulint max_top)
+        : head(records, orbit::bit_width(n - 1)), tail(records, orbit::bit_width(n - 1)),
+          top(records, orbit::bit_width(max_top)) {}
+    size_t size() const { return head.size(); }
+    /** The number of records an RLBWT with these run heads and lengths needs. */
+    template <typename Lens>
+    static ulint records_for(const std::vector<uchar>& heads, const Lens& lens) {
+        ulint records = 0;
+        for (size_t r = 0; r < heads.size(); ++r) records += heads[r] == orbit::TERMINATOR ? ulint(lens[r]) : 1;
+        return records;
+    }
 };
 
 /** Splitting parameters for each move structure of a TmsIndex. */
@@ -166,9 +196,29 @@ public:
     template <typename Lens = std::vector<ulint>, typename Tops = std::vector<ulint>>
     TmsIndex(const std::vector<uchar>& heads, const Lens& lens,
              const TmsBuildOptions& opts = TmsBuildOptions{}, const Tops* run_tops = nullptr) {
+        build(heads, lens, opts, run_tops, nullptr);
+    }
+
+    /**
+     * Build as above, with phi (and phi_inv if opts.phi_inv) from samples,
+     * which must have TmsPhiSamples::records_for(heads, lens) records, instead
+     * of from run tops and a walk of LF.  The BWT may have many terminators.
+     * opts.layout must not be psi.  samples is freed during the build.
+     */
+    template <typename Lens = std::vector<ulint>>
+    TmsIndex(const std::vector<uchar>& heads, const Lens& lens, const TmsBuildOptions& opts,
+             TmsPhiSamples&& samples) {
+        build(heads, lens, opts, static_cast<const std::vector<ulint>*>(nullptr), &samples);
+    }
+
+private:
+    template <typename Lens, typename Tops>
+    void build(const std::vector<uchar>& heads, const Lens& lens, const TmsBuildOptions& opts,
+               const Tops* run_tops, TmsPhiSamples* samples) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
-        if (opts.layout == TmsLayout::PSI && run_tops) throw std::invalid_argument("a psi layout takes no LCP values");
-        if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
+        const bool lcp = run_tops || samples;
+        if (opts.layout == TmsLayout::PSI && lcp) throw std::invalid_argument("a psi layout takes no LCP values");
+        if (opts.layout == TmsLayout::PHI && !lcp) throw std::invalid_argument("a phi layout needs LCP values");
         check_lf_split(opts.lf_split);
         auto phase = [&](const char* name) { if (opts.report) mem_report::phase(name, heads.size()); };
         has_psi_ = opts.layout != TmsLayout::PHI;
@@ -193,6 +243,17 @@ public:
             // or by splitting the runs again, when less is held.
             auto release = [&]() { lf_enc = Enc(); };
             build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, phi_cols, phase, release);
+            lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
+                              : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
+            phase("tms_build_phi");
+            has_phi_ = true;
+            has_phi_inv_ = opts.phi_inv;
+        } else if (samples) {
+            // As above, without a walk: LF's encoding is needed only to find
+            // the LF intervals that start runs.
+            auto release = [&]() { lf_enc = Enc(); };
+            build_phi_from_samples(heads, lens, lf_enc, *samples, opts.phi_split, opts.phi_inv, phi_cols, phase,
+                                   release);
             lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
                               : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
             phase("tms_build_phi");
@@ -242,6 +303,8 @@ public:
         compute_occurs();
         if (has_phi_inv_) build_start_tables();
     }
+
+public:
 
     /**
      * Throw unless sp splits LF: TmsIndex's LF is always split, with length
@@ -1140,7 +1203,8 @@ private:
             }
             if (pos != lf.first() || std::find(seen.begin(), seen.end(), false) != seen.end())
                 throw std::runtime_error("LF is not a single cycle (a string collection, such as an FMD, with one "
-                                         "terminator per string); building phi by an LF walk needs one terminator");
+                                         "terminator per string); building phi by an LF walk needs one terminator, "
+                                         "so build it from TeraLCP -ophi samples (tms-build --phi) instead");
         }
         // Which LF intervals' bytes differ from the one before's (k = 0
         // counts as differing), after which release_enc may free lf_enc.
@@ -1206,6 +1270,107 @@ private:
         phi_inv_ = sampled_permutation<PhiInv, TmsPhiInvCols>(
             m, [&](size_t x) -> ulint { return starts[x]; }, [&](size_t x) -> ulint { return images[x]; },
             [&](size_t x) -> ulint { return samples[x]; }, n, sp);
+    }
+
+    /**
+     * Build phi (and phi_inv if with_inv) from samples (see TmsPhiSamples)
+     * and fill the PHI columns, without walking LF; samples is freed.
+     *
+     * The phi interval of record i starts at head[i] and maps to tail[i - 1]
+     * (tail[R - 1] for i = 0, so SA[0] maps to SA[n - 1]), with PLCP sample
+     * top[i].  The phi_inv interval of record i starts at tail[i] and maps to
+     * head[i + 1] (head[0] for i = R - 1), with PLCPB sample top[i + 1] (0 for
+     * i = R - 1).  Since each terminator row is a record, no interval holds a
+     * text position whose predecessor is a terminator, which is where the LCP
+     * of the next position need not be one less.
+     *
+     * The PHI columns of the first LF interval of each BWT run hold the phi
+     * point of the run's head row, which is where queries read them; the PHI
+     * columns of other LF intervals hold 0.  LF's encoding is needed only to
+     * find the first LF interval of each run, after which release_enc may
+     * free it.
+     */
+    template <typename Lens, typename Enc, typename Phase, typename Release>
+    void build_phi_from_samples(const std::vector<uchar>& heads, const Lens& lens, const Enc& lf_enc,
+                                TmsPhiSamples& samples, const orbit::split_params& sp, bool with_inv,
+                                orbit::packed_matrix<2>& phi_cols, Phase&& phase, Release&& release_enc) {
+        const ulint R = samples.size(), n = lf_enc.domain(), lf_count = lf_enc.intervals();
+        if (samples.tail.size() != R || samples.top.size() != R)
+            throw std::invalid_argument("phi samples must have as many tails and tops as heads");
+        const ulint want = TmsPhiSamples::records_for(heads, lens);
+        if (R != want)
+            throw std::invalid_argument("phi samples have " + std::to_string(R) + " records, but the RLBWT needs " +
+                                        std::to_string(want) + " (one per run, and one per row of a terminator run)");
+        const auto& head = samples.head;
+        const auto& tail = samples.tail;
+        const auto& top = samples.top;
+        for (ulint i = 0; i < R; ++i)
+            if (head[i] >= n || tail[i] >= n || top[i] >= n)
+                throw std::runtime_error("phi sample " + std::to_string(i) + " lies outside the text");
+        // The first LF interval of each run.
+        std::vector<bool> run_start(lf_count, false);
+        {
+            ulint k = 0;
+            for (size_t r = 0; r < heads.size(); ++r) {
+                run_start[k] = true;
+                for (ulint covered = 0; covered < ulint(lens[r]);) covered += lf_enc.get_length(k++);
+            }
+        }
+        release_enc();
+        // The records in the text order of key, packed.
+        auto text_order = [&](const orbit::int_vector& key) {
+            std::vector<ulint> order(R);
+            std::iota(order.begin(), order.end(), ulint(0));
+            std::sort(order.begin(), order.end(), [&](ulint a, ulint b) { return key[a] < key[b]; });
+            if (key[order[0]] != 0) throw std::runtime_error("phi samples lack text position 0");
+            for (ulint x = 1; x < R; ++x)
+                if (key[order[x]] == key[order[x - 1]]) throw std::runtime_error("phi samples repeat a text position");
+            orbit::int_vector packed(R, orbit::bit_width(R - 1));
+            for (ulint x = 0; x < R; ++x) packed.set(x, order[x]);
+            return packed;
+        };
+        orbit::int_vector order = text_order(head);
+        phase("tms_phi_order");
+        phi_ = sampled_permutation<Phi, TmsPhiCols>(
+            R, [&](size_t x) -> ulint { return head[order[x]]; },
+            [&](size_t x) -> ulint { const ulint i = order[x]; return tail[i == 0 ? R - 1 : i - 1]; },
+            [&](size_t x) -> ulint { return top[order[x]]; }, n, sp);
+        order = orbit::int_vector();
+        phase("tms_phi");
+        // Each run head's phi point, located with a start table; an offset
+        // into a phi interval fits phi's own offset column.
+        phi_table_ = StartTable(phi_, start_table_shift(phi_.domain(), phi_.intervals()));
+        phi_cols = orbit::packed_matrix<2>(
+            lf_count, {orbit::bit_width(phi_.intervals() - 1), phi_.get_widths()[Phi::offset_column()]});
+        {
+            const PhiWalker w = phi_walker();
+            ulint r = 0, x = 0;
+            for (ulint k = 0; k < lf_count; ++k) {
+                if (!run_start[k]) {
+                    phi_cols.set<0>(k, 0);
+                    phi_cols.set<1>(k, 0);
+                    continue;
+                }
+                const PhiPos q = w.locate(head[x]);
+                phi_cols.set<0>(k, q.interval);
+                phi_cols.set<1>(k, q.offset);
+                x += heads[r] == orbit::TERMINATOR ? ulint(lens[r]) : 1;
+                ++r;
+            }
+        }
+        phi_table_ = StartTable();
+        std::vector<bool>().swap(run_start);
+        phase("tms_phi_cols");
+        if (with_inv) {
+            order = text_order(tail);
+            phi_inv_ = sampled_permutation<PhiInv, TmsPhiInvCols>(
+                R, [&](size_t x) -> ulint { return tail[order[x]]; },
+                [&](size_t x) -> ulint { const ulint i = order[x]; return head[i + 1 == R ? 0 : i + 1]; },
+                [&](size_t x) -> ulint { const ulint i = order[x]; return i + 1 == R ? ulint(0) : ulint(top[i + 1]); },
+                n, sp);
+            order = orbit::int_vector();
+        }
+        samples = TmsPhiSamples();
     }
 
     static constexpr ulint NOT_A_RUN_HEAD = std::numeric_limits<ulint>::max();
