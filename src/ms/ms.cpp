@@ -869,8 +869,15 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // The run lengths, packed.
-        orbit::int_vector run_lens;
+        // The run lengths and tops, packed.
+        orbit::int_vector run_lens, run_tops;
+        {
+            ulint max_top = 0;
+            for (ulint t : tops) max_top = std::max(max_top, t);
+            run_tops = orbit::int_vector(tops.size(), orbit::bit_width(max_top));
+            for (size_t i = 0; i < tops.size(); ++i) run_tops.set(i, tops[i]);
+            std::vector<ulint>().swap(tops);
+        }
         {
             ulint max_len = 0;
             for (ulint l : lens) max_len = std::max(max_len, l);
@@ -881,7 +888,7 @@ int main(int argc, char** argv) {
         const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
         mem_report::phase("tms_load", heads.size());
         auto t1 = clock::now();
-        TmsIndex idx(heads, run_lens, opts, with_phi ? &tops : nullptr);
+        TmsIndex idx(heads, run_lens, opts, with_phi ? &run_tops : nullptr);
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
         std::ofstream out(idx_path, std::ios::binary);
