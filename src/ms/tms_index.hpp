@@ -184,11 +184,13 @@ public:
         orbit::packed_matrix<2> phi_cols;
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
-            // With psi, LF's encoding is cheap to make again from the rows, so
-            // build_phi frees it once its walk is done.
-            auto release = [&]() { if (has_psi_) lf_enc = Enc(); };
+            // build_phi frees LF's encoding once its walk is done, and it is
+            // made again afterwards, from the rows with psi (which is cheap)
+            // or by splitting the runs again, when less is held.
+            auto release = [&]() { lf_enc = Enc(); };
             build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, phi_cols, phase, release);
-            if (has_psi_) lf_enc = Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING);
+            lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
+                              : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
             phase("tms_build_phi");
             has_phi_ = true;
             has_phi_inv_ = opts.phi_inv;
