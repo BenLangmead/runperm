@@ -85,6 +85,7 @@
 #include <numeric>
 #include <cstring>
 #include <iostream>
+#include <type_traits>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -1286,8 +1287,9 @@ private:
      *
      * The PHI columns of the first LF interval of each BWT run hold the phi
      * point of the run's head row, which is where queries read them; the PHI
-     * columns of other LF intervals hold 0.  LF's encoding is needed only to
-     * find the first LF interval of each run, after which release_enc may
+     * columns of other LF intervals hold 0.  They are filled last, when only
+     * the heads of the samples are still held.  LF's encoding is needed only
+     * to find the first LF interval of each run, after which release_enc may
      * free it.
      */
     template <typename Lens, typename Enc, typename Phase, typename Release>
@@ -1329,14 +1331,52 @@ private:
             for (ulint x = 0; x < R; ++x) packed.set(x, order[x]);
             return packed;
         };
-        orbit::int_vector order = text_order(head);
+        // A structure's interval starts, images and LCP samples in text
+        // order, packed, so that building it reads them in order.
+        orbit::int_vector starts, images, lcps;
+        auto lay_out = [&](const orbit::int_vector& order, auto start, auto image, auto sample) {
+            starts = orbit::int_vector(R, orbit::bit_width(n - 1));
+            images = orbit::int_vector(R, orbit::bit_width(n - 1));
+            lcps = orbit::int_vector(R, top.get_width());
+            for (ulint x = 0; x < R; ++x) {
+                const ulint i = order[x];
+                starts.set(x, start(i));
+                images.set(x, image(i));
+                lcps.set(x, sample(i));
+            }
+        };
+        auto build_from_lists = [&](auto& perm, auto cols_tag) {
+            using P = std::remove_reference_t<decltype(perm)>;
+            perm = sampled_permutation<P, decltype(cols_tag)>(
+                R, [&](size_t x) -> ulint { return starts[x]; }, [&](size_t x) -> ulint { return images[x]; },
+                [&](size_t x) -> ulint { return lcps[x]; }, n, sp);
+            starts = images = lcps = orbit::int_vector();
+        };
+        {
+            orbit::int_vector order = text_order(head);
+            lay_out(order, [&](ulint i) -> ulint { return head[i]; },
+                    [&](ulint i) -> ulint { return tail[i == 0 ? R - 1 : i - 1]; },
+                    [&](ulint i) -> ulint { return top[i]; });
+        }
         phase("tms_phi_order");
-        phi_ = sampled_permutation<Phi, TmsPhiCols>(
-            R, [&](size_t x) -> ulint { return head[order[x]]; },
-            [&](size_t x) -> ulint { const ulint i = order[x]; return tail[i == 0 ? R - 1 : i - 1]; },
-            [&](size_t x) -> ulint { return top[order[x]]; }, n, sp);
-        order = orbit::int_vector();
+        build_from_lists(phi_, TmsPhiCols{});
         phase("tms_phi");
+        if (with_inv) {
+            {
+                orbit::int_vector order = text_order(tail);
+                lay_out(order, [&](ulint i) -> ulint { return tail[i]; },
+                        [&](ulint i) -> ulint { return head[i + 1 == R ? 0 : i + 1]; },
+                        [&](ulint i) -> ulint { return i + 1 == R ? ulint(0) : ulint(top[i + 1]); });
+            }
+            // Only the heads are needed after this.
+            samples.tail = orbit::int_vector();
+            samples.top = orbit::int_vector();
+            phase("tms_phi_inv_order");
+            build_from_lists(phi_inv_, TmsPhiInvCols{});
+            phase("tms_phi_inv");
+        }
+        samples.tail = orbit::int_vector();
+        samples.top = orbit::int_vector();
         // Each run head's phi point, located with a start table; an offset
         // into a phi interval fits phi's own offset column.
         phi_table_ = StartTable(phi_, start_table_shift(phi_.domain(), phi_.intervals()));
@@ -1361,15 +1401,6 @@ private:
         phi_table_ = StartTable();
         std::vector<bool>().swap(run_start);
         phase("tms_phi_cols");
-        if (with_inv) {
-            order = text_order(tail);
-            phi_inv_ = sampled_permutation<PhiInv, TmsPhiInvCols>(
-                R, [&](size_t x) -> ulint { return tail[order[x]]; },
-                [&](size_t x) -> ulint { const ulint i = order[x]; return head[i + 1 == R ? 0 : i + 1]; },
-                [&](size_t x) -> ulint { const ulint i = order[x]; return i + 1 == R ? ulint(0) : ulint(top[i + 1]); },
-                n, sp);
-            order = orbit::int_vector();
-        }
         samples = TmsPhiSamples();
     }
 
