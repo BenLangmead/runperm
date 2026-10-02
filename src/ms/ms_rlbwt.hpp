@@ -706,6 +706,7 @@ class MSIndexSpillLCP {
 public:
     using Position = typename IndexImpl::position;
     using position = Position;
+    using Impl = IndexImpl;
     MSIndexSpillLCP(const std::vector<uchar>& chars,
                     const std::vector<ulint>& lens,
                     const std::vector<std::array<ulint, static_cast<size_t>(LCPSpillRunCols::COUNT)>>& run_data,
@@ -721,6 +722,19 @@ public:
         for (size_t i = 0; i < chars.size(); ++i)
             if (lens[i] > 0) occurs_[chars[i]] = true;
         compute_codes();
+    }
+
+    /** From a move structure already holding the LCP columns (see ms_build). */
+    MSIndexSpillLCP(IndexImpl&& idx, std::vector<SpilloverVector> spill_vectors, ulint max_top, ulint max_sub,
+                    ulint spill_align = 0, uchar spill_split_bits = 0)
+        : idx_(std::move(idx))
+        , spill_vectors_(std::move(spill_vectors))
+        , max_lcp_top_(max_top)
+        , max_lcp_min_sub_(max_sub)
+        , spill_align_(spill_align > 0 ? spill_align : 1)
+        , spill_split_bits_(spill_split_bits)
+    {
+        compute_occurs();
     }
 
     /** An empty index, to be filled by load(). */

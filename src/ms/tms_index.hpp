@@ -76,6 +76,7 @@
 #include "orbit/rlbwt.hpp"
 #include "orbit/common.hpp"
 #include "ms_alphabet.hpp"
+#include "mem_report.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -129,6 +130,8 @@ struct TmsBuildOptions {
     // Build phi_inv along with phi (same splitting as phi).
     bool phi_inv = true;
     TmsLayout layout = TmsLayout::FULL;
+    // Print memory at the phase boundaries of the build (see mem_report).
+    bool report = false;
 };
 
 class TmsIndex {
@@ -158,35 +161,84 @@ public:
      * LF over all n rows from row 0 and so needs a single terminator.
      * opts.layout says which parts to build: the psi layout takes no
      * run_tops, and the phi layout needs them.  opts.lf_split must split.
+     * lens and run_tops may be std::vectors or packed orbit::int_vectors.
      */
-    TmsIndex(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
-             const TmsBuildOptions& opts = TmsBuildOptions{}, const std::vector<ulint>* run_tops = nullptr) {
+    template <typename Lens = std::vector<ulint>, typename Tops = std::vector<ulint>>
+    TmsIndex(const std::vector<uchar>& heads, const Lens& lens,
+             const TmsBuildOptions& opts = TmsBuildOptions{}, const Tops* run_tops = nullptr) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
         if (opts.layout == TmsLayout::PSI && run_tops) throw std::invalid_argument("a psi layout takes no LCP values");
         if (opts.layout == TmsLayout::PHI && !run_tops) throw std::invalid_argument("a phi layout needs LCP values");
         check_lf_split(opts.lf_split);
+        auto phase = [&](const char* name) { if (opts.report) mem_report::phase(name, heads.size()); };
         has_psi_ = opts.layout != TmsLayout::PHI;
         Enc lf_enc;
-        std::vector<typename LF::data_tuple> cols;
+        // With psi, the rows' bytes, which fill_psi reads.
+        std::vector<uchar> row_heads;
+        orbit::int_vector row_lens;
         if (has_psi_) {
-            std::vector<uchar> row_heads;
-            std::vector<ulint> row_lens;
             union_rows(heads, lens, opts.lf_split, row_heads, row_lens);
-            cols.resize(row_lens.size());
-            fill_psi(row_heads, row_lens, cols);
+            phase("tms_union_rows");
             lf_enc = Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING);
         } else {
             lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
-            cols.resize(lf_enc.intervals());
         }
+        phase("tms_lf_enc");
+        // With phi, the PHI_INT and PHI_OFF columns of each LF row.
+        orbit::packed_matrix<2> phi_cols;
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
-            build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, cols);
+            // build_phi frees LF's encoding once its walk is done, and it is
+            // made again afterwards, from the rows with psi (which is cheap)
+            // or by splitting the runs again, when less is held.
+            auto release = [&]() { lf_enc = Enc(); };
+            build_phi(lens, lf_enc, *run_tops, opts.phi_split, opts.phi_inv, phi_cols, phase, release);
+            lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
+                              : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
+            phase("tms_build_phi");
             has_phi_ = true;
             has_phi_inv_ = opts.phi_inv;
         }
-        // The columns of parts the index lacks hold zeros and take no bits.
-        lf_ = LF(lf_enc, cols, {!has_psi_, !has_psi_, !has_phi_, !has_phi_});
+        // The data columns take the widths of their largest values, and the
+        // columns of parts the index lacks take no bits and read as 0.  LF is
+        // built with them and its data written in place.
+        std::array<uchar, 4> widths{};
+        if (has_psi_) {
+            ulint max_int = 0, max_off = 0;
+            fill_psi(row_heads, [&](ulint i) { return lf_enc.get_length(i); }, [&](ulint, ulint to, ulint off) {
+                max_int = std::max(max_int, to);
+                max_off = std::max(max_off, off);
+            });
+            widths[col(TmsLFCols::PSI_INT)] = orbit::bit_width(max_int);
+            widths[col(TmsLFCols::PSI_OFF)] = orbit::bit_width(max_off);
+        }
+        if (has_phi_) {
+            ulint max_int = 0, max_off = 0;
+            for (size_t k = 0; k < phi_cols.size(); ++k) {
+                max_int = std::max(max_int, phi_cols.get<0>(k));
+                max_off = std::max(max_off, phi_cols.get<1>(k));
+            }
+            widths[col(TmsLFCols::PHI_INT)] = orbit::bit_width(max_int);
+            widths[col(TmsLFCols::PHI_OFF)] = orbit::bit_width(max_off);
+        }
+        lf_ = LF(lf_enc, widths, LF::in_place_data);
+        lf_enc = Enc();
+        row_lens = orbit::int_vector();
+        if (has_psi_) {
+            fill_psi(row_heads, [&](ulint i) { return lf_.get_length(i); }, [&](ulint k, ulint to, ulint off) {
+                lf_.template set_data<TmsLFCols::PSI_INT>(k, to);
+                lf_.template set_data<TmsLFCols::PSI_OFF>(k, off);
+            });
+            std::vector<uchar>().swap(row_heads);
+        }
+        if (has_phi_) {
+            for (size_t k = 0; k < phi_cols.size(); ++k) {
+                lf_.template set_data<TmsLFCols::PHI_INT>(k, phi_cols.get<0>(k));
+                lf_.template set_data<TmsLFCols::PHI_OFF>(k, phi_cols.get<1>(k));
+            }
+            phi_cols = orbit::packed_matrix<2>();
+        }
+        phase("tms_assemble");
         compute_occurs();
         if (has_phi_inv_) build_start_tables();
     }
@@ -867,9 +919,10 @@ private:
      * LF's intervals, split with sp, and of their images.  Each row gets the
      * byte of the run it lies in.  O(r) time and space.
      */
-    static void union_rows(const std::vector<uchar>& heads, const std::vector<ulint>& lens,
+    template <typename Lens>
+    static void union_rows(const std::vector<uchar>& heads, const Lens& lens,
                            const orbit::split_params& sp, std::vector<uchar>& row_heads,
-                           std::vector<ulint>& row_lens) {
+                           orbit::int_vector& row_lens) {
         using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
         const Enc split = Enc::lf_interval_encoding(heads, lens, sp);
         const ulint m = split.intervals();
@@ -895,10 +948,10 @@ private:
             next_slot[c] = b;
             b += intervals_of[c];
         }
-        // The images' starts, in row order.
-        std::vector<ulint> images(m);
+        // The images' starts, in row order, packed.
+        orbit::int_vector images(m, orbit::bit_width(split.domain() - 1));
         each([&](ulint k, uchar c) {
-            images[next_slot[c]++] = next_image[c];
+            images.set(next_slot[c]++, next_image[c]);
             next_image[c] += split.get_length(k);
         });
         // Merge the two sorted lists of starts, calling emit(c, length) for
@@ -919,30 +972,35 @@ private:
             });
         };
         size_t rows = 0;
-        merge([&](uchar, ulint) { ++rows; });
-        row_heads.clear();
-        row_lens.clear();
-        row_heads.reserve(rows);
-        row_lens.reserve(rows);
+        ulint max_len = 0;
+        merge([&](uchar, ulint len) {
+            ++rows;
+            max_len = std::max(max_len, len);
+        });
+        row_heads.assign(rows, 0);
+        row_lens = orbit::int_vector(rows, orbit::bit_width(max_len));
+        size_t i = 0;
         merge([&](uchar c, ulint len) {
-            row_heads.push_back(c);
-            row_lens.push_back(len);
+            row_heads[i] = c;
+            row_lens.set(i++, len);
         });
     }
 
     /**
-     * For LF rows with the given heads and lengths, fill the PSI columns
-     * with psi's pointer and offset for each row's head, and the table of F
-     * block starts.  Row i with byte c holds the occurrences of c ranked R
-     * to R + length - 1 in the BWT, where R counts those in earlier rows, so
-     * psi maps F positions C[c] + R onward into it; the rows of c's F block
-     * that start there are found by walking the block alongside.
+     * For LF rows with the given heads and lengths (len(i) the length of row
+     * i), find psi's pointer and offset for each row's head, calling
+     * put(k, pointer, offset) for each row k that psi maps a row head into,
+     * and fill the table of F block starts.  Row i with byte c holds the
+     * occurrences of c ranked R to R + length - 1 in the BWT, where R counts
+     * those in earlier rows, so psi maps F positions C[c] + R onward into it;
+     * the rows of c's F block that start there are found by walking the
+     * block alongside.
      */
-    void fill_psi(const std::vector<uchar>& row_heads, const std::vector<ulint>& row_lens,
-                  std::vector<typename LF::data_tuple>& cols) {
-        const size_t rows = row_lens.size();
+    template <typename Len, typename Put>
+    void fill_psi(const std::vector<uchar>& row_heads, Len&& len, Put&& put) {
+        const size_t rows = row_heads.size();
         std::array<ulint, 256> count{}, f_pos{}, f_row{};
-        for (size_t i = 0; i < rows; ++i) count[row_heads[i]] += row_lens[i];
+        for (size_t i = 0; i < rows; ++i) count[row_heads[i]] += len(i);
         for (size_t c = 0, a = 0; c < 256; ++c) {
             f_pos[c] = a;
             a += count[c];
@@ -954,7 +1012,7 @@ private:
             size_t i = 0, b = 0;
             for (size_t c = 0; c < 256; ++c) {
                 if (count[c] == 0) continue;
-                while (start < f_pos[c]) start += row_lens[i++];
+                while (start < f_pos[c]) start += len(i++);
                 if (start != f_pos[c]) throw std::logic_error("an F block must start at a row start");
                 f_row[c] = i;
                 if (b > F_BLOCKS) throw std::runtime_error("more characters than the F block table holds");
@@ -966,12 +1024,10 @@ private:
         std::array<ulint, 256> next_row = f_row, next_start = f_pos;
         for (size_t i = 0; i < rows; ++i) {
             const uchar c = row_heads[i];
-            const ulint lo = f_pos[c] + rank[c], hi = lo + row_lens[i];
-            for (; next_start[c] < hi; next_start[c] += row_lens[next_row[c]++]) {
-                cols[next_row[c]][col(TmsLFCols::PSI_INT)] = i;
-                cols[next_row[c]][col(TmsLFCols::PSI_OFF)] = next_start[c] - lo;
-            }
-            rank[c] += row_lens[i];
+            const ulint li = len(i);
+            const ulint lo = f_pos[c] + rank[c], hi = lo + li;
+            for (; next_start[c] < hi; next_start[c] += len(next_row[c]++)) put(next_row[c], i, next_start[c] - lo);
+            rank[c] += li;
         }
     }
 
@@ -983,39 +1039,53 @@ private:
     }
 
     /**
-     * A starts-based permutation over text positions whose intervals start at
-     * starts (sorted, starting at 0) with the given images, and one integrated
-     * column holding an LCP value that drops by one per position inside an
-     * interval, sampled at each start.  Split intervals get the sample minus
-     * their distance from the original start.  Also returns the starts of the
-     * split intervals.
+     * A starts-based permutation over text positions with m intervals, the
+     * x-th starting at start(x) (increasing, from 0) with image image(x),
+     * and one integrated column holding an LCP value that drops by one per
+     * position inside an interval, sampled at each start as sample(x).
+     * Split intervals get the sample minus their distance from the original
+     * start.  The column is written in place, at the width of its largest
+     * value.
      */
-    template <typename Perm, typename Cols>
-    static std::pair<Perm, std::vector<ulint>> sampled_permutation(const std::vector<ulint>& starts,
-                                                                   const std::vector<ulint>& images,
-                                                                   const std::vector<ulint>& samples, ulint n,
-                                                                   const orbit::split_params& sp) {
-        if (starts.empty() || starts[0] != 0) throw std::logic_error("a permutation over text positions must start at 0");
-        std::vector<ulint> lengths(starts.size());
+    template <typename Perm, typename Cols, typename Start, typename Image, typename Sample>
+    static Perm sampled_permutation(size_t m, Start&& start, Image&& image, Sample&& sample, ulint n,
+                                    const orbit::split_params& sp) {
+        if (m == 0 || start(0) != 0) throw std::logic_error("a permutation over text positions must start at 0");
+        // Views of the intervals' lengths and images, as Orbit's encoding reads them.
+        struct Lengths {
+            size_t m;
+            ulint n;
+            const Start* start;
+            size_t size() const { return m; }
+            ulint operator[](size_t x) const { return (x + 1 < m ? (*start)(x + 1) : n) - (*start)(x); }
+        } lengths{m, n, &start};
+        struct Images {
+            size_t m;
+            const Image* image;
+            size_t size() const { return m; }
+            ulint operator[](size_t x) const { return (*image)(x); }
+        } images{m, &image};
         ulint max_length = 0;
-        for (size_t x = 0; x < starts.size(); ++x) {
-            lengths[x] = (x + 1 < starts.size() ? starts[x + 1] : n) - starts[x];
-            max_length = std::max(max_length, lengths[x]);
-        }
+        for (size_t x = 0; x < m; ++x) max_length = std::max(max_length, lengths[x]);
         auto enc = orbit::interval_encoding_impl<>::from_lengths_and_images(lengths, images, n, max_length, sp);
-        std::vector<orbit::columns_tuple<Cols>> cols(enc.intervals());
-        std::vector<ulint> split_starts(enc.intervals());
-        ulint s = 0;
-        size_t x = 0;
-        for (ulint i = 0; i < enc.intervals(); ++i) {
-            while (x + 1 < starts.size() && starts[x + 1] <= s) ++x;
-            const ulint into = s - starts[x];
-            if (samples[x] < into) throw std::runtime_error("LCP samples are inconsistent with the RLBWT");
-            cols[i][0] = samples[x] - into;
-            split_starts[i] = s;
-            s += enc.get_length(i);
-        }
-        return {Perm(enc, cols), std::move(split_starts)};
+        // Call put(i, value) with the column's value for each split interval i.
+        auto each = [&](auto put) {
+            ulint s = 0;
+            size_t x = 0;
+            ulint sx = start(0);
+            for (ulint i = 0; i < enc.intervals(); ++i) {
+                while (x + 1 < m && start(x + 1) <= s) sx = start(++x);
+                const ulint into = s - sx, v = sample(x);
+                if (v < into) throw std::runtime_error("LCP samples are inconsistent with the RLBWT");
+                put(i, v - into);
+                s += enc.get_length(i);
+            }
+        };
+        ulint max_value = 0;
+        each([&](ulint, ulint v) { max_value = std::max(max_value, v); });
+        Perm perm(enc, {orbit::bit_width(max_value)}, Perm::in_place_data);
+        each([&](ulint i, ulint v) { perm.template set_data<static_cast<Cols>(0)>(i, v); });
+        return perm;
     }
 
     /**
@@ -1033,23 +1103,33 @@ private:
      * the interval starting at SA[t] maps to SA[t + 1] (SA[n - 1] to SA[0] =
      * n - 1).  The PLCPB sample at SA[t] is LCP[t + 1], the top of the next
      * run, or 0 for row n - 1.
+     *
+     * The text positions and tops are kept packed, and the intervals of phi
+     * and phi_inv are read through views of them in text order.
      */
-    template <typename Enc>
-    void build_phi(const std::vector<ulint>& lens, const Enc& lf_enc,
-                   const std::vector<ulint>& run_tops, const orbit::split_params& sp, bool with_inv,
-                   std::vector<typename LF::data_tuple>& cols) {
+    template <typename Lens, typename Enc, typename Tops, typename Phase, typename Release>
+    void build_phi(const Lens& lens, const Enc& lf_enc,
+                   const Tops& run_tops, const orbit::split_params& sp, bool with_inv,
+                   orbit::packed_matrix<2>& phi_cols, Phase&& phase, Release&& release_enc) {
         const ulint lf_count = lf_enc.intervals();
-        std::vector<ulint> sa_head(lf_count), sa_tail(lf_count), top(lf_count, NOT_A_RUN_HEAD);
+        const ulint n = lf_enc.domain();
+        // top holds 1 + the LCP at each LF interval that starts an original
+        // run, and 0 at the others.
+        orbit::int_vector sa_head(lf_count, orbit::bit_width(n - 1)), sa_tail(lf_count, orbit::bit_width(n - 1)), top;
+        {
+            ulint max_top = 0;
+            for (ulint t : run_tops) max_top = std::max(max_top, t);
+            top = orbit::int_vector(lf_count, orbit::bit_width(max_top + 1));
+        }
         {
             // The LCP at each LF interval that starts an original run.
             ulint k = 0;
             for (size_t r = 0; r < lens.size(); ++r) {
-                top[k] = run_tops[r];
+                top.set(k, run_tops[r] + 1);
                 ulint covered = 0;
                 while (covered < lens[r]) covered += lf_enc.get_length(k++);
             }
             orbit::rlbwt::lf_move<false, ms_alpha::alphabet> lf(lf_enc);
-            const ulint n = lf.domain();
             auto pos = lf.first();
             ulint sa = n - 1;
             std::vector<bool> seen(lf_count, false);
@@ -1062,52 +1142,70 @@ private:
                 throw std::runtime_error("LF is not a single cycle (a string collection, such as an FMD, with one "
                                          "terminator per string); building phi by an LF walk needs one terminator");
         }
-        const ulint n = lf_enc.domain();
-        const auto& lf_heads = lf_enc.get_heads();
-        std::vector<ulint> order, starts, images, samples;
-        auto fill = [&](auto start_of, auto image_of, auto sample_of) {
-            std::sort(order.begin(), order.end(), [&](ulint a, ulint b) { return start_of(a) < start_of(b); });
-            starts.resize(order.size());
-            images.resize(order.size());
-            samples.resize(order.size());
-            for (size_t x = 0; x < order.size(); ++x) {
-                starts[x] = start_of(order[x]);
-                images[x] = image_of(order[x]);
-                samples[x] = sample_of(order[x]);
-            }
-        };
-        // phi from true run heads.
-        order.clear();
-        for (ulint k = 0; k < lf_count; ++k)
-            if (k == 0 || lf_heads[k] != lf_heads[k - 1]) order.push_back(k);
-        fill([&](ulint k) { return sa_head[k]; },
-             [&](ulint k) { return sa_tail[k == 0 ? lf_count - 1 : k - 1]; },
-             [&](ulint k) {
-                 if (top[k] == NOT_A_RUN_HEAD) throw std::logic_error("a true run head must start an original run");
-                 return top[k];
-             });
-        std::vector<ulint> split_starts;
-        std::tie(phi_, split_starts) = sampled_permutation<Phi, TmsPhiCols>(starts, images, samples, n, sp);
-        for (ulint k = 0; k < lf_count; ++k) {
-            const ulint p = sa_head[k];
-            const ulint i = static_cast<ulint>(std::upper_bound(split_starts.begin(), split_starts.end(), p) -
-                                               split_starts.begin()) - 1;
-            cols[k][col(TmsLFCols::PHI_INT)] = i;
-            cols[k][col(TmsLFCols::PHI_OFF)] = p - split_starts[i];
+        // Which LF intervals' bytes differ from the one before's (k = 0
+        // counts as differing), after which release_enc may free lf_enc.
+        std::vector<bool> differs(lf_count);
+        {
+            const auto& lf_heads = lf_enc.get_heads();
+            for (ulint k = 0; k < lf_count; ++k) differs[k] = k == 0 || lf_heads[k] != lf_heads[k - 1];
         }
+        release_enc();
+        phase("tms_phi_walk");
+        auto top_of = [&](ulint k) {
+            const ulint t = top[k];
+            if (t == 0) throw std::logic_error("a true run head must start an original run");
+            return t - 1;
+        };
+        // The LF intervals that give the intervals, in text order.
+        std::vector<ulint> order;
+        // phi from true run heads.
+        for (ulint k = 0; k < lf_count; ++k)
+            if (differs[k]) order.push_back(k);
+        std::sort(order.begin(), order.end(), [&](ulint a, ulint b) { return sa_head[a] < sa_head[b]; });
+        phi_ = sampled_permutation<Phi, TmsPhiCols>(
+            order.size(), [&](size_t x) -> ulint { return sa_head[order[x]]; },
+            [&](size_t x) -> ulint { const ulint k = order[x]; return sa_tail[k == 0 ? lf_count - 1 : k - 1]; },
+            [&](size_t x) { return top_of(order[x]); }, n, sp);
+        std::vector<ulint>().swap(order);
+        phase("tms_phi");
+        // Each LF row head's phi point, located with a start table; an offset
+        // into a phi interval fits phi's own offset column.
+        phi_table_ = StartTable(phi_, start_table_shift(phi_.domain(), phi_.intervals()));
+        phi_cols = orbit::packed_matrix<2>(
+            lf_count, {orbit::bit_width(phi_.intervals() - 1), phi_.get_widths()[Phi::offset_column()]});
+        {
+            const PhiWalker w = phi_walker();
+            for (ulint k = 0; k < lf_count; ++k) {
+                const PhiPos q = w.locate(sa_head[k]);
+                phi_cols.set<0>(k, q.interval);
+                phi_cols.set<1>(k, q.offset);
+            }
+        }
+        phi_table_ = StartTable();
+        phase("tms_phi_cols");
         if (!with_inv) return;
         // phi_inv from true run tails.
-        order.clear();
         for (ulint k = 0; k < lf_count; ++k)
-            if (k + 1 == lf_count || lf_heads[k] != lf_heads[k + 1]) order.push_back(k);
-        fill([&](ulint k) { return sa_tail[k]; },
-             [&](ulint k) { return sa_head[k + 1 == lf_count ? 0 : k + 1]; },
-             [&](ulint k) {
-                 if (k + 1 == lf_count) return ulint(0);
-                 if (top[k + 1] == NOT_A_RUN_HEAD) throw std::logic_error("a true run head must start an original run");
-                 return top[k + 1];
-             });
-        std::tie(phi_inv_, split_starts) = sampled_permutation<PhiInv, TmsPhiInvCols>(starts, images, samples, n, sp);
+            if (k + 1 == lf_count || differs[k + 1]) order.push_back(k);
+        std::sort(order.begin(), order.end(), [&](ulint a, ulint b) { return sa_tail[a] < sa_tail[b]; });
+        // phi_inv's intervals, packed, so that the walk's data is freed before
+        // phi_inv's encoding is made.
+        const size_t m = order.size();
+        orbit::int_vector starts(m, orbit::bit_width(n - 1)), images(m, orbit::bit_width(n - 1)),
+            samples(m, top.get_width());
+        for (size_t x = 0; x < m; ++x) {
+            const ulint k = order[x];
+            starts.set(x, sa_tail[k]);
+            images.set(x, sa_head[k + 1 == lf_count ? 0 : k + 1]);
+            samples.set(x, k + 1 == lf_count ? ulint(0) : top_of(k + 1));
+        }
+        std::vector<ulint>().swap(order);
+        sa_head = orbit::int_vector();
+        sa_tail = orbit::int_vector();
+        top = orbit::int_vector();
+        phi_inv_ = sampled_permutation<PhiInv, TmsPhiInvCols>(
+            m, [&](size_t x) -> ulint { return starts[x]; }, [&](size_t x) -> ulint { return images[x]; },
+            [&](size_t x) -> ulint { return samples[x]; }, n, sp);
     }
 
     static constexpr ulint NOT_A_RUN_HEAD = std::numeric_limits<ulint>::max();

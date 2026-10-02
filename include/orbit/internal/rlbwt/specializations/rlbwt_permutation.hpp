@@ -78,6 +78,18 @@ public:
         }
     }
 
+    using in_place_data_t = typename base::in_place_data_t;
+    static constexpr in_place_data_t in_place_data{};
+
+    // From an encoding, with the data columns' widths given and their values
+    // left to be written in place (see permutation_impl).
+    template<typename rlbwt_interval_encoding_t>
+    rlbwt_permutation(const rlbwt_interval_encoding_t& enc, const std::array<uchar, num_columns<data_columns_t>()>& data_widths, in_place_data_t tag)
+        : base(enc, data_widths, tag) {
+        static_assert(std::is_same_v<alphabet_t, typename rlbwt_interval_encoding_t::alphabet_tag>, "alphabet_t must be the same as the alphabet type used to create the interval encoding");
+        alphabet_ = enc.get_alphabet();
+    }
+
     template<typename container1_t, typename container2_t>
     rlbwt_permutation(const container1_t &rlbwt_heads, const container2_t &rlbwt_run_lengths, const std::vector<data_tuple> &run_data)
         : rlbwt_permutation(rlbwt_heads, rlbwt_run_lengths, NO_SPLITTING, run_data) {}

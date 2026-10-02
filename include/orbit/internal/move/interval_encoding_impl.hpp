@@ -152,7 +152,10 @@ public:
         assert(lengths.size() == images.size());
 
         int_vector_t img_rank_inv = compute_img_rank_inv<int_vector_t>(images);
-        return from_lengths_and_img_rank_inv(lengths, img_rank_inv, domain, max_length, sp);
+        interval_encoding_impl<int_vector_t> enc;
+        enc.set_initial_values(domain, lengths.size(), max_length, sp);
+        enc.init_img_rank_inv(lengths, std::move(img_rank_inv));
+        return enc;
     }
 
     template<typename container1_t, typename container2_t>
@@ -291,6 +294,28 @@ protected:
             curr_lengths[i] = lengths[i];
             curr_img_rank_inv[i] = img_rank_inv[i];
         }
+
+        ulint new_max_length = 0;
+        apply_splitting(curr_lengths, curr_img_rank_inv, new_max_length);
+
+        this->lengths = std::move(curr_lengths);
+        this->img_rank_inv = std::move(curr_img_rank_inv);
+        this->max_length_ = new_max_length;
+        this->intervals_ = this->lengths.size();
+    }
+
+    // As init_img_rank_inv, taking over img_rank_inv, which must have the
+    // width bit_width(runs - 1), instead of copying it.
+    template<typename container1_t>
+    void init_img_rank_inv(const container1_t& lengths, int_vector_t&& img_rank_inv) {
+        assert(img_rank_inv.size() == this->runs_);
+        uchar length_bits = bit_width(this->max_length_);
+
+        int_vector_t curr_lengths(this->runs_, length_bits);
+        for (size_t i = 0; i < this->runs_; ++i) {
+            curr_lengths[i] = lengths[i];
+        }
+        int_vector_t curr_img_rank_inv = std::move(img_rank_inv);
 
         ulint new_max_length = 0;
         apply_splitting(curr_lengths, curr_img_rank_inv, new_max_length);
