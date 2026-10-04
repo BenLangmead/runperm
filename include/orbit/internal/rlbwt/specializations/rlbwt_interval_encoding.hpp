@@ -74,7 +74,8 @@ public:
 protected:
     template<typename, bool, bool, bool, typename,
              template<typename, template<typename> class> class,
-             template<typename> class>
+             template<typename> class,
+             invertible_space_mode>
     friend class orbit::permutation_impl;
 
     // Also drops run heads. find_structure copies them into the character column first.
