@@ -25,6 +25,7 @@
 #include "read_chunks.hpp"
 #include "format_int.hpp"
 #include "orient.hpp"
+#include "ftab_survey.hpp"
 #include <zlib.h>
 #include <iostream>
 #include <string>
@@ -38,6 +39,9 @@
 #include <memory>
 #include <optional>
 #include <type_traits>
+#include <filesystem>
+#include <iomanip>
+#include <thread>
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -161,8 +165,15 @@ static void usage(const char* prog) {
               << "              collection (one terminator per string, as in an FMD), print\n"
               << "              each string and its $, one per line, in the BWT order of\n"
               << "              their terminators.  An FMD's N prints as N.\n"
-              << "  tms-inspect INDEX_PATH\n"
-              << "              Print the structures' sizes and column widths.\n"
+              << "  ftab-survey INDEX_PATH [--kmin K] [--kmax K] [--threads T] [--verify K]\n"
+              << "              Development: count the k-mers over ACGT that occur in the\n"
+              << "              text, for each k from --kmin (default 6) to --kmax (default\n"
+              << "              15), and the size of a dense table holding each k-mer's\n"
+              << "              row after its cold-start walk.  --verify K checks the counts\n"
+              << "              for k up to K against ms on every k-mer.\n"
+              << "  tms-inspect INDEX_PATH [--phi-lengths]\n"
+              << "              Print the structures' sizes and column widths.  --phi-lengths\n"
+              << "              loads only LF and phi's lengths-based form.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
               << "              Inspect index and optionally output spillover TSV.\n"
               << "  lcp-list   TSV_PATH\n"
@@ -521,6 +532,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #ifdef MS_STATS
     MsStats ms_total;
 #endif
+#ifdef MS_STEP_STATS
+    StepAgg step_total;
+#endif
     auto t_all = clock::now();
     try {
         run_parallel_blocks<Block>(
@@ -549,6 +563,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #endif
 #ifdef MS_STATS
                 ms_total += ms_stats;
+#endif
+#ifdef MS_STEP_STATS
+                step_total += step_agg;
 #endif
             });
     } catch (const std::exception& e) {
@@ -579,6 +596,10 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
               << " lf_ff/step=" << double(ms_total.lf_ff) / ms_total.lf_steps
               << " walk_up/rep=" << double(ms_total.walk_up) / ms_total.repositions
               << " walk_down/rep=" << double(ms_total.walk_down) / ms_total.repositions << "\n";
+#endif
+#ifdef MS_STEP_STATS
+    if (interleave == 0) step_total.print(std::cerr);
+    else std::cerr << "stepstats: none recorded; steps are recorded with --interleave 0\n";
 #endif
     perf.report(std::cerr, n_bases);
     // query_s sums the threads' time in queries, parse_s their time
@@ -996,9 +1017,65 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "ftab-survey") {
+        if (argc < 1) { std::cerr << "ftab-survey requires INDEX_PATH\n"; return 1; }
+        unsigned kmin = 6, kmax = 15, verify = 0;
+        size_t threads = 1;
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "--kmin") == 0 && i + 1 < argc) kmin = static_cast<unsigned>(std::stoul(argv[++i]));
+            else if (strcmp(argv[i], "--kmax") == 0 && i + 1 < argc) kmax = static_cast<unsigned>(std::stoul(argv[++i]));
+            else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
+                threads = static_cast<size_t>(std::stoull(argv[++i]));
+            else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify = static_cast<unsigned>(std::stoul(argv[++i]));
+            else { std::cerr << "Unknown ftab-survey option: " << argv[i] << "\n"; return 1; }
+        }
+        if (kmin < 1 || kmax < kmin || kmax > 31) { std::cerr << "ftab-survey needs 1 <= kmin <= kmax <= 31\n"; return 1; }
+        threads = resolve_thread_count(threads);
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+        auto opt = ms_serialize::read_index(argv[0]);
+        if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
+        auto& idx = *opt;
+        const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+        const ulint file_bytes = static_cast<ulint>(std::filesystem::file_size(argv[0]));
+        const ulint intervals = idx.move_runs();
+        const ulint max_len = ftab_survey::max_interval_length(idx, threads);
+        // An entry names an interval and an offset within it, plus one bit
+        // marking a k-mer that does not occur.
+        const unsigned int_bits = ftab_survey::bits_for(intervals - 1);
+        const unsigned off_bits = ftab_survey::bits_for(max_len > 0 ? max_len - 1 : 0);
+        const unsigned entry_bits = int_bits + off_bits + 1;
+        std::cout << "index: " << argv[0] << " file_bytes=" << file_bytes << " intervals=" << intervals
+                  << " n=" << idx.domain() << " max_interval_length=" << max_len << " interval_bits=" << int_bits
+                  << " offset_bits=" << off_bits << " entry_bits=" << entry_bits
+                  << " len_width=" << int(idx.get_widths()[0]) << " threads=" << threads << " load_s=" << load_s
+                  << "\n";
+        const auto res = ftab_survey::survey(idx, kmax, threads);
+        std::cout << "survey: kmax=" << kmax << " steps=" << res.steps << " seconds=" << res.seconds << "\n";
+        std::cout << "k\tpresent\tkmers\toccupancy\tbits_per_entry\ttable_bytes\tpct_of_index\n";
+        for (unsigned k = kmin; k <= kmax; ++k) {
+            const ulint kmers = ulint{1} << (2 * k);
+            const ulint table_bytes = (kmers * entry_bits + 7) / 8;
+            std::cout << k << '\t' << res.present[k] << '\t' << kmers << '\t' << std::setprecision(6)
+                      << double(res.present[k]) / double(kmers) << '\t' << entry_bits << '\t' << table_bytes << '\t'
+                      << 100.0 * double(table_bytes) / double(file_bytes) << "\n";
+        }
+        for (unsigned k = 1; k <= std::min(verify, kmax); ++k) {
+            const ulint bf = ftab_survey::brute_force(idx, k);
+            std::cout << "verify: k=" << k << " survey=" << res.present[k] << " brute_force=" << bf
+                      << (bf == res.present[k] ? " ok" : " mismatch") << "\n";
+            if (bf != res.present[k]) return 1;
+        }
+        return 0;
+    }
+
     if (cmd == "tms-inspect") {
         if (argc < 1) { std::cerr << "tms-inspect requires INDEX_PATH\n"; return 1; }
-        auto opt = read_tms_index(argv[0]);
+        // --phi-lengths loads LF and phi's lengths-based form alone, which
+        // takes far less memory than a whole phi or full index.
+        const TmsParts lf_phi_len{false, true, false, false};
+        const bool phi_len_only = argc > 1 && strcmp(argv[1], "--phi-lengths") == 0;
+        auto opt = read_tms_index(argv[0], phi_len_only ? &lf_phi_len : nullptr);
         if (!opt) { std::cerr << "Failed to load index: " << argv[0] << "\n"; return 1; }
         opt->describe(std::cout);
         return 0;

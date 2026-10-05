@@ -17,6 +17,7 @@
 #define _TMS_QUERY_HPP
 
 #include "tms_index.hpp"
+#include "step_stats.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -48,6 +49,9 @@ inline thread_local TmsStats tms_stats;
 #define TMS_COUNT(field, v) (tms_stats.field += (v))
 #else
 #define TMS_COUNT(field, v) ((void)0)
+#endif
+#if defined(MS_STEP_STATS) && !defined(TMS_STATS)
+#error "MS_STEP_STATS reads the TMS_STATS counters"
 #endif
 
 /**
@@ -209,6 +213,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint dist_up, dist_down;  // rows from the current row to u's tail and d's head
         bool found_up, found_down, scanned_up, scanned_down;
         Side up, down;
+#ifdef MS_STEP_STATS
+        size_t m;         // the pattern's length
+#endif
     };
     // LF rows prefetched on each side of the current row before a
     // reposition's scan, and how many more a scan prefetches on a side
@@ -231,6 +238,12 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     if constexpr (Toehold) init_ph = idx.resolve_phi(idx.template phi_at_head<PhiStarts>(0));
     std::vector<Slot> slots(k);
     size_t next = 0;
+#ifdef MS_STEP_STATS
+    // Steps are recorded only with one pattern in flight, so that each
+    // visit's time belongs to one step.
+    const bool record_steps = k == 1;
+    const ulint no_rows = 0;
+#endif
     auto start = [&](Slot& s) {
         while (next < patterns.size()) {
             const size_t j = next++;
@@ -245,6 +258,10 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
             s.pos = idx.first();
             s.ph = init_ph;
             s.state = STEP;
+#ifdef MS_STEP_STATS
+            s.m = patterns[j].size();
+            if (record_steps) step_rec.begin(s.m, out_len[j].data());
+#endif
             return true;
         }
         return false;
@@ -312,6 +329,10 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     while (end != slots.data()) {
         for (Slot* sp = slots.data(); sp < end;) {
             Slot& s = *sp;
+#ifdef MS_STEP_STATS
+            // Rows read are the reposition scans' rows.
+            StepProbe probe(s.m - s.i, &tms_stats.repositions, &tms_stats.scan_rows, &no_rows);
+#endif
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
             bool advanced = false;  // pat[i - 1] is done
             if (s.state == STEP) {
@@ -470,10 +491,17 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     }
                 }
             }
+#ifdef MS_STEP_STATS
+            // Before start() files this pattern and begins the next.
+            probe.record();
+#endif
             if (!advanced || --s.i > 0 || start(s)) ++sp;
             else s = *--end;
         }
     }
+#ifdef MS_STEP_STATS
+    if (record_steps) step_rec.flush();
+#endif
 }
 
 /**

@@ -25,6 +25,7 @@
 #include "orbit/common.hpp"
 #include "ms_alphabet.hpp"
 #include "ms_constants.hpp"
+#include "step_stats.hpp"
 #include <cassert>
 #include <iostream>
 #include <utility>
@@ -63,6 +64,9 @@ inline thread_local MsStats ms_stats;
 #define MS_COUNT(field, v) (ms_stats.field += (v))
 #else
 #define MS_COUNT(field, v) ((void)0)
+#endif
+#if defined(MS_STEP_STATS) && !defined(MS_STATS)
+#error "MS_STEP_STATS reads the MS_STATS counters"
 #endif
 
 /**
@@ -1180,7 +1184,14 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
     out.resize(pattern.size(), 0);
     Position pos = idx.first();
     ulint match_len = 0;
+#ifdef MS_STEP_STATS
+    step_rec.begin(pattern.size(), out.data());
+#endif
     for (size_t i = pattern.size(); i > 0; --i) {
+#ifdef MS_STEP_STATS
+        // Rows read are the reposition walks' rows, up and down.
+        StepProbe probe(pattern.size() - i, &ms_stats.repositions, &ms_stats.walk_up, &ms_stats.walk_down);
+#endif
         uchar c = static_cast<uchar>(pattern[i - 1]);
         if (idx.get_character(pos.interval) == c) {
             // Simple "case 1" LF step
@@ -1201,6 +1212,9 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
         out[i - 1] = match_len = std::min(match_len, opt->second) + 1;
         pos = opt->first;
     }
+#ifdef MS_STEP_STATS
+    step_rec.flush();
+#endif
     return out;
 }
 
