@@ -1284,10 +1284,10 @@ struct NoSeekBuf : std::streambuf {
 }  // namespace
 
 /**
- * The ORBITIDX header of a tms index: its sections and profiles agree with
- * the index, a load refuses a header whose column codes or profiles disagree
- * with the code, a load skips sections on a stream that cannot seek, and a
- * truncated file is refused.
+ * The ORBITIDX header of a tms index: its sections agree with the index, a
+ * load reads the sections its query needs and refuses a header whose column
+ * codes disagree with the code, a load skips sections on a stream that cannot
+ * seek, and a truncated file is refused.
  */
 bool test_index_format() {
     std::cout << "Testing the ORBITIDX header of tms indexes" << std::endl;
@@ -1300,16 +1300,30 @@ bool test_index_format() {
     const std::string file = ss.str();
     const Header h = decode_header(file.data());
     assert(h.tool == Tool::TMS && h.layout == Layout::FULL && h.n == idx.domain() && h.bwt_runs == idx.bwt_runs());
-    assert(h.sections.size() == 5 && h.profiles.size() == 10 && h.info == "built_by=test\n");
+    assert(h.sections.size() == 5 && h.info == "built_by=test\n");
     const SectionEntry* lf = h.find(Section::LF);
     assert(lf && lf->rows == idx.lf().intervals() && lf->cols.size() == 8);
     assert(lf->cols[4].first == static_cast<uint8_t>(Col::PSI_INT) && lf->cols[4].second == idx.lf().get_widths()[4]);
     for (const auto& e : h.sections) assert(e.offset % SECTION_ALIGN == 0);
     assert(file.size() == h.sections.back().offset + h.sections.back().bytes);
-    const Profile* phi_len = h.profile("phi-len");
-    assert(phi_len && phi_len->mask == (section_bit(Section::LF) | section_bit(Section::PHI_LEN)));
-    const Profile* all = h.profile("psi+phi-starts+phi-inv");
-    assert(all && all->phi_shift != NO_START_TABLE && all->phi_inv_shift != NO_START_TABLE);
+    // What a query loads.
+    const uint32_t lf_bit = section_bit(Section::LF);
+    assert(TmsIndex::sections_for(TmsParts{}) == lf_bit);
+    assert(TmsIndex::sections_for(TmsParts{true, false, false, false}) == (lf_bit | section_bit(Section::F_STARTS)));
+    assert(TmsIndex::sections_for(TmsParts{false, true, false, false}) == (lf_bit | section_bit(Section::PHI_LEN)));
+    assert(TmsIndex::sections_for(TmsParts{false, true, true, true}) ==
+           (lf_bit | section_bit(Section::PHI_START) | section_bit(Section::PHI_INV)));
+    assert(TmsIndex::sections_for(TmsParts{false, false, true, false}) == lf_bit);
+    {
+        std::stringstream in(file);
+        TmsIndex x;
+        x.load(in, TmsParts{false, true, true, true});
+        const SectionEntry* st = h.find(Section::PHI_START);
+        const SectionEntry* inv = h.find(Section::PHI_INV);
+        assert(x.has_phi_starts() && !x.has_phi_lengths() && x.has_phi_inv());
+        assert(x.start_table_bytes() == TmsIndex::start_table_bytes(st->domain, st->rows) +
+                                            TmsIndex::start_table_bytes(inv->domain, inv->rows));
+    }
 
     const TmsParts phi_need{false, true, false, false};
     // A column code other than the one this build reads.
@@ -1319,19 +1333,6 @@ bool test_index_format() {
         std::stringstream in(bad_col);
         TmsIndex x;
         assert(throws<std::runtime_error>([&] { x.load(in, phi_need); }, "has column plcp where this build reads psi_int"));
-    }
-    // A profile naming other sections than this build loads.
-    std::string bad_profile = file;
-    const size_t at = FIXED_BYTES + h.sections.size() * SECTION_ENTRY_BYTES;
-    for (size_t i = 0; i < h.profiles.size(); ++i)
-        if (h.profiles[i].name == "phi-len") {
-            const uint32_t m = phi_len->mask | section_bit(Section::PHI_START);
-            std::memcpy(&bad_profile[at + i * PROFILE_ENTRY_BYTES + 24], &m, 4);
-        }
-    {
-        std::stringstream in(bad_profile);
-        TmsIndex x;
-        assert(throws<std::runtime_error>([&] { x.load(in, phi_need); }, "names other sections"));
     }
     // Skipping sections on a stream that cannot seek reads past them.
     for (const TmsParts& need : {phi_need, TmsParts{false, true, true, true}, TmsParts{true, false, false, false}}) {
@@ -1353,7 +1354,7 @@ bool test_index_format() {
         TmsIndex x;
         assert(throws<std::runtime_error>([&] { x.load(in); }, "truncated"));
     }
-    std::cout << "  " << h.sections.size() << " sections and " << h.profiles.size() << " profiles PASSED" << std::endl;
+    std::cout << "  " << h.sections.size() << " sections PASSED" << std::endl;
     return true;
 }
 

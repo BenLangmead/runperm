@@ -60,28 +60,6 @@ void describe_header(const Header& h, std::ostream& os) {
         }
         os << "\n";
     }
-    os << "profiles (what a query loads, and the RAM its structures take):\n";
-    for (const auto& p : h.profiles) {
-        uint64_t total = 0;
-        os << "  " << p.name << ":";
-        for (const auto& e : h.sections)
-            if (p.mask & section_bit(e.id)) {
-                os << " " << section_name(e.id);
-                total += e.bytes;
-            }
-        const SectionEntry *st = h.find(Section::PHI_START), *inv = h.find(Section::PHI_INV);
-        if (st && p.phi_shift != NO_START_TABLE) {
-            const uint64_t b = start_table_bytes(*st, p.phi_shift);
-            os << " +phi_start_table(shift=" << int(p.phi_shift) << ")";
-            total += b;
-        }
-        if (inv && p.phi_inv_shift != NO_START_TABLE) {
-            const uint64_t b = start_table_bytes(*inv, p.phi_inv_shift);
-            os << " +phi_inv_start_table(shift=" << int(p.phi_inv_shift) << ")";
-            total += b;
-        }
-        os << "  = " << mb(total) << "\n";
-    }
     if (!h.info.empty()) {
         os << "info:\n";
         std::istringstream is(h.info);
@@ -303,7 +281,6 @@ std::string rewrap_legacy(const std::string& from, const std::string& to, const 
             sp.kind = Kind::SPILL_ARRAYS;
             sp.rows = arrays;
             srcs.push_back({sp, [&f, spill_begin](std::ostream& o) { copy_range(f, spill_begin, f.size, o); }});
-            h.profiles = ms_profiles();
         } else if (std::memcmp(magic, "TMSX", 4) == 0) {
             if (version != 8) return "TMSX version " + std::to_string(version) + " is not rewrapped (only 8)";
             h.tool = Tool::TMS;
@@ -350,10 +327,7 @@ std::string rewrap_legacy(const std::string& from, const std::string& to, const 
         h.info = info;
         std::ofstream out(to, std::ios::binary);
         if (!out.good()) return "cannot write " + to;
-        write_file(out, h, srcs, [&](Header& hh) {
-            hh.bwt_runs = runs;
-            if (hh.tool == Tool::TMS) hh.profiles = tms_profiles(hh);
-        });
+        write_file(out, h, srcs, [&](Header& hh) { hh.bwt_runs = runs; });
         out.close();
         if (!out) return "failed writing " + to;
         return "";

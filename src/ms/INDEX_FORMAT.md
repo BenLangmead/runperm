@@ -1,13 +1,13 @@
 # ORBITIDX: the Orbit-ms and Orbit-tms index format
 
-Both `ms build`/`build-rlbwt` (Orbit-ms) and `ms tms-build` (Orbit-tms) write this format. The first 4096 bytes of a file describe everything a query loads: which move tables, their columns in row order, and each column's bit width. `ms index-plan INDEX` prints that from the header alone. Code: `index_format.hpp` and `index_format.cpp`.
+Both `ms build`/`build-rlbwt` (Orbit-ms) and `ms tms-build` (Orbit-tms) write this format. The first 4096 bytes of a file describe everything it holds: each move table, its columns in row order, and each column's bit width. The format describes what is stored. Which parts a query loads is the software's choice, so it can change without changing the format. Given that choice, the header alone says exactly what a query will hold in RAM; `ms index-plan INDEX` prints it. Code: `index_format.hpp` and `index_format.cpp`.
 
 All integers are little-endian. The endian check refuses a file written on a big-endian host.
 
 ## Layout
 
 ```
-[0, 4096)        header: fixed fields, section table, profile table, info text; zero padded
+[0, 4096)        header: fixed fields, section table, info text; zero padded
 [4096, ...)      sections, each starting on a 4096-byte boundary, in section-table order
 ```
 
@@ -26,7 +26,7 @@ The file ends where the last section ends; `ms index-verify` checks this along w
 | 24 | u64 | n, the text length, terminators included |
 | 32 | u64 | BWT runs: maximal runs of one character in LF's rows |
 | 40 | u16 | sections |
-| 42 | u16 | profiles |
+| 42 | u16 | reserved, 0 |
 | 44 | u16 | info bytes |
 | 48 | u64[4] | tool scalars. ms: max LCP top, max LCP min-sub, spill alignment, spill split bits. tms: 0 |
 | 80 | | reserved, 0 |
@@ -54,31 +54,28 @@ Payloads:
 - **u64 array**: the values. F_STARTS has 7, the first row of each F block after the first.
 - **Spill arrays**: per array, a u64 byte count and the bytes.
 
-## Profile table (after the section table, 32 bytes per entry)
+## What this software loads (informative)
 
-| offset | type | field |
-|---|---|---|
-| 0 | char[24] | name, NUL padded |
-| 24 | u32 | mask: bit `id` set for each section loaded |
-| 28 | u8 | log2 positions per entry of phi's start table built at load, or 255 for none |
-| 29 | u8 | the same for phi_inv's start table |
+This section describes the current `ms` binary, not the format.
 
-A start table has `((domain - 1) >> shift) + 2` entries of `max(1, bit_width(rows - 1))` bits.
+- **Orbit-ms:** every query loads every section.
+- **Orbit-tms:** a query always loads LF, whole, with every column the layout keeps (`TmsIndex::sections_for`). It then adds:
+  - **F_STARTS** if the query walks psi;
+  - **PHI_START** if it needs text positions (`--positions`, an SMEM report, or `--phi-starts`), or else **PHI_LEN** if it walks phi;
+  - **PHI_INV** for `--report smem-all`. In that case it also builds a start table for PHI_START and for PHI_INV. Each has `((domain - 1) >> shift) + 2` entries of `max(1, bit_width(rows - 1))` bits, where `shift` is the smallest with `2^shift * rows >= 4 * domain`, computed from the section's entry.
 
-An ms index has one profile, `ms`, which loads LF and MS_SPILL. A tms index has a profile for each set of parts it holds, named by its parts joined with `+`. It always loads LF; `psi` adds F_STARTS; `phi-len` or `phi-starts` adds one form of phi; `phi-inv` adds PHI_INV and builds start tables. `lf` alone names LF with nothing else. `tms-batch` picks its profile as follows:
-
-| query | profile |
+| query | sections loaded |
 |---|---|
-| `--mode psi` | `psi` |
-| `--mode phi` | `phi-len` |
-| `--mode phi --phi-starts`, or `--positions` or `--report smem-one` in phi mode | `phi-starts` |
-| `--mode phiskip` or `dual` | `psi+phi-len` |
-| psi, phiskip or dual with `--positions` or `--report smem-one` | `psi+phi-starts` |
-| `--report smem-all` | `phi-starts+phi-inv`, or `psi+phi-starts+phi-inv` outside phi mode |
+| `--mode psi` | LF, F_STARTS |
+| `--mode phi` | LF, PHI_LEN |
+| `--mode phi` with `--phi-starts`, `--positions` or `--report smem-one` | LF, PHI_START |
+| `--mode phiskip` or `dual` | LF, F_STARTS, PHI_LEN |
+| psi with `--positions` or `--report smem-one`; phiskip or dual with those or `--phi-starts` | LF, F_STARTS, PHI_START |
+| `--report smem-all` | LF, PHI_START, PHI_INV, plus F_STARTS outside phi mode |
 
-`ms index-plan INDEX` prints this table for the index at hand. The loader looks up the profile by name and refuses an index whose profile names other sections than the code expects, so the header's plan is the load's plan.
+`ms index-plan INDEX` prints, for the index at hand, the sections and start tables each `tms-batch` command line loads and the RAM they take.
 
-LF is loaded whole, with every column the layout keeps. On a full-layout index a phi-mode query therefore loads the PSI columns and the union rows it does not read; build `--layout phi` for phi-only work.
+Because LF is loaded whole, a phi-mode query on a full-layout index also loads the PSI columns and the union rows it does not read. Build `--layout phi` for phi-only work.
 
 ## Info text
 

@@ -182,11 +182,11 @@ static void usage(const char* prog) {
               << "              2b - 1 that balancing factor b guarantees.  tms parts are\n"
               << "              loaded a group at a time.\n"
               << "  index-plan INDEX_PATH [--mode M] [--positions] [--report R] [--phi-starts]\n"
-              << "              Print an index's header: its sections with their columns and\n"
-              << "              widths, and the profiles of the queries it serves with the RAM\n"
-              << "              each takes, read from the file's first 4 KiB alone.  For a tms\n"
-              << "              index, also print the profile each tms-batch query loads, or with\n"
-              << "              query options only that query's.\n"
+              << "              Print an index's header, read from the file's first 4 KiB\n"
+              << "              alone: its sections with their columns and widths.  Then print\n"
+              << "              what this build loads for each query, and the RAM it takes: for\n"
+              << "              a tms index, for each tms-batch command line, or with query\n"
+              << "              options for that one alone.\n"
               << "  index-verify INDEX_PATH\n"
               << "              Check every section's CRC-32 and that the file is whole.\n"
               << "  index-rewrap LEGACY_PATH INDEX_PATH\n"
@@ -1154,27 +1154,57 @@ int main(int argc, char** argv) {
         }
         if (query && h.tool != orbit_idx::Tool::TMS) { std::cerr << "query options apply to tms indexes only\n"; return 1; }
         orbit_idx::describe_header(h, std::cout);
+        auto mb = [](size_t bytes) {
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(bytes < 10'000'000 ? 3 : 1) << bytes / 1e6 << " MB";
+            return os.str();
+        };
         if (h.tool != orbit_idx::Tool::TMS) {
-            std::cout << "queries: every ms query loads profile ms\n";
+            size_t total = 0;
+            for (const auto& e : h.sections) total += e.bytes;
+            std::cout << "load plan of this build: every ms query loads every section = " << mb(total) << "\n";
             return 0;
         }
-        // The profile each tms-batch command line loads.
-        auto plan = [&]() {
-            const TmsParts need = tms_batch_parts();
-            const std::string name = TmsIndex::profile_for(need);
-            const TmsParts held = TmsIndex::held_parts(h);
-            const bool ok = (!need.psi || held.psi) && (!need.phi || held.phi) && (!need.phi_inv || held.phi_inv);
-            return ok ? name : "(refused: the index lacks a part)";
+        // What this build loads for each tms-batch command line, from the
+        // header's sections: TmsIndex::sections_for, and the start tables
+        // load() builds with phi_inv.
+        const TmsParts held = TmsIndex::held_parts(h);
+        auto serves = [&](const TmsParts& need) {
+            return (!need.psi || held.psi) && (!need.phi || held.phi) && (!need.phi_inv || held.phi_inv);
+        };
+        auto describe_plan = [&](const TmsParts& need) {
+            std::ostringstream os;
+            const uint32_t mask = TmsIndex::sections_for(need);
+            size_t total = 0;
+            for (const auto& e : h.sections)
+                if (mask & orbit_idx::section_bit(e.id)) {
+                    os << " " << orbit_idx::section_name(e.id);
+                    total += e.bytes;
+                }
+            if (need.phi && need.phi_inv) {
+                for (auto id : {orbit_idx::Section::PHI_START, orbit_idx::Section::PHI_INV}) {
+                    const orbit_idx::SectionEntry* e = h.find(id);
+                    if (!e || !(mask & orbit_idx::section_bit(id))) continue;
+                    os << " +" << orbit_idx::section_name(id) << "_start_table(shift="
+                       << TmsIndex::start_table_shift(e->domain, e->rows) << ")";
+                    total += TmsIndex::start_table_bytes(e->domain, e->rows);
+                }
+            }
+            os << "  = " << mb(total);
+            return os.str();
         };
         const char* modes[] = {"psi", "phi", "phiskip", "dual"};
         const TmsMode mode_of[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
         if (query) {
-            std::cout << "this query loads: " << plan() << "\n";
+            const TmsParts need = tms_batch_parts();
+            if (!serves(need)) { std::cout << "this query: refused, the index lacks a part it needs\n"; return 0; }
+            std::cout << "this query loads (" << TmsIndex::load_name(need) << "):" << describe_plan(need) << "\n";
             return 0;
         }
-        std::cout << "tms-batch queries (--mode, --report, then --positions and --phi-starts):\n";
+        std::vector<std::string> names, plans;
+        std::vector<std::string> rows;
         for (int m = 0; m < 4; ++m)
             for (int r = 0; r < 3; ++r)
                 for (int pos = 0; pos < 2; ++pos)
@@ -1183,10 +1213,22 @@ int main(int argc, char** argv) {
                         g_tms_report = report_of[r];
                         g_tms_positions = pos;
                         g_tms_phi_starts = ps;
-                        std::cout << "  " << std::left << std::setw(8) << modes[m] << std::setw(9) << reports[r]
-                                  << std::setw(12) << (pos ? "--positions" : "") << std::setw(13)
-                                  << (ps ? "--phi-starts" : "") << std::right << plan() << "\n";
+                        const TmsParts need = tms_batch_parts();
+                        const std::string name = serves(need) ? TmsIndex::load_name(need) : "(refused: the index lacks a part)";
+                        if (serves(need) && std::find(names.begin(), names.end(), name) == names.end()) {
+                            names.push_back(name);
+                            plans.push_back(describe_plan(need));
+                        }
+                        std::ostringstream row;
+                        row << "  " << std::left << std::setw(8) << modes[m] << std::setw(9) << reports[r] << std::setw(12)
+                            << (pos ? "--positions" : "") << std::setw(13) << (ps ? "--phi-starts" : "") << std::right
+                            << name;
+                        rows.push_back(row.str());
                     }
+        std::cout << "load plans of this build (sections read, start tables built, and the RAM they take):\n";
+        for (size_t i = 0; i < names.size(); ++i) std::cout << "  " << names[i] << ":" << plans[i] << "\n";
+        std::cout << "tms-batch queries (--mode, --report, then --positions and --phi-starts):\n";
+        for (const auto& r : rows) std::cout << r << "\n";
         return 0;
     }
 

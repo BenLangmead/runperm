@@ -75,9 +75,9 @@
  * The LF data columns a layout omits have width 0 (see Orbit's
  * permutation_impl), so they take no bits and read as 0, and the columns
  * kept stay where the full layout has them.  An index is written as an
- * ORBITIDX file (see index_format.hpp), with a section per structure and a
- * profile per set of parts a query can need (TmsParts), naming the sections
- * it loads.  load() reads only the sections of the profile a query needs,
+ * ORBITIDX file (see index_format.hpp), with a section per structure whose
+ * header entry gives its columns and their widths.  load() reads only the
+ * sections holding the parts a query needs (TmsParts, see sections_for),
  * seeking past the rest.  LF is loaded whole, with every column the layout
  * keeps, whichever parts a query needs.
  */
@@ -349,9 +349,8 @@ public:
 
     /**
      * Write the index as an ORBITIDX file (see index_format.hpp): a header
-     * with a section per structure and the profiles of the queries it
-     * serves, then LF, with psi the F block starts, and with phi both of its
-     * forms and phi_inv if present.  Throws if the index was loaded with only
+     * with a section per structure, then LF, with psi the F block starts, and
+     * with phi both of its forms and phi_inv if present.  Throws if the index was loaded with only
      * some of its parts.
      */
     size_t serialize(std::ostream& out) {
@@ -383,7 +382,7 @@ public:
             srcs.push_back(move_table_source(Section::PHI_START, phi_, PHI_COLS));
         }
         if (has_phi_inv_) srcs.push_back(move_table_source(Section::PHI_INV, phi_inv_, PHI_INV_COLS));
-        return write_file(out, h, srcs, [](Header& hh) { hh.profiles = tms_profiles(hh); });
+        return write_file(out, h, srcs);
     }
 
     /** Read an index written by serialize(), with every part it holds.  Throws on malformed input. */
@@ -391,20 +390,36 @@ public:
 
     /**
      * Read an index written by serialize(), with only LF and the parts in
-     * need: the sections of the header's profile for need (see profile_for),
-     * skipping the rest.  Throws, before reading LF, if the index lacks a
-     * part in need.
+     * need: the sections sections_for(need), skipping the rest.  Throws,
+     * before reading LF, if the index lacks a part in need.
      */
     void load(std::istream& in, const TmsParts& need) { load(in, &need); }
 
     /**
-     * The name of the profile that loads need (see orbit_idx::tms_profiles),
-     * as load() reads it: phi_inv only with phi, and one form of phi.
+     * The sections load() reads for need, as a mask of orbit_idx::section_bit:
+     * LF; with psi the F block starts; with phi one form of it, starts-based
+     * if need.phi_starts, else lengths-based; and with phi and phi_inv,
+     * phi_inv, from which load() also builds start tables (see
+     * start_table_bytes).
      */
-    static std::string profile_for(const TmsParts& need) {
-        using orbit_idx::PhiForm;
-        const PhiForm form = !need.phi ? PhiForm::NONE : need.phi_starts ? PhiForm::STARTS : PhiForm::LENGTHS;
-        return orbit_idx::tms_profile_name(need.psi, form, need.phi && need.phi_inv);
+    static uint32_t sections_for(const TmsParts& need) {
+        using orbit_idx::Section;
+        using orbit_idx::section_bit;
+        uint32_t m = section_bit(Section::LF);
+        if (need.psi) m |= section_bit(Section::F_STARTS);
+        if (need.phi) m |= section_bit(need.phi_starts ? Section::PHI_START : Section::PHI_LEN);
+        if (need.phi && need.phi_inv) m |= section_bit(Section::PHI_INV);
+        return m;
+    }
+
+    /** A short name for what sections_for(need) loads: lf, or its parts joined with +. */
+    static std::string load_name(const TmsParts& need) {
+        std::string s;
+        auto add = [&](const char* p) { s += s.empty() ? p : std::string("+") + p; };
+        if (need.psi) add("psi");
+        if (need.phi) add(need.phi_starts ? "phi-starts" : "phi-len");
+        if (need.phi && need.phi_inv) add("phi-inv");
+        return s.empty() ? "lf" : s;
     }
 
     /** Build provenance written with the index, as "key=value" lines. */
@@ -603,22 +618,39 @@ public:
      * intervals: the smallest whose entries cover, on average, at least
      * START_TABLE_DENSITY intervals each.
      */
-    static unsigned start_table_shift(ulint n, ulint intervals) { return orbit_idx::start_table_shift(n, intervals); }
+    static unsigned start_table_shift(ulint n, ulint intervals) {
+        unsigned s = 0;
+        while ((ulint(1) << s) * intervals < START_TABLE_DENSITY * n && s < 62) ++s;
+        return s;
+    }
+    static constexpr ulint START_TABLE_DENSITY = 4;
+
+    /**
+     * Bytes of the start table that build_start_tables makes, with the
+     * default shift, for a starts-based permutation over n text positions in
+     * the given intervals: one entry per 2^shift positions, plus one, of the
+     * bits an interval takes.
+     */
+    static size_t start_table_bytes(ulint n, ulint intervals) {
+        const unsigned shift = start_table_shift(n, intervals);
+        const size_t entries = ((n - 1) >> shift) + 2;
+        const size_t width = std::max<uchar>(1, orbit::bit_width(intervals - 1));
+        // As packed_matrix: whole bytes of packed entries, and a word of slack.
+        return (entries * width + 7) / 8 + sizeof(ulint);
+    }
 
     /**
      * Build the start tables of phi and phi_inv, which phi_at, phi_inv_at and
      * the walkers' locate use, with 2^shift text positions per entry;
-     * shift = -1 picks start_table_shift.  load() builds them, with the
-     * shifts its profile records, when it reads phi_inv, and so does the
-     * constructor that builds phi_inv.  phi_inv_shift, if not -1, is the
-     * shift of phi_inv's table instead.
+     * shift = -1 picks start_table_shift.  load() builds them when it reads
+     * phi_inv, and so does the constructor that builds phi_inv.
      */
-    void build_start_tables(int shift = -1, int phi_inv_shift = -1) {
-        auto pick = [&](const auto& perm, int s) {
-            return s < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(s);
+    void build_start_tables(int shift = -1) {
+        auto pick = [&](const auto& perm) {
+            return shift < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(shift);
         };
-        if (has_phi_starts_) phi_table_ = StartTable(phi_, pick(phi_, shift));
-        if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_, phi_inv_shift < 0 ? shift : phi_inv_shift));
+        if (has_phi_starts_) phi_table_ = StartTable(phi_, pick(phi_));
+        if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_));
     }
     /** Bytes the start tables take. */
     size_t start_table_bytes() const { return phi_table_.bytes() + phi_inv_table_.bytes(); }
@@ -976,10 +1008,9 @@ private:
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
     /**
-     * load() with the parts in *need, through the header's profile for them,
-     * or every part the index holds if need is null, when both forms of phi
-     * are read.  phi_inv, whose start tables take time to build, is read only
-     * with phi.
+     * load() with the parts in *need, or every part the index holds if need
+     * is null, when both forms of phi are read.  phi_inv, whose start tables
+     * take time to build, is read only with phi.
      */
     void load(std::istream& in, const TmsParts* need) {
         using namespace orbit_idx;
@@ -988,23 +1019,7 @@ private:
         const TmsParts held = held_parts(h);
         const TmsParts want = need ? *need : held;
         check_parts(held, want);
-        // The sections to read, and the start-table shifts, from the profile.
-        uint32_t mask = h.held_mask();
-        int phi_shift = -1, inv_shift = -1;
-        if (need) {
-            const std::string name = profile_for(want);
-            const Profile* p = h.profile(name);
-            if (!p) throw std::runtime_error("tms index has no profile " + name);
-            TmsParts norm = want;
-            norm.phi_inv = want.phi && want.phi_inv;
-            const uint32_t expect = tms_profile_mask(norm.psi, !norm.phi ? PhiForm::NONE
-                                                                : norm.phi_starts ? PhiForm::STARTS : PhiForm::LENGTHS,
-                                                     norm.phi_inv);
-            if (p->mask != expect) throw std::runtime_error("tms index profile " + name + " names other sections than this build loads");
-            mask = p->mask;
-            if (p->phi_shift != NO_START_TABLE) phi_shift = p->phi_shift;
-            if (p->phi_inv_shift != NO_START_TABLE) inv_shift = p->phi_inv_shift;
-        }
+        const uint32_t mask = need ? sections_for(want) : h.held_mask();
         auto wants = [&](Section s) { return (mask & section_bit(s)) != 0; };
         rd.load_move_table(Section::LF, lf_, LF_COLS);
         if (wants(Section::F_STARTS)) {
@@ -1025,7 +1040,7 @@ private:
         info_ = h.info;
         compute_occurs();
         if (h.bwt_runs != bwt_runs_) throw std::runtime_error("tms index's BWT runs disagree with its header");
-        if (has_phi_inv_) build_start_tables(phi_shift, inv_shift);
+        if (has_phi_inv_) build_start_tables();
     }
 
     /** Throw, naming what is missing and how to build it, if an index with parts held lacks one in want. */

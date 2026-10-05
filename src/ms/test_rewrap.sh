@@ -20,8 +20,8 @@ same() {
 import struct, sys
 def norm(p):
     b = bytearray(open(p, 'rb').read())
-    ns, np_, ni = struct.unpack_from('<HHH', b, 40)
-    at = 128 + 80 * ns + 32 * np_
+    ns, ni = struct.unpack_from('<H', b, 40)[0], struct.unpack_from('<H', b, 44)[0]
+    at = 128 + 80 * ns
     b[44:46] = b'\0\0'
     b[at:at + ni] = b'\0' * ni
     return bytes(b)

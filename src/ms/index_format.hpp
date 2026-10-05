@@ -2,13 +2,13 @@
  * The ORBITIDX container that Orbit-ms and Orbit-tms indexes are written in.
  * See INDEX_FORMAT.md for the byte layout.
  *
- * The first HEADER_BYTES of a file describe it completely: the tool and
+ * The first HEADER_BYTES of a file describe what it holds: the tool and
  * layout, the text length, and a table of sections, each with its offset,
  * size and checksum and, for a move table, its rows, domain and columns (a
- * column code and a bit width each, in the order the rows hold them).  A
- * table of profiles names the sections that each kind of query loads, so the
- * memory a query takes can be read from the header alone (see `ms
- * index-plan`).  Section payloads are the structures' own Orbit
+ * column code and a bit width each, in the order the rows hold them).  Which
+ * sections a query loads is the software's choice, not the file's; with the
+ * section table, the memory that choice takes follows from the header alone
+ * (see `ms index-plan`).  Section payloads are the structures' own Orbit
  * serializations, each starting on a SECTION_ALIGN boundary.
  *
  * A writer serializes each section twice, first into a sink that counts its
@@ -46,15 +46,15 @@ inline constexpr uint32_t ENDIAN_CHECK = 0x01020304;
 inline constexpr uint32_t HEADER_BYTES = 4096;
 inline constexpr uint64_t SECTION_ALIGN = 4096;
 // Byte sizes of the header's parts (see INDEX_FORMAT.md).
-inline constexpr size_t FIXED_BYTES = 128, SECTION_ENTRY_BYTES = 80, PROFILE_ENTRY_BYTES = 32;
-inline constexpr size_t MAX_COLS = 12, PROFILE_NAME_BYTES = 24, SCALARS = 4;
+inline constexpr size_t FIXED_BYTES = 128, SECTION_ENTRY_BYTES = 80;
+inline constexpr size_t MAX_COLS = 12, SCALARS = 4;
 
 enum class Tool : uint16_t { MS = 1, TMS = 2 };
 
 /** A tms index's layout, or NONE for an ms index. */
 enum class Layout : uint16_t { NONE = 0, FULL = 1, PSI = 2, PHI = 3 };
 
-/** Section ids; a profile's mask has bit id set for each section it loads. */
+/** Section ids.  A set of sections is a mask with bit id set for each (see section_bit). */
 enum class Section : uint16_t { LF = 1, F_STARTS = 2, PHI_LEN = 3, PHI_START = 4, PHI_INV = 5, MS_SPILL = 6 };
 
 enum class Kind : uint16_t {
@@ -114,9 +114,6 @@ inline const char* layout_name(Layout l) {
 
 constexpr uint32_t section_bit(Section s) { return uint32_t(1) << static_cast<unsigned>(s); }
 
-/** No start table: a profile's start-table shift when it builds none. */
-inline constexpr uint8_t NO_START_TABLE = 0xFF;
-
 struct SectionEntry {
     Section id{};
     Kind kind{};
@@ -128,14 +125,6 @@ struct SectionEntry {
     std::vector<std::pair<uint8_t, uint8_t>> cols;  // (code, width) in row order
 };
 
-struct Profile {
-    std::string name;
-    uint32_t mask = 0;
-    // log2 of the text positions per start-table entry, for phi's and
-    // phi_inv's tables built at load, or NO_START_TABLE.
-    uint8_t phi_shift = NO_START_TABLE, phi_inv_shift = NO_START_TABLE;
-};
-
 struct Header {
     Tool tool{};
     Layout layout = Layout::NONE;
@@ -144,17 +133,11 @@ struct Header {
     // Tool scalars.  ms: max LCP top, max LCP min-sub, spill alignment, spill split bits.
     std::array<uint64_t, SCALARS> scalars{};
     std::vector<SectionEntry> sections;
-    std::vector<Profile> profiles;
     std::string info;  // build provenance, "key=value" lines
 
     const SectionEntry* find(Section s) const {
         for (const auto& e : sections)
             if (e.id == s) return &e;
-        return nullptr;
-    }
-    const Profile* profile(const std::string& name) const {
-        for (const auto& p : profiles)
-            if (p.name == name) return &p;
         return nullptr;
     }
     uint32_t held_mask() const {
@@ -221,8 +204,7 @@ T get(const char* b, size_t at) {
 
 /** Bytes the header's tables and info take; at most HEADER_BYTES. */
 inline size_t header_used(const Header& h) {
-    return FIXED_BYTES + h.sections.size() * SECTION_ENTRY_BYTES + h.profiles.size() * PROFILE_ENTRY_BYTES +
-           h.info.size();
+    return FIXED_BYTES + h.sections.size() * SECTION_ENTRY_BYTES + h.info.size();
 }
 
 /** The HEADER_BYTES bytes of h.  Throws if its tables and info do not fit. */
@@ -239,7 +221,6 @@ inline std::vector<char> encode_header(const Header& h) {
     put<uint64_t>(b, 24, h.n);
     put<uint64_t>(b, 32, h.bwt_runs);
     put<uint16_t>(b, 40, static_cast<uint16_t>(h.sections.size()));
-    put<uint16_t>(b, 42, static_cast<uint16_t>(h.profiles.size()));
     put<uint16_t>(b, 44, static_cast<uint16_t>(h.info.size()));
     for (size_t i = 0; i < SCALARS; ++i) put<uint64_t>(b, 48 + 8 * i, h.scalars[i]);
     size_t at = FIXED_BYTES;
@@ -259,14 +240,6 @@ inline std::vector<char> encode_header(const Header& h) {
             put<uint8_t>(b, at + 49 + 2 * c, e.cols[c].second);
         }
         at += SECTION_ENTRY_BYTES;
-    }
-    for (const auto& p : h.profiles) {
-        if (p.name.size() >= PROFILE_NAME_BYTES) throw std::length_error("profile name too long: " + p.name);
-        std::memcpy(b.data() + at, p.name.data(), p.name.size());
-        put<uint32_t>(b, at + 24, p.mask);
-        put<uint8_t>(b, at + 28, p.phi_shift);
-        put<uint8_t>(b, at + 29, p.phi_inv_shift);
-        at += PROFILE_ENTRY_BYTES;
     }
     std::memcpy(b.data() + at, h.info.data(), h.info.size());
     return b;
@@ -289,9 +262,13 @@ inline Header decode_header(const char* b) {
     h.layout = static_cast<Layout>(get<uint16_t>(b, 22));
     h.n = get<uint64_t>(b, 24);
     h.bwt_runs = get<uint64_t>(b, 32);
-    const size_t ns = get<uint16_t>(b, 40), np = get<uint16_t>(b, 42), ni = get<uint16_t>(b, 44);
+    const size_t ns = get<uint16_t>(b, 40), ni = get<uint16_t>(b, 44);
     for (size_t i = 0; i < SCALARS; ++i) h.scalars[i] = get<uint64_t>(b, 48 + 8 * i);
-    if (FIXED_BYTES + ns * SECTION_ENTRY_BYTES + np * PROFILE_ENTRY_BYTES + ni > HEADER_BYTES)
+    // Reserved bytes are 0, so that a later version can give them meaning.
+    bool reserved_zero = get<uint16_t>(b, 42) == 0 && get<uint16_t>(b, 46) == 0;
+    for (size_t i = 48 + 8 * SCALARS; i < FIXED_BYTES; ++i) reserved_zero = reserved_zero && b[i] == 0;
+    if (!reserved_zero) throw std::runtime_error("malformed Orbit index header: reserved bytes are not 0");
+    if (FIXED_BYTES + ns * SECTION_ENTRY_BYTES + ni > HEADER_BYTES)
         throw std::runtime_error("malformed Orbit index header: its tables overrun it");
     size_t at = FIXED_BYTES;
     uint64_t end = HEADER_BYTES;
@@ -318,17 +295,6 @@ inline Header decode_header(const char* b) {
         if (h.find(e.id)) throw std::runtime_error("malformed Orbit index header: a section appears twice");
         end = e.offset + e.bytes;
         h.sections.push_back(std::move(e));
-    }
-    const uint32_t held = h.held_mask();
-    for (size_t i = 0; i < np; ++i, at += PROFILE_ENTRY_BYTES) {
-        Profile p;
-        p.name.assign(b + at, strnlen(b + at, PROFILE_NAME_BYTES - 1));
-        p.mask = get<uint32_t>(b, at + 24);
-        p.phi_shift = get<uint8_t>(b, at + 28);
-        p.phi_inv_shift = get<uint8_t>(b, at + 29);
-        if ((p.mask & ~held) != 0)
-            throw std::runtime_error("malformed Orbit index header: profile " + p.name + " names a missing section");
-        h.profiles.push_back(std::move(p));
     }
     h.info.assign(b + at, ni);
     return h;
@@ -436,92 +402,6 @@ SectionEntry move_table_entry(Section id, const Structure& x, const std::array<C
 template <typename Structure, size_t N>
 SectionSource move_table_source(Section id, Structure& x, const std::array<Col, N>& codes) {
     return SectionSource{move_table_entry(id, x, codes), [&x](std::ostream& o) { x.serialize(o); }};
-}
-
-// --- Profiles --------------------------------------------------------------
-
-/**
- * log2 of the text positions per entry of the start table of a starts-based
- * permutation over domain positions in intervals intervals: the smallest
- * shift with 2^shift * intervals >= START_TABLE_DENSITY * domain.
- */
-inline constexpr uint64_t START_TABLE_DENSITY = 4;
-inline uint8_t start_table_shift(uint64_t domain, uint64_t intervals) {
-    unsigned s = 0;
-    while ((uint64_t(1) << s) * intervals < START_TABLE_DENSITY * domain && s < 62) ++s;
-    return static_cast<uint8_t>(s);
-}
-
-/** Which form of phi a tms profile loads. */
-enum class PhiForm { NONE, LENGTHS, STARTS };
-
-/** The name of the tms profile that loads LF and the given parts. */
-inline std::string tms_profile_name(bool psi, PhiForm phi, bool phi_inv) {
-    std::string s;
-    auto add = [&](const char* p) { s += s.empty() ? p : std::string("+") + p; };
-    if (psi) add("psi");
-    if (phi == PhiForm::LENGTHS) add("phi-len");
-    if (phi == PhiForm::STARTS) add("phi-starts");
-    if (phi != PhiForm::NONE && phi_inv) add("phi-inv");
-    return s.empty() ? "lf" : s;
-}
-
-/** The sections the tms profile with the given parts loads. */
-inline uint32_t tms_profile_mask(bool psi, PhiForm phi, bool phi_inv) {
-    uint32_t m = section_bit(Section::LF);
-    if (psi) m |= section_bit(Section::F_STARTS);
-    if (phi == PhiForm::LENGTHS) m |= section_bit(Section::PHI_LEN);
-    if (phi == PhiForm::STARTS) m |= section_bit(Section::PHI_START);
-    if (phi != PhiForm::NONE && phi_inv) m |= section_bit(Section::PHI_INV);
-    return m;
-}
-
-/**
- * Every tms profile an index with header h's sections serves: LF with or
- * without psi, no phi or either form, and phi_inv or not with phi.  A
- * profile with phi_inv builds start tables at load, for phi_inv and for
- * phi's starts-based form if loaded.
- */
-inline std::vector<Profile> tms_profiles(const Header& h) {
-    std::vector<Profile> out;
-    const SectionEntry *f = h.find(Section::F_STARTS), *len = h.find(Section::PHI_LEN),
-                       *st = h.find(Section::PHI_START), *inv = h.find(Section::PHI_INV);
-    for (bool psi : {false, true}) {
-        if (psi && !f) continue;
-        for (PhiForm phi : {PhiForm::NONE, PhiForm::LENGTHS, PhiForm::STARTS}) {
-            if ((phi == PhiForm::LENGTHS && !len) || (phi == PhiForm::STARTS && !st)) continue;
-            for (bool pi : {false, true}) {
-                if (pi && (phi == PhiForm::NONE || !inv)) continue;
-                Profile p;
-                p.name = tms_profile_name(psi, phi, pi);
-                p.mask = tms_profile_mask(psi, phi, pi);
-                if (pi) {
-                    p.phi_inv_shift = start_table_shift(inv->domain, inv->rows);
-                    if (phi == PhiForm::STARTS) p.phi_shift = start_table_shift(st->domain, st->rows);
-                }
-                out.push_back(std::move(p));
-            }
-        }
-    }
-    return out;
-}
-
-/** The one profile of an ms index: everything. */
-inline std::vector<Profile> ms_profiles() {
-    Profile p;
-    p.name = "ms";
-    p.mask = section_bit(Section::LF) | section_bit(Section::MS_SPILL);
-    return {p};
-}
-
-/** Bytes of the start table built over a section: one entry per 2^shift positions, plus one. */
-inline uint64_t start_table_bytes(const SectionEntry& e, uint8_t shift) {
-    if (shift == NO_START_TABLE || e.domain == 0) return 0;
-    unsigned w = 0;
-    while (w < 64 && (e.rows - 1) >> w) ++w;
-    w = std::max(w, 1u);
-    const uint64_t entries = ((e.domain - 1) >> shift) + 2;
-    return (entries * w + 7) / 8 + 8;
 }
 
 // --- Reading -------------------------------------------------------------
@@ -679,7 +559,7 @@ private:
 /** The header of the file at path, read from its first HEADER_BYTES alone. */
 Header read_header_file(const std::string& path);
 
-/** A description of h: its sections and profiles, with bytes and columns. */
+/** A description of h: its sections, with bytes and columns, and its info. */
 void describe_header(const Header& h, std::ostream& os);
 
 /**

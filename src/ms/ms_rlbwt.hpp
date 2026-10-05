@@ -761,7 +761,6 @@ public:
         h.tool = Tool::MS;
         h.n = idx_.domain();
         h.scalars = {max_lcp_top_, max_lcp_min_sub_, spill_align_, spill_split_bits_};
-        h.profiles = ms_profiles();
         h.info = info_;
         ulint runs = 0;
         for (ulint i = 0, prev = 256; i < idx_.intervals(); ++i) {
