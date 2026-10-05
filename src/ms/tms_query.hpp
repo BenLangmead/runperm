@@ -260,7 +260,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
             s.state = STEP;
 #ifdef MS_STEP_STATS
             s.m = patterns[j].size();
-            if (record_steps) step_rec.begin(s.m, out_len[j].data());
+            if (record_steps) step_rec.begin(s.pat, s.m, out_len[j].data());
 #endif
             return true;
         }

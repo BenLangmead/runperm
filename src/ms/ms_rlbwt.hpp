@@ -1185,7 +1185,7 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
     Position pos = idx.first();
     ulint match_len = 0;
 #ifdef MS_STEP_STATS
-    step_rec.begin(pattern.size(), out.data());
+    step_rec.begin(pattern.data(), pattern.size(), out.data());
 #endif
     for (size_t i = pattern.size(); i > 0; --i) {
 #ifdef MS_STEP_STATS

@@ -6,12 +6,14 @@
  *
  * A step is one character, counted from where the walk starts, the read's
  * right end.  The query records each step's repositions, rows read and
- * cycles (from the time stamp counter) as it goes, and finish() files the
- * read's steps by their index and by their distance from the last absent
- * character (such as N), and works out which of the read's windows an ftab
- * could jump: the last j bases, and the j bases after each run of absent
- * characters, can be jumped when they occur in the text, which the read's
- * matching statistics say.  Reads are recorded only when one is in flight
+ * cycles (from the time stamp counter) as it goes, and flush() files the
+ * read's steps by their index and by their distance from the last character
+ * other than A, C, G and T (such as N), and works out which of the read's
+ * windows an ftab over ACGT could jump: the last j bases, and the j bases
+ * after each run of other characters, can be jumped when they occur in the
+ * text, which the read's matching statistics say.  An index whose text holds
+ * N (an FMD's, for one) matches a read's N rather than restarting there, but
+ * an ftab over ACGT has no entry for a window holding one either way.  Reads are recorded only when one is in flight
  * at a time (ms batch and tms-batch with --interleave 0).
  */
 
@@ -48,16 +50,16 @@ struct StepAgg {
     using Arr = std::array<step_ulint, J + 1>;
     // By step index from the read's right end.
     Arr steps{}, reps{}, rows{}, cyc{};
-    // By steps since the end of the last run of absent characters, for steps
-    // after one.
+    // By steps since the end of the last run of characters other than ACGT,
+    // for steps after one.
     Arr n_steps{}, n_reps{}, n_rows{}, n_cyc{};
     // For j = 1 to J: reads with at least j bases, those whose last j bases
     // occur, and the repositions, rows and cycles of the first j steps of
     // those reads.
     Arr start_fit{}, start_jump{}, start_jump_reps{}, start_jump_rows{}, start_jump_cyc{};
-    // The same for the j bases after each run of absent characters.
+    // The same for the j bases after each run of characters other than ACGT.
     Arr postn_fit{}, postn_jump{}, postn_jump_reps{}, postn_jump_rows{}, postn_jump_cyc{};
-    step_ulint reads = 0, bases = 0, reads_absent = 0, absent_chars = 0, absent_runs = 0;
+    step_ulint reads = 0, bases = 0, reads_other = 0, other_chars = 0, other_runs = 0;
     step_ulint tot_reps = 0, tot_rows = 0, tot_cyc = 0;
 
     StepAgg& operator+=(const StepAgg& o) {
@@ -68,16 +70,16 @@ struct StepAgg {
         add(start_jump_rows, o.start_jump_rows); add(start_jump_cyc, o.start_jump_cyc);
         add(postn_fit, o.postn_fit); add(postn_jump, o.postn_jump); add(postn_jump_reps, o.postn_jump_reps);
         add(postn_jump_rows, o.postn_jump_rows); add(postn_jump_cyc, o.postn_jump_cyc);
-        reads += o.reads; bases += o.bases; reads_absent += o.reads_absent;
-        absent_chars += o.absent_chars; absent_runs += o.absent_runs;
+        reads += o.reads; bases += o.bases; reads_other += o.reads_other;
+        other_chars += o.other_chars; other_runs += o.other_runs;
         tot_reps += o.tot_reps; tot_rows += o.tot_rows; tot_cyc += o.tot_cyc;
         return *this;
     }
 
     /** One line of totals, then one line per j of the counts above. */
     void print(std::ostream& os) const {
-        os << "stepstats: reads=" << reads << " bases=" << bases << " reads_absent=" << reads_absent
-           << " absent_chars=" << absent_chars << " absent_runs=" << absent_runs << " reps=" << tot_reps
+        os << "stepstats: reads=" << reads << " bases=" << bases << " reads_other=" << reads_other
+           << " other_chars=" << other_chars << " other_runs=" << other_runs << " reps=" << tot_reps
            << " rows=" << tot_rows << " cycles=" << tot_cyc << "\n";
         os << "stepstats-cols: j steps reps rows cyc n_steps n_reps n_rows n_cyc start_fit start_jump start_jump_reps "
               "start_jump_rows start_jump_cyc postn_fit postn_jump postn_jump_reps postn_jump_rows postn_jump_cyc\n";
@@ -97,12 +99,14 @@ inline thread_local StepAgg step_agg;
 struct StepRecorder {
     std::vector<step_ulint> reps, rows, cyc;
     const step_ulint* ms = nullptr;  // the read's statistics, complete when it is finished
+    const char* pat = nullptr;       // the read
     size_t m = 0;
     bool pending = false;
 
-    /** Start recording a read of length m whose statistics go to ms, filing the previous one. */
-    void begin(size_t len, const step_ulint* out) {
+    /** Start recording read p of length len whose statistics go to out, filing the previous one. */
+    void begin(const char* p, size_t len, const step_ulint* out) {
         flush();
+        pat = p;
         m = len;
         ms = out;
         reps.assign(m, 0);
@@ -124,9 +128,11 @@ struct StepRecorder {
         constexpr size_t J = StepAgg::J;
         ++a.reads;
         a.bases += m;
-        // Step t reads pattern position m - 1 - t, whose statistic is 0
-        // exactly when that character does not occur in the text.
-        auto absent = [&](size_t t) { return ms[m - 1 - t] == 0; };
+        // Step t reads pattern position m - 1 - t.
+        auto other = [&](size_t t) {
+            const char c = pat[m - 1 - t];
+            return c != 'A' && c != 'C' && c != 'G' && c != 'T';
+        };
         // Prefix sums over steps, for the windows.
         std::vector<step_ulint> pr(m + 1, 0), pw(m + 1, 0), pc(m + 1, 0);
         for (size_t t = 0; t < m; ++t) {
@@ -143,8 +149,10 @@ struct StepRecorder {
                 ++fit[j];
                 // The window is steps s to s + j - 1, pattern positions
                 // m - s - j to m - s - 1; it occurs when the statistic at its
-                // left end covers it.
-                if (ms[m - s - j] >= j) {
+                // left end covers it and it holds only ACGT.
+                bool acgt = true;
+                for (size_t t = s; t < s + j && acgt; ++t) acgt = !other(t);
+                if (acgt && ms[m - s - j] >= j) {
                     ++jump[j];
                     jr[j] += pr[s + j] - pr[s];
                     jw[j] += pw[s + j] - pw[s];
@@ -153,19 +161,19 @@ struct StepRecorder {
             }
         };
         window(0, a.start_fit, a.start_jump, a.start_jump_reps, a.start_jump_rows, a.start_jump_cyc);
-        bool any_absent = false;
-        size_t seg = SIZE_MAX;  // first step after the last run of absent characters
+        bool any_other = false;
+        size_t seg = SIZE_MAX;  // first step after the last run of characters other than ACGT
         for (size_t t = 0; t < m; ++t) {
             const size_t b = std::min(t, J);
             a.steps[b] += 1;
             a.reps[b] += reps[t];
             a.rows[b] += rows[t];
             a.cyc[b] += cyc[t];
-            if (absent(t)) {
-                ++a.absent_chars;
-                any_absent = true;
-                if (t + 1 == m || !absent(t + 1)) {
-                    ++a.absent_runs;
+            if (other(t)) {
+                ++a.other_chars;
+                any_other = true;
+                if (t + 1 == m || !other(t + 1)) {
+                    ++a.other_runs;
                     seg = t + 1;
                     if (seg < m)
                         window(seg, a.postn_fit, a.postn_jump, a.postn_jump_reps, a.postn_jump_rows,
@@ -181,7 +189,7 @@ struct StepRecorder {
                 a.n_cyc[u] += cyc[t];
             }
         }
-        if (any_absent) ++a.reads_absent;
+        if (any_other) ++a.reads_other;
     }
 };
 
