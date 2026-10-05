@@ -3,7 +3,7 @@
  * with and the balance they reach.  This is a development tool; it reads an
  * index and changes nothing.
  *
- * For each move structure an MSIX (Orbit-ms) or TMSX (Orbit-tms) file
+ * For each move structure an Orbit-ms or Orbit-tms index
  * holds, it prints:
  *
  *  - the split_params stored with it.  A structure built with NO_SPLITTING
@@ -27,7 +27,7 @@
  *    maximum is within 2b - 1 for the default b of 16 (or the stored b).
  *
  * The counts take one pass over the rows per structure, shared among
- * threads.  TMSX parts are loaded one group at a time (LF with psi, then
+ * threads.  tms parts are loaded one group at a time (LF with psi, then
  * phi's lengths-based form, then phi's starts-based form with phi_inv), as
  * tms-batch loads them, so that less of a large index is held at once.
  */
@@ -228,12 +228,12 @@ inline ulint count_runs(ulint m, Chr&& chr) {
     return runs;
 }
 
-/** Report an MSIX (Orbit-ms) index: LF only. */
+/** Report an Orbit-ms index: LF only. */
 inline int report_ms(const std::string& path, size_t threads, std::ostream& os) {
     auto t0 = std::chrono::steady_clock::now();
     auto opt = ms_serialize::read_index(path);
     if (!opt) { std::cerr << "Failed to load ms index: " << path << "\n"; return 1; }
-    os << "index: " << path << " format=MSIX load_s="
+    os << "index: " << path << " format=ORBITIDX tool=ms load_s="
        << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << "\n";
     const auto& lf = opt->impl();
     using Impl = std::remove_cv_t<std::remove_reference_t<decltype(lf)>>;
@@ -280,7 +280,7 @@ inline std::optional<TmsIndex> load_tms(const std::string& path, const TmsParts&
     return idx;
 }
 
-/** Report a TMSX (Orbit-tms) index, one group of parts at a time. */
+/** Report an Orbit-tms index, one group of parts at a time. */
 inline int report_tms(const std::string& path, size_t threads, std::ostream& os) {
     TmsParts held;
     try {
@@ -289,7 +289,7 @@ inline int report_tms(const std::string& path, size_t threads, std::ostream& os)
         std::cerr << path << ": " << e.what() << "\n";
         return 1;
     }
-    os << "index: " << path << " format=TMSX layout=" << TmsIndex::layout_name(held)
+    os << "index: " << path << " format=ORBITIDX tool=tms layout=" << TmsIndex::layout_name(held)
        << " phi_inv=" << (held.phi_inv ? "yes" : "no") << "\n";
     {
         // LF, with the PSI columns in the psi and full layouts.
@@ -403,16 +403,16 @@ inline int report_tms(const std::string& path, size_t threads, std::ostream& os)
     return 0;
 }
 
-/** Report the index at path, an MSIX or a TMSX file. */
+/** Report the index at path, an ms or a tms ORBITIDX file. */
 inline int run(const std::string& path, size_t threads, std::ostream& os) {
-    std::ifstream in(path, std::ios::binary);
-    char magic[4] = {};
-    in.read(magic, 4);
-    if (!in.good()) { std::cerr << "Cannot read " << path << "\n"; return 1; }
-    if (std::memcmp(magic, "MSIX", 4) == 0) return report_ms(path, threads, os);
-    if (std::memcmp(magic, "TMSX", 4) == 0) return report_tms(path, threads, os);
-    std::cerr << path << " is neither an MSIX nor a TMSX index\n";
-    return 1;
+    orbit_idx::Header h;
+    try {
+        h = orbit_idx::read_header_file(path);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
+    return h.tool == orbit_idx::Tool::MS ? report_ms(path, threads, os) : report_tms(path, threads, os);
 }
 
 }  // namespace split_report

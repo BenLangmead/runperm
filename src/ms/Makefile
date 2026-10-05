@@ -2,7 +2,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -I../../include -I. -O3 -pthread
 
-MS_SRCS = ms.cpp tsv.cpp ms_io.cpp ms_test.cpp inspect.cpp tms_test.cpp fmd_test.cpp
+MS_SRCS = ms.cpp tsv.cpp ms_io.cpp index_format.cpp ms_test.cpp inspect.cpp tms_test.cpp fmd_test.cpp
 
 MS_HDRS = $(wildcard *.hpp) $(shell find ../../include -name '*.hpp')
 
@@ -32,10 +32,10 @@ debug: CXXFLAGS += -O0 -g
 debug: ms
 
 # Microbenchmark of LF and psi step chains on a tms index
-tms_chain_bench: tms_chain_bench.cpp $(MS_HDRS)
-	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp
+tms_chain_bench: tms_chain_bench.cpp index_format.cpp $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp index_format.cpp
 
-.PHONY: test test-threads test-reader all clean debug bench
+.PHONY: test test-threads test-reader test-rewrap all clean debug bench
 test: ms
 	./ms test ../../data
 
@@ -50,6 +50,12 @@ test-reader: read_chunks_test
 # Output identity across interleave, thread count and block size
 test-threads: ms
 	./test_threads.sh ./ms ../../data
+
+# index-rewrap against new builds: OLD is an ms binary that writes the
+# earlier formats (MSIX v4, TMSX v8), as built from commit f82f172
+test-rewrap: ms
+	@test -n "$(OLD)" || { echo "usage: make test-rewrap OLD=path/to/old/ms"; exit 1; }
+	./test_rewrap.sh $(OLD) ./ms ../../data
 
 all: ms
 

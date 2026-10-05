@@ -74,9 +74,12 @@
  *
  * The LF data columns a layout omits have width 0 (see Orbit's
  * permutation_impl), so they take no bits and read as 0, and the columns
- * kept stay where the full layout has them.  The header records which parts
- * the index holds (TmsParts), and load() reads only the parts a query needs,
- * seeking past the rest.
+ * kept stay where the full layout has them.  An index is written as an
+ * ORBITIDX file (see index_format.hpp), with a section per structure and a
+ * profile per set of parts a query can need (TmsParts), naming the sections
+ * it loads.  load() reads only the sections of the profile a query needs,
+ * seeking past the rest.  LF is loaded whole, with every column the layout
+ * keeps, whichever parts a query needs.
  */
 
 #ifndef _TMS_INDEX_HPP
@@ -87,6 +90,7 @@
 #include "ms_alphabet.hpp"
 #include "mem_report.hpp"
 #include "step_stats.hpp"
+#include "index_format.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -344,35 +348,42 @@ public:
     }
 
     /**
-     * Write the index in Orbit's packed serialization, host byte order: a
-     * header with the parts the index holds, LF, with psi the table of F
-     * block starts, and then each part's structure present, phi (lengths-based,
-     * then starts-based) and phi_inv, after its size in bytes so that load()
-     * can skip it.  Throws if the index was loaded with only one form of phi.
+     * Write the index as an ORBITIDX file (see index_format.hpp): a header
+     * with a section per structure and the profiles of the queries it
+     * serves, then LF, with psi the F block starts, and with phi both of its
+     * forms and phi_inv if present.  Throws if the index was loaded with only
+     * some of its parts.
      */
     size_t serialize(std::ostream& out) {
-        if (has_phi_ && !(has_phi_len_ && has_phi_starts_))
-            throw std::logic_error("an index loaded with one form of phi cannot be written");
-        size_t bytes = 0;
-        out.write(MAGIC, 4);
-        const uint32_t v = VERSION, flags = parts_flags(parts());
-        out.write(reinterpret_cast<const char*>(&v), sizeof(v));
-        out.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
-        bytes += 12;
-        bytes += lf_.serialize(out);
+        if (!complete_)
+            throw std::logic_error("an index loaded with only some of its parts cannot be written");
+        using namespace orbit_idx;
+        Header h;
+        h.tool = Tool::TMS;
+        h.layout = has_psi_ && has_phi_ ? Layout::FULL : has_psi_ ? Layout::PSI : has_phi_ ? Layout::PHI : Layout::NONE;
+        h.n = lf_.domain();
+        h.bwt_runs = bwt_runs_;
+        h.info = info_;
+        std::vector<SectionSource> srcs;
+        srcs.push_back(move_table_source(Section::LF, lf_, LF_COLS));
         if (has_psi_) {
-            for (ulint s : f_rows_) {
-                const uint64_t x = s;
-                out.write(reinterpret_cast<const char*>(&x), sizeof(x));
-            }
-            bytes += F_BLOCKS * sizeof(uint64_t);
+            SectionEntry e;
+            e.id = Section::F_STARTS;
+            e.kind = Kind::U64_ARRAY;
+            e.rows = F_BLOCKS;
+            srcs.push_back({e, [this](std::ostream& o) {
+                                for (ulint s : f_rows_) {
+                                    const uint64_t x = s;
+                                    o.write(reinterpret_cast<const char*>(&x), sizeof(x));
+                                }
+                            }});
         }
         if (has_phi_) {
-            bytes += serialize_sized(phi_len_, out);
-            bytes += serialize_sized(phi_, out);
+            srcs.push_back(move_table_source(Section::PHI_LEN, phi_len_, PHI_LEN_COLS));
+            srcs.push_back(move_table_source(Section::PHI_START, phi_, PHI_COLS));
         }
-        if (has_phi_inv_) bytes += serialize_sized(phi_inv_, out);
-        return bytes;
+        if (has_phi_inv_) srcs.push_back(move_table_source(Section::PHI_INV, phi_inv_, PHI_INV_COLS));
+        return write_file(out, h, srcs, [](Header& hh) { hh.profiles = tms_profiles(hh); });
     }
 
     /** Read an index written by serialize(), with every part it holds.  Throws on malformed input. */
@@ -380,10 +391,25 @@ public:
 
     /**
      * Read an index written by serialize(), with only LF and the parts in
-     * need, seeking past the rest.  Throws, before reading LF, if the index
-     * lacks a part in need.
+     * need: the sections of the header's profile for need (see profile_for),
+     * skipping the rest.  Throws, before reading LF, if the index lacks a
+     * part in need.
      */
     void load(std::istream& in, const TmsParts& need) { load(in, &need); }
+
+    /**
+     * The name of the profile that loads need (see orbit_idx::tms_profiles),
+     * as load() reads it: phi_inv only with phi, and one form of phi.
+     */
+    static std::string profile_for(const TmsParts& need) {
+        using orbit_idx::PhiForm;
+        const PhiForm form = !need.phi ? PhiForm::NONE : need.phi_starts ? PhiForm::STARTS : PhiForm::LENGTHS;
+        return orbit_idx::tms_profile_name(need.psi, form, need.phi && need.phi_inv);
+    }
+
+    /** Build provenance written with the index, as "key=value" lines. */
+    const std::string& info() const { return info_; }
+    void set_info(std::string info) { info_ = std::move(info); }
 
     bool has_psi() const { return has_psi_; }
     bool has_phi() const { return has_phi_; }
@@ -577,25 +603,22 @@ public:
      * intervals: the smallest whose entries cover, on average, at least
      * START_TABLE_DENSITY intervals each.
      */
-    static unsigned start_table_shift(ulint n, ulint intervals) {
-        unsigned s = 0;
-        while ((ulint(1) << s) * intervals < START_TABLE_DENSITY * n && s < 62) ++s;
-        return s;
-    }
-    static constexpr ulint START_TABLE_DENSITY = 4;
+    static unsigned start_table_shift(ulint n, ulint intervals) { return orbit_idx::start_table_shift(n, intervals); }
 
     /**
      * Build the start tables of phi and phi_inv, which phi_at, phi_inv_at and
      * the walkers' locate use, with 2^shift text positions per entry;
-     * shift = -1 picks start_table_shift.  load() builds them when it reads
-     * phi_inv, and so does the constructor that builds phi_inv.
+     * shift = -1 picks start_table_shift.  load() builds them, with the
+     * shifts its profile records, when it reads phi_inv, and so does the
+     * constructor that builds phi_inv.  phi_inv_shift, if not -1, is the
+     * shift of phi_inv's table instead.
      */
-    void build_start_tables(int shift = -1) {
-        auto pick = [&](const auto& perm) {
-            return shift < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(shift);
+    void build_start_tables(int shift = -1, int phi_inv_shift = -1) {
+        auto pick = [&](const auto& perm, int s) {
+            return s < 0 ? start_table_shift(perm.domain(), perm.intervals()) : unsigned(s);
         };
-        if (has_phi_starts_) phi_table_ = StartTable(phi_, pick(phi_));
-        if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_));
+        if (has_phi_starts_) phi_table_ = StartTable(phi_, pick(phi_, shift));
+        if (has_phi_inv_) phi_inv_table_ = StartTable(phi_inv_, pick(phi_inv_, phi_inv_shift < 0 ? shift : phi_inv_shift));
     }
     /** Bytes the start tables take. */
     size_t start_table_bytes() const { return phi_table_.bytes() + phi_inv_table_.bytes(); }
@@ -751,17 +774,12 @@ public:
     ulint bwt_runs() const { return bwt_runs_; }
 
     /** The parts the index file at path holds, from its header.  Throws if it is not a tms index. */
-    static TmsParts held_parts(const std::string& path) {
-        std::ifstream in(path, std::ios::binary);
-        char magic[4] = {};
-        uint32_t v = 0, flags = 0;
-        in.read(magic, 4);
-        in.read(reinterpret_cast<char*>(&v), sizeof(v));
-        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
-        if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
-        return TmsParts{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0,
-                        (flags & FLAG_PHI) != 0};
+    static TmsParts held_parts(const std::string& path) { return held_parts(orbit_idx::read_header_file(path)); }
+    static TmsParts held_parts(const orbit_idx::Header& h) {
+        using orbit_idx::Section;
+        if (h.tool != orbit_idx::Tool::TMS) throw std::runtime_error("not a tms index");
+        const bool phi = h.find(Section::PHI_LEN) && h.find(Section::PHI_START);
+        return TmsParts{h.find(Section::F_STARTS) != nullptr, phi, phi && h.find(Section::PHI_INV) != nullptr, phi};
     }
     /**
      * The alphabet code of byte c in LF's character column, or no_code if c
@@ -927,10 +945,13 @@ public:
     }
 
 private:
-    static constexpr char MAGIC[4] = {'T', 'M', 'S', 'X'};
-    static constexpr uint32_t VERSION = 8;
-    // Header flags for the parts an index holds.
-    static constexpr uint32_t FLAG_PHI = 1, FLAG_PHI_INV = 2, FLAG_PSI = 4;
+    // Each structure's column codes, in the order its rows hold them.
+    using Col = orbit_idx::Col;
+    static constexpr std::array<Col, 8> LF_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::CHARACTER,
+                                                Col::PSI_INT, Col::PSI_OFF, Col::PHI_INT, Col::PHI_OFF};
+    static constexpr std::array<Col, 4> PHI_LEN_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::PLCP};
+    static constexpr std::array<Col, 4> PHI_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCP};
+    static constexpr std::array<Col, 4> PHI_INV_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCPB};
 
     LF lf_;
     Phi phi_;
@@ -938,6 +959,9 @@ private:
     PhiInv phi_inv_;
     // has_phi_: the PHI columns and at least one form of phi.
     bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false, has_phi_starts_ = false, has_phi_len_ = false;
+    // Every part the index holds is present: built, or loaded whole.
+    bool complete_ = true;
+    std::string info_;
     // Start tables of phi and phi_inv, built when phi_inv is present.
     StartTable phi_table_, phi_inv_table_;
     std::array<bool, 256> occurs_{};
@@ -951,103 +975,57 @@ private:
 
     static constexpr size_t col(TmsLFCols c) { return static_cast<size_t>(c); }
 
-    static uint32_t parts_flags(const TmsParts& p) {
-        return (p.phi ? FLAG_PHI : 0) | (p.phi_inv ? FLAG_PHI_INV : 0) | (p.psi ? FLAG_PSI : 0);
-    }
-
-    /** A stream buffer that counts the bytes written to it and keeps none. */
-    struct CountingBuf : std::streambuf {
-        size_t count = 0;
-        int_type overflow(int_type c) override {
-            if (!traits_type::eq_int_type(c, traits_type::eof())) ++count;
-            return traits_type::not_eof(c);
-        }
-        std::streamsize xsputn(const char*, std::streamsize n) override {
-            count += static_cast<size_t>(n);
-            return n;
-        }
-    };
-
     /**
-     * Write x after its serialized size in bytes, as a uint64_t.  Returns the
-     * bytes written.  The size is counted from a first serialization rather
-     * than taken from serialize()'s return value, which for some Orbit
-     * structures leaves out a few bytes.
-     */
-    template <typename Structure>
-    static size_t serialize_sized(Structure& x, std::ostream& out) {
-        CountingBuf counter;
-        std::ostream sizing(&counter);
-        x.serialize(sizing);
-        const uint64_t size = counter.count;
-        out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        x.serialize(out);
-        return sizeof(size) + size;
-    }
-
-    /**
-     * Read a structure written by serialize_sized into x if want, else seek
-     * past it.  Throws if a read structure's size disagrees with the one
-     * recorded.
-     */
-    template <typename Structure>
-    static void load_sized(Structure& x, std::istream& in, bool want) {
-        uint64_t size = 0;
-        in.read(reinterpret_cast<char*>(&size), sizeof(size));
-        if (!in.good()) throw std::runtime_error("truncated tms index");
-        if (!want) {
-            in.seekg(static_cast<std::streamoff>(size), std::ios::cur);
-            if (!in.good()) {
-                // A stream that cannot seek reads past the structure instead.
-                in.clear();
-                in.ignore(static_cast<std::streamsize>(size));
-            }
-            return;
-        }
-        const std::streampos at = in.tellg();
-        x.load(in);
-        if (at != std::streampos(-1) && in.good() && static_cast<uint64_t>(in.tellg() - at) != size)
-            throw std::runtime_error("malformed tms index: a structure's size disagrees with its header");
-    }
-
-    /**
-     * load() with the parts in *need, or every part the index holds if need
-     * is null, when both forms of phi are read.  phi_inv, whose start tables
-     * take time to build, is read only with phi.
+     * load() with the parts in *need, through the header's profile for them,
+     * or every part the index holds if need is null, when both forms of phi
+     * are read.  phi_inv, whose start tables take time to build, is read only
+     * with phi.
      */
     void load(std::istream& in, const TmsParts* need) {
-        char magic[4] = {};
-        uint32_t v = 0, flags = 0;
-        in.read(magic, 4);
-        in.read(reinterpret_cast<char*>(&v), sizeof(v));
-        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
-        if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
-        const TmsParts held{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0,
-                            (flags & FLAG_PHI) != 0};
+        using namespace orbit_idx;
+        Reader rd(in);
+        const Header& h = rd.header();
+        const TmsParts held = held_parts(h);
         const TmsParts want = need ? *need : held;
         check_parts(held, want);
-        lf_.load(in);
-        if (held.psi) {
-            for (ulint& s : f_rows_) {
-                uint64_t x = 0;
-                in.read(reinterpret_cast<char*>(&x), sizeof(x));
-                s = x;
-            }
+        // The sections to read, and the start-table shifts, from the profile.
+        uint32_t mask = h.held_mask();
+        int phi_shift = -1, inv_shift = -1;
+        if (need) {
+            const std::string name = profile_for(want);
+            const Profile* p = h.profile(name);
+            if (!p) throw std::runtime_error("tms index has no profile " + name);
+            TmsParts norm = want;
+            norm.phi_inv = want.phi && want.phi_inv;
+            const uint32_t expect = tms_profile_mask(norm.psi, !norm.phi ? PhiForm::NONE
+                                                                : norm.phi_starts ? PhiForm::STARTS : PhiForm::LENGTHS,
+                                                     norm.phi_inv);
+            if (p->mask != expect) throw std::runtime_error("tms index profile " + name + " names other sections than this build loads");
+            mask = p->mask;
+            if (p->phi_shift != NO_START_TABLE) phi_shift = p->phi_shift;
+            if (p->phi_inv_shift != NO_START_TABLE) inv_shift = p->phi_inv_shift;
+        }
+        auto wants = [&](Section s) { return (mask & section_bit(s)) != 0; };
+        rd.load_move_table(Section::LF, lf_, LF_COLS);
+        if (wants(Section::F_STARTS)) {
+            const std::vector<uint64_t> v = rd.load_u64s(Section::F_STARTS);
+            if (v.size() != F_BLOCKS) throw std::runtime_error("tms index has another number of F block starts");
+            for (size_t i = 0; i < F_BLOCKS; ++i) f_rows_[i] = v[i];
         }
         has_psi_ = want.psi;
         has_phi_ = want.phi;
         has_phi_inv_ = want.phi && want.phi_inv;
-        has_phi_starts_ = want.phi && want.phi_starts;
-        has_phi_len_ = want.phi && (!need || !want.phi_starts);
-        if (held.phi) {
-            load_sized(phi_len_, in, has_phi_len_);
-            load_sized(phi_, in, has_phi_starts_);
-        }
-        if (held.phi_inv && has_phi_inv_) load_sized(phi_inv_, in, true);
-        if (!in.good()) throw std::runtime_error("truncated tms index");
+        has_phi_len_ = want.phi && wants(Section::PHI_LEN);
+        has_phi_starts_ = want.phi && wants(Section::PHI_START);
+        if (has_phi_len_) rd.load_move_table(Section::PHI_LEN, phi_len_, PHI_LEN_COLS);
+        if (has_phi_starts_) rd.load_move_table(Section::PHI_START, phi_, PHI_COLS);
+        if (has_phi_inv_) rd.load_move_table(Section::PHI_INV, phi_inv_, PHI_INV_COLS);
+        complete_ = !need || (want.psi == held.psi && want.phi == held.phi && has_phi_inv_ == held.phi_inv &&
+                              (!held.phi || (has_phi_len_ && has_phi_starts_)));
+        info_ = h.info;
         compute_occurs();
-        if (has_phi_inv_) build_start_tables();
+        if (h.bwt_runs != bwt_runs_) throw std::runtime_error("tms index's BWT runs disagree with its header");
+        if (has_phi_inv_) build_start_tables(phi_shift, inv_shift);
     }
 
     /** Throw, naming what is missing and how to build it, if an index with parts held lacks one in want. */

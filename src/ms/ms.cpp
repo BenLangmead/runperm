@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <thread>
+#include <ctime>
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -173,13 +174,25 @@ static void usage(const char* prog) {
               << "              row after its cold-start walk.  --verify K checks the counts\n"
               << "              for k up to K against ms on every k-mer.\n"
               << "  split-report INDEX_PATH [--threads T]\n"
-              << "              Development: for each move structure of an ms (MSIX) or tms\n"
-              << "              (TMSX) index, print the split parameters stored with it, its\n"
+              << "              Development: for each move structure of an ms or tms index,\n"
+              << "              print the split parameters stored with it, its\n"
               << "              intervals, longest interval and the length cap Orbit's length\n"
               << "              capping implies, and its balance: how many input interval\n"
               << "              starts lie inside each output interval, against the bound\n"
               << "              2b - 1 that balancing factor b guarantees.  tms parts are\n"
               << "              loaded a group at a time.\n"
+              << "  index-plan INDEX_PATH [--mode M] [--positions] [--report R] [--phi-starts]\n"
+              << "              Print an index's header: its sections with their columns and\n"
+              << "              widths, and the profiles of the queries it serves with the RAM\n"
+              << "              each takes, read from the file's first 4 KiB alone.  For a tms\n"
+              << "              index, also print the profile each tms-batch query loads, or with\n"
+              << "              query options only that query's.\n"
+              << "  index-verify INDEX_PATH\n"
+              << "              Check every section's CRC-32 and that the file is whole.\n"
+              << "  index-rewrap LEGACY_PATH INDEX_PATH\n"
+              << "              Rewrite an index of the earlier formats (MSIX v4 from build or\n"
+              << "              build-rlbwt, TMSX v8 from tms-build) in the current format,\n"
+              << "              copying its structures' bytes without loading them.\n"
               << "  tms-inspect INDEX_PATH [--phi-lengths]\n"
               << "              Print the structures' sizes and column widths.  --phi-lengths\n"
               << "              loads only LF and phi's lengths-based form.\n"
@@ -284,6 +297,52 @@ static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r) {
     query_many(idx, {s}, 1, r, 0);
 }
 
+/**
+ * If argv[i] is a tms query flag that chooses what a query loads (--mode,
+ * --positions, --report or --phi-starts), apply it to the tms-batch settings,
+ * advancing i past its value, and return 1; return -1, after printing why, if
+ * its value is unknown, and 0 if argv[i] is no such flag.
+ */
+static int tms_query_flag(int argc, char** argv, int& i) {
+    if (strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
+    else if (strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
+    else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+        const std::string m = argv[++i];
+        if (m == "psi") g_tms_mode = TmsMode::PSI;
+        else if (m == "phi") g_tms_mode = TmsMode::PHI;
+        else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
+        else if (m == "dual") g_tms_mode = TmsMode::DUAL;
+        else { std::cerr << "Unknown mode: " << m << "\n"; return -1; }
+    }
+    else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
+        const std::string r = argv[++i];
+        if (r == "ms") g_tms_report = TmsReport::MS;
+        else if (r == "smem-one") g_tms_report = TmsReport::SMEM_ONE;
+        else if (r == "smem-all") g_tms_report = TmsReport::SMEM_ALL;
+        else { std::cerr << "Unknown report: " << r << "\n"; return -1; }
+    }
+    else return 0;
+    return 1;
+}
+
+/** The parts a tms-batch query with the current settings loads. */
+static TmsParts tms_batch_parts() {
+    TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
+    need.phi_starts = need.phi_starts || (need.phi && g_tms_phi_starts);
+    return need;
+}
+
+// The command line, recorded in the provenance of the indexes it builds.
+static std::string g_command_line;
+
+/** Build provenance for an index: this command line and the time, as "key=value" lines. */
+static std::string build_info() {
+    const std::time_t t = std::time(nullptr);
+    char when[32];
+    std::strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return "built_by=" + g_command_line + "\nbuilt_at=" + when + "\n";
+}
+
 // Read a tms index with the parts in *need, or every part it holds if need is null.
 static std::optional<TmsIndex> read_tms_index(const std::string& path, const TmsParts* need = nullptr) {
     std::ifstream in(path, std::ios::binary);
@@ -316,6 +375,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     size_t interleave = 32, threads = 1, block_reads = 0, block_bytes = 0;
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
+    int q = 0;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
@@ -336,22 +396,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             else if (o == "qual") orient = ReadOrient::QUAL;
             else { std::cerr << "Unknown orientation: " << o << " (expected fwd, rc or qual)\n"; return 1; }
         }
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-            const std::string m = argv[++i];
-            if (m == "psi") g_tms_mode = TmsMode::PSI;
-            else if (m == "phi") g_tms_mode = TmsMode::PHI;
-            else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
-            else if (m == "dual") g_tms_mode = TmsMode::DUAL;
-            else { std::cerr << "Unknown mode: " << m << "\n"; return 1; }
-        }
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
-            const std::string r = argv[++i];
-            if (r == "ms") g_tms_report = TmsReport::MS;
-            else if (r == "smem-one") g_tms_report = TmsReport::SMEM_ONE;
-            else if (r == "smem-all") g_tms_report = TmsReport::SMEM_ALL;
-            else { std::cerr << "Unknown report: " << r << "\n"; return 1; }
+        else if (std::is_same_v<Index, TmsIndex> && (q = tms_query_flag(argc, argv, i)) != 0) {
+            if (q < 0) return 1;
         }
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--min-smem-len") == 0 && i + 1 < argc)
             g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
@@ -637,6 +683,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string cmd = argv[1];
+    for (int i = 0; i < argc; ++i) g_command_line += (i ? " " : "") + std::string(argv[i]);
     argc -= 2;
     argv += 2;
 
@@ -747,6 +794,7 @@ int main(int argc, char** argv) {
         ms_build::Stats st;
         auto idx = ms_build::build(std::move(bwt_heads), std::move(bwt_run_lengths),
                                    ms_build::lcp_vectors_source(lcps_per_run, minima_only), bo, &st);
+        idx.set_info(build_info());
         if (!ms_serialize::write_index(idx_path, idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
@@ -850,6 +898,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
+        idx->set_info(build_info());
         if (!ms_serialize::write_index(idx_path, *idx)) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
@@ -869,8 +918,7 @@ int main(int argc, char** argv) {
         // Load only the parts the query reads; the load refuses an index
         // that lacks one.
         return run_batch<TmsIndex>(argc, argv, [](const std::string& path) {
-            TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
-            need.phi_starts = need.phi_starts || (need.phi && g_tms_phi_starts);
+            const TmsParts need = tms_batch_parts();
             return read_tms_index(path, &need);
         });
     }
@@ -1016,8 +1064,15 @@ int main(int argc, char** argv) {
                                         : TmsIndex(heads, run_lens, opts, std::move(samples));
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
+        idx.set_info(build_info());
         std::ofstream out(idx_path, std::ios::binary);
-        const size_t bytes = out.good() ? idx.serialize(out) : 0;
+        size_t bytes = 0;
+        try {
+            if (out.good()) bytes = idx.serialize(out);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            out.setstate(std::ios::failbit);
+        }
         if (!out.good()) {
             std::cerr << "Failed to write index: " << idx_path << "\n";
             return 1;
@@ -1078,6 +1133,81 @@ int main(int argc, char** argv) {
                       << (bf == res.present[k] ? " ok" : " mismatch") << "\n";
             if (bf != res.present[k]) return 1;
         }
+        return 0;
+    }
+
+    if (cmd == "index-plan") {
+        if (argc < 1) { std::cerr << "index-plan requires INDEX_PATH\n"; return 1; }
+        orbit_idx::Header h;
+        try {
+            h = orbit_idx::read_header_file(argv[0]);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        }
+        bool query = false;
+        for (int i = 1; i < argc; ++i) {
+            const int q = tms_query_flag(argc, argv, i);
+            if (q < 0) return 1;
+            if (q == 0) { std::cerr << "Unknown index-plan option: " << argv[i] << "\n"; return 1; }
+            query = true;
+        }
+        if (query && h.tool != orbit_idx::Tool::TMS) { std::cerr << "query options apply to tms indexes only\n"; return 1; }
+        orbit_idx::describe_header(h, std::cout);
+        if (h.tool != orbit_idx::Tool::TMS) {
+            std::cout << "queries: every ms query loads profile ms\n";
+            return 0;
+        }
+        // The profile each tms-batch command line loads.
+        auto plan = [&]() {
+            const TmsParts need = tms_batch_parts();
+            const std::string name = TmsIndex::profile_for(need);
+            const TmsParts held = TmsIndex::held_parts(h);
+            const bool ok = (!need.psi || held.psi) && (!need.phi || held.phi) && (!need.phi_inv || held.phi_inv);
+            return ok ? name : "(refused: the index lacks a part)";
+        };
+        const char* modes[] = {"psi", "phi", "phiskip", "dual"};
+        const TmsMode mode_of[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+        const char* reports[] = {"ms", "smem-one", "smem-all"};
+        const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
+        if (query) {
+            std::cout << "this query loads: " << plan() << "\n";
+            return 0;
+        }
+        std::cout << "tms-batch queries (--mode, --report, then --positions and --phi-starts):\n";
+        for (int m = 0; m < 4; ++m)
+            for (int r = 0; r < 3; ++r)
+                for (int pos = 0; pos < 2; ++pos)
+                    for (int ps = 0; ps < 2; ++ps) {
+                        g_tms_mode = mode_of[m];
+                        g_tms_report = report_of[r];
+                        g_tms_positions = pos;
+                        g_tms_phi_starts = ps;
+                        std::cout << "  " << std::left << std::setw(8) << modes[m] << std::setw(9) << reports[r]
+                                  << std::setw(12) << (pos ? "--positions" : "") << std::setw(13)
+                                  << (ps ? "--phi-starts" : "") << std::right << plan() << "\n";
+                    }
+        return 0;
+    }
+
+    if (cmd == "index-verify") {
+        if (argc < 1) { std::cerr << "index-verify requires INDEX_PATH\n"; return 1; }
+        const std::string bad = orbit_idx::verify_file(argv[0]);
+        if (!bad.empty()) { std::cerr << argv[0] << ": " << bad << "\n"; return 1; }
+        std::cout << argv[0] << ": every section's CRC-32 matches\n";
+        return 0;
+    }
+
+    if (cmd == "index-rewrap") {
+        if (argc < 2) { std::cerr << "index-rewrap requires LEGACY_PATH and INDEX_PATH\n"; return 1; }
+        std::string info = "rewrapped_from=" + std::string(argv[0]) + "\n" + build_info();
+        info.replace(info.find("built_by="), 9, "rewrapped_by=");
+        info.replace(info.find("built_at="), 9, "rewrapped_at=");
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string err = orbit_idx::rewrap_legacy(argv[0], argv[1], info);
+        if (!err.empty()) { std::cerr << "index-rewrap: " << err << "\n"; return 1; }
+        std::cout << "Rewrapped " << argv[0] << " as " << argv[1] << " (s="
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << ")\n";
         return 0;
     }
 

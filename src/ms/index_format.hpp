@@ -1,0 +1,700 @@
+/**
+ * The ORBITIDX container that Orbit-ms and Orbit-tms indexes are written in.
+ * See INDEX_FORMAT.md for the byte layout.
+ *
+ * The first HEADER_BYTES of a file describe it completely: the tool and
+ * layout, the text length, and a table of sections, each with its offset,
+ * size and checksum and, for a move table, its rows, domain and columns (a
+ * column code and a bit width each, in the order the rows hold them).  A
+ * table of profiles names the sections that each kind of query loads, so the
+ * memory a query takes can be read from the header alone (see `ms
+ * index-plan`).  Section payloads are the structures' own Orbit
+ * serializations, each starting on a SECTION_ALIGN boundary.
+ *
+ * A writer serializes each section twice, first into a sink that counts its
+ * bytes and checksums them, so that the header can go first and the output
+ * need not seek.  A reader reads the header, then seeks (or, on a stream
+ * that cannot seek, reads) past the sections it does not load, and checks
+ * each section it loads against its entry: the bytes it took, and for a move
+ * table its column codes, widths, rows and domain.
+ *
+ * Integers are little-endian; a header written on a big-endian host is
+ * refused through its endian check.
+ */
+
+#ifndef _INDEX_FORMAT_HPP
+#define _INDEX_FORMAT_HPP
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <istream>
+#include <ostream>
+#include <sstream>
+#include <stdexcept>
+#include <streambuf>
+#include <string>
+#include <vector>
+
+namespace orbit_idx {
+
+inline constexpr char MAGIC[8] = {'O', 'R', 'B', 'I', 'T', 'I', 'D', 'X'};
+inline constexpr uint32_t FORMAT_VERSION = 1;
+inline constexpr uint32_t ENDIAN_CHECK = 0x01020304;
+inline constexpr uint32_t HEADER_BYTES = 4096;
+inline constexpr uint64_t SECTION_ALIGN = 4096;
+// Byte sizes of the header's parts (see INDEX_FORMAT.md).
+inline constexpr size_t FIXED_BYTES = 128, SECTION_ENTRY_BYTES = 80, PROFILE_ENTRY_BYTES = 32;
+inline constexpr size_t MAX_COLS = 12, PROFILE_NAME_BYTES = 24, SCALARS = 4;
+
+enum class Tool : uint16_t { MS = 1, TMS = 2 };
+
+/** A tms index's layout, or NONE for an ms index. */
+enum class Layout : uint16_t { NONE = 0, FULL = 1, PSI = 2, PHI = 3 };
+
+/** Section ids; a profile's mask has bit id set for each section it loads. */
+enum class Section : uint16_t { LF = 1, F_STARTS = 2, PHI_LEN = 3, PHI_START = 4, PHI_INV = 5, MS_SPILL = 6 };
+
+enum class Kind : uint16_t {
+    MOVE_TABLE = 1,    // an Orbit permutation's serialization
+    U64_ARRAY = 2,     // rows little-endian uint64_t values
+    SPILL_ARRAYS = 3,  // rows byte arrays, each a uint64_t size and its bytes
+};
+
+/** Column codes, one registry for every move table. */
+enum class Col : uint8_t {
+    LENGTH = 1, START = 2, POINTER = 3, OFFSET = 4, CHARACTER = 5,
+    PSI_INT = 16, PSI_OFF = 17, PHI_INT = 18, PHI_OFF = 19, PLCP = 20, PLCPB = 21,
+    LCP_TOP = 32, LCP_MIN_SUB = 33, LCP_SPILL = 34,
+};
+
+inline const char* section_name(Section s) {
+    switch (s) {
+        case Section::LF: return "LF";
+        case Section::F_STARTS: return "F_STARTS";
+        case Section::PHI_LEN: return "PHI_LEN";
+        case Section::PHI_START: return "PHI_START";
+        case Section::PHI_INV: return "PHI_INV";
+        case Section::MS_SPILL: return "MS_SPILL";
+    }
+    return "?";
+}
+
+inline const char* col_name(uint8_t c) {
+    switch (static_cast<Col>(c)) {
+        case Col::LENGTH: return "len";
+        case Col::START: return "start";
+        case Col::POINTER: return "ptr";
+        case Col::OFFSET: return "off";
+        case Col::CHARACTER: return "chr";
+        case Col::PSI_INT: return "psi_int";
+        case Col::PSI_OFF: return "psi_off";
+        case Col::PHI_INT: return "phi_int";
+        case Col::PHI_OFF: return "phi_off";
+        case Col::PLCP: return "plcp";
+        case Col::PLCPB: return "plcpb";
+        case Col::LCP_TOP: return "lcp_top";
+        case Col::LCP_MIN_SUB: return "lcp_min_sub";
+        case Col::LCP_SPILL: return "lcp_spill";
+    }
+    return "?";
+}
+
+inline const char* layout_name(Layout l) {
+    switch (l) {
+        case Layout::NONE: return "none";
+        case Layout::FULL: return "full";
+        case Layout::PSI: return "psi";
+        case Layout::PHI: return "phi";
+    }
+    return "?";
+}
+
+constexpr uint32_t section_bit(Section s) { return uint32_t(1) << static_cast<unsigned>(s); }
+
+/** No start table: a profile's start-table shift when it builds none. */
+inline constexpr uint8_t NO_START_TABLE = 0xFF;
+
+struct SectionEntry {
+    Section id{};
+    Kind kind{};
+    uint16_t row_bits = 0;  // a move table's bits per row
+    uint64_t offset = 0, bytes = 0;
+    uint64_t rows = 0;      // a move table's rows, or the values or arrays of the other kinds
+    uint64_t domain = 0;    // a move table's domain
+    uint32_t crc = 0;       // CRC-32 of the payload
+    std::vector<std::pair<uint8_t, uint8_t>> cols;  // (code, width) in row order
+};
+
+struct Profile {
+    std::string name;
+    uint32_t mask = 0;
+    // log2 of the text positions per start-table entry, for phi's and
+    // phi_inv's tables built at load, or NO_START_TABLE.
+    uint8_t phi_shift = NO_START_TABLE, phi_inv_shift = NO_START_TABLE;
+};
+
+struct Header {
+    Tool tool{};
+    Layout layout = Layout::NONE;
+    uint64_t n = 0;         // text length, terminators included
+    uint64_t bwt_runs = 0;  // maximal runs of one character in LF's rows
+    // Tool scalars.  ms: max LCP top, max LCP min-sub, spill alignment, spill split bits.
+    std::array<uint64_t, SCALARS> scalars{};
+    std::vector<SectionEntry> sections;
+    std::vector<Profile> profiles;
+    std::string info;  // build provenance, "key=value" lines
+
+    const SectionEntry* find(Section s) const {
+        for (const auto& e : sections)
+            if (e.id == s) return &e;
+        return nullptr;
+    }
+    const Profile* profile(const std::string& name) const {
+        for (const auto& p : profiles)
+            if (p.name == name) return &p;
+        return nullptr;
+    }
+    uint32_t held_mask() const {
+        uint32_t m = 0;
+        for (const auto& e : sections) m |= section_bit(e.id);
+        return m;
+    }
+};
+
+// --- CRC-32 (IEEE, reflected), slicing by eight -------------------------
+
+namespace detail {
+struct CrcTables {
+    uint32_t t[8][256];
+    CrcTables() {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[0][i] = c;
+        }
+        for (uint32_t i = 0; i < 256; ++i)
+            for (int s = 1; s < 8; ++s) t[s][i] = (t[s - 1][i] >> 8) ^ t[0][t[s - 1][i] & 0xFF];
+    }
+};
+inline const CrcTables& crc_tables() {
+    static const CrcTables tables;
+    return tables;
+}
+}  // namespace detail
+
+/** Extend crc, a CRC-32 of earlier bytes (0 for none), with n bytes at p. */
+inline uint32_t crc32(uint32_t crc, const void* p, size_t n) {
+    const auto& t = detail::crc_tables().t;
+    const auto* b = static_cast<const unsigned char*>(p);
+    crc = ~crc;
+    while (n >= 8) {
+        uint32_t lo, hi;
+        std::memcpy(&lo, b, 4);
+        std::memcpy(&hi, b + 4, 4);
+        lo ^= crc;
+        crc = t[7][lo & 0xFF] ^ t[6][(lo >> 8) & 0xFF] ^ t[5][(lo >> 16) & 0xFF] ^ t[4][lo >> 24] ^
+              t[3][hi & 0xFF] ^ t[2][(hi >> 8) & 0xFF] ^ t[1][(hi >> 16) & 0xFF] ^ t[0][hi >> 24];
+        b += 8;
+        n -= 8;
+    }
+    while (n--) crc = t[0][(crc ^ *b++) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+// --- Header bytes --------------------------------------------------------
+
+namespace detail {
+template <typename T>
+void put(std::vector<char>& b, size_t at, T v) {
+    std::memcpy(b.data() + at, &v, sizeof(v));
+}
+template <typename T>
+T get(const char* b, size_t at) {
+    T v;
+    std::memcpy(&v, b + at, sizeof(v));
+    return v;
+}
+}  // namespace detail
+
+/** Bytes the header's tables and info take; at most HEADER_BYTES. */
+inline size_t header_used(const Header& h) {
+    return FIXED_BYTES + h.sections.size() * SECTION_ENTRY_BYTES + h.profiles.size() * PROFILE_ENTRY_BYTES +
+           h.info.size();
+}
+
+/** The HEADER_BYTES bytes of h.  Throws if its tables and info do not fit. */
+inline std::vector<char> encode_header(const Header& h) {
+    using detail::put;
+    if (header_used(h) > HEADER_BYTES) throw std::length_error("index header does not fit in its block");
+    std::vector<char> b(HEADER_BYTES, 0);
+    std::memcpy(b.data(), MAGIC, 8);
+    put<uint32_t>(b, 8, FORMAT_VERSION);
+    put<uint32_t>(b, 12, ENDIAN_CHECK);
+    put<uint32_t>(b, 16, HEADER_BYTES);
+    put<uint16_t>(b, 20, static_cast<uint16_t>(h.tool));
+    put<uint16_t>(b, 22, static_cast<uint16_t>(h.layout));
+    put<uint64_t>(b, 24, h.n);
+    put<uint64_t>(b, 32, h.bwt_runs);
+    put<uint16_t>(b, 40, static_cast<uint16_t>(h.sections.size()));
+    put<uint16_t>(b, 42, static_cast<uint16_t>(h.profiles.size()));
+    put<uint16_t>(b, 44, static_cast<uint16_t>(h.info.size()));
+    for (size_t i = 0; i < SCALARS; ++i) put<uint64_t>(b, 48 + 8 * i, h.scalars[i]);
+    size_t at = FIXED_BYTES;
+    for (const auto& e : h.sections) {
+        if (e.cols.size() > MAX_COLS) throw std::length_error("a move table has more columns than the header holds");
+        put<uint16_t>(b, at, static_cast<uint16_t>(e.id));
+        put<uint16_t>(b, at + 2, static_cast<uint16_t>(e.kind));
+        put<uint8_t>(b, at + 4, static_cast<uint8_t>(e.cols.size()));
+        put<uint16_t>(b, at + 6, e.row_bits);
+        put<uint64_t>(b, at + 8, e.offset);
+        put<uint64_t>(b, at + 16, e.bytes);
+        put<uint64_t>(b, at + 24, e.rows);
+        put<uint64_t>(b, at + 32, e.domain);
+        put<uint32_t>(b, at + 40, e.crc);
+        for (size_t c = 0; c < e.cols.size(); ++c) {
+            put<uint8_t>(b, at + 48 + 2 * c, e.cols[c].first);
+            put<uint8_t>(b, at + 49 + 2 * c, e.cols[c].second);
+        }
+        at += SECTION_ENTRY_BYTES;
+    }
+    for (const auto& p : h.profiles) {
+        if (p.name.size() >= PROFILE_NAME_BYTES) throw std::length_error("profile name too long: " + p.name);
+        std::memcpy(b.data() + at, p.name.data(), p.name.size());
+        put<uint32_t>(b, at + 24, p.mask);
+        put<uint8_t>(b, at + 28, p.phi_shift);
+        put<uint8_t>(b, at + 29, p.phi_inv_shift);
+        at += PROFILE_ENTRY_BYTES;
+    }
+    std::memcpy(b.data() + at, h.info.data(), h.info.size());
+    return b;
+}
+
+/** True if the first bytes of a file, at least 8 of them, are an ORBITIDX magic. */
+inline bool has_magic(const char* b, size_t n) { return n >= 8 && std::memcmp(b, MAGIC, 8) == 0; }
+
+/** The header in the HEADER_BYTES bytes at b.  Throws if they are not a valid one. */
+inline Header decode_header(const char* b) {
+    using detail::get;
+    if (!has_magic(b, 8)) throw std::runtime_error("not an Orbit index (no ORBITIDX magic)");
+    if (get<uint32_t>(b, 12) != ENDIAN_CHECK) throw std::runtime_error("Orbit index written with another byte order");
+    const uint32_t v = get<uint32_t>(b, 8);
+    if (v != FORMAT_VERSION) throw std::runtime_error("unsupported Orbit index format version " + std::to_string(v));
+    if (get<uint32_t>(b, 16) != HEADER_BYTES) throw std::runtime_error("unsupported Orbit index header size");
+    Header h;
+    h.tool = static_cast<Tool>(get<uint16_t>(b, 20));
+    if (h.tool != Tool::MS && h.tool != Tool::TMS) throw std::runtime_error("Orbit index of an unknown tool");
+    h.layout = static_cast<Layout>(get<uint16_t>(b, 22));
+    h.n = get<uint64_t>(b, 24);
+    h.bwt_runs = get<uint64_t>(b, 32);
+    const size_t ns = get<uint16_t>(b, 40), np = get<uint16_t>(b, 42), ni = get<uint16_t>(b, 44);
+    for (size_t i = 0; i < SCALARS; ++i) h.scalars[i] = get<uint64_t>(b, 48 + 8 * i);
+    if (FIXED_BYTES + ns * SECTION_ENTRY_BYTES + np * PROFILE_ENTRY_BYTES + ni > HEADER_BYTES)
+        throw std::runtime_error("malformed Orbit index header: its tables overrun it");
+    size_t at = FIXED_BYTES;
+    uint64_t end = HEADER_BYTES;
+    for (size_t i = 0; i < ns; ++i, at += SECTION_ENTRY_BYTES) {
+        SectionEntry e;
+        e.id = static_cast<Section>(get<uint16_t>(b, at));
+        e.kind = static_cast<Kind>(get<uint16_t>(b, at + 2));
+        const size_t nc = get<uint8_t>(b, at + 4);
+        e.row_bits = get<uint16_t>(b, at + 6);
+        e.offset = get<uint64_t>(b, at + 8);
+        e.bytes = get<uint64_t>(b, at + 16);
+        e.rows = get<uint64_t>(b, at + 24);
+        e.domain = get<uint64_t>(b, at + 32);
+        e.crc = get<uint32_t>(b, at + 40);
+        if (nc > MAX_COLS) throw std::runtime_error("malformed Orbit index header: too many columns");
+        unsigned bits = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            e.cols.emplace_back(get<uint8_t>(b, at + 48 + 2 * c), get<uint8_t>(b, at + 49 + 2 * c));
+            bits += e.cols.back().second;
+        }
+        if (bits != e.row_bits) throw std::runtime_error("malformed Orbit index header: row bits disagree with widths");
+        if (e.offset % SECTION_ALIGN != 0 || e.offset < end)
+            throw std::runtime_error("malformed Orbit index header: sections out of order or unaligned");
+        if (h.find(e.id)) throw std::runtime_error("malformed Orbit index header: a section appears twice");
+        end = e.offset + e.bytes;
+        h.sections.push_back(std::move(e));
+    }
+    const uint32_t held = h.held_mask();
+    for (size_t i = 0; i < np; ++i, at += PROFILE_ENTRY_BYTES) {
+        Profile p;
+        p.name.assign(b + at, strnlen(b + at, PROFILE_NAME_BYTES - 1));
+        p.mask = get<uint32_t>(b, at + 24);
+        p.phi_shift = get<uint8_t>(b, at + 28);
+        p.phi_inv_shift = get<uint8_t>(b, at + 29);
+        if ((p.mask & ~held) != 0)
+            throw std::runtime_error("malformed Orbit index header: profile " + p.name + " names a missing section");
+        h.profiles.push_back(std::move(p));
+    }
+    h.info.assign(b + at, ni);
+    return h;
+}
+
+// --- Writing -------------------------------------------------------------
+
+namespace detail {
+/** A stream buffer that counts and checksums what is written to it, and forwards it to next if any. */
+struct CrcCountBuf : std::streambuf {
+    std::streambuf* next = nullptr;
+    uint64_t count = 0;
+    uint32_t crc = 0;
+    explicit CrcCountBuf(std::streambuf* n = nullptr) : next(n) {}
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        const char ch = traits_type::to_char_type(c);
+        return xsputn(&ch, 1) == 1 ? c : traits_type::eof();
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        crc = crc32(crc, s, static_cast<size_t>(n));
+        count += static_cast<uint64_t>(n);
+        if (next && next->sputn(s, n) != n) return 0;
+        return n;
+    }
+};
+
+inline void write_zeros(std::ostream& out, uint64_t n) {
+    static const char zeros[4096] = {};
+    while (n > 0) {
+        const uint64_t k = std::min<uint64_t>(n, sizeof(zeros));
+        out.write(zeros, static_cast<std::streamsize>(k));
+        n -= k;
+    }
+}
+}  // namespace detail
+
+inline uint64_t align_up(uint64_t x) { return (x + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN; }
+
+/** A section to write: its entry, apart from offset, bytes and crc, and how to write its payload. */
+struct SectionSource {
+    SectionEntry entry;
+    std::function<void(std::ostream&)> write;
+};
+
+/**
+ * Write a file with header h, whose sections are those of srcs, filled in.
+ * Each payload is written twice: once to count and checksum it, and once to
+ * out.  finish, if given, completes h between the two passes.  Returns the
+ * bytes written.  Throws if a payload's second writing differs from its first
+ * or out fails.
+ */
+inline uint64_t write_file(std::ostream& out, Header h, std::vector<SectionSource>& srcs,
+                           const std::function<void(Header&)>& finish = {}) {
+    h.sections.clear();
+    uint64_t at = HEADER_BYTES;
+    for (auto& s : srcs) {
+        detail::CrcCountBuf sink;
+        std::ostream os(&sink);
+        s.write(os);
+        s.entry.offset = align_up(at);
+        s.entry.bytes = sink.count;
+        s.entry.crc = sink.crc;
+        at = s.entry.offset + s.entry.bytes;
+        h.sections.push_back(s.entry);
+    }
+    if (finish) finish(h);
+    const std::vector<char> hb = encode_header(h);
+    out.write(hb.data(), static_cast<std::streamsize>(hb.size()));
+    uint64_t pos = HEADER_BYTES;
+    for (const auto& s : srcs) {
+        detail::write_zeros(out, s.entry.offset - pos);
+        detail::CrcCountBuf tee(out.rdbuf());
+        std::ostream os(&tee);
+        s.write(os);
+        os.flush();
+        if (tee.count != s.entry.bytes || tee.crc != s.entry.crc)
+            throw std::logic_error(std::string("section ") + section_name(s.entry.id) + " serialized differently twice");
+        pos = s.entry.offset + s.entry.bytes;
+    }
+    if (!out.good()) throw std::runtime_error("failed writing Orbit index");
+    return pos;
+}
+
+/** A move-table section entry for a structure with the given column codes. */
+template <typename Structure, size_t N>
+SectionEntry move_table_entry(Section id, const Structure& x, const std::array<Col, N>& codes) {
+    static_assert(N <= MAX_COLS);
+    SectionEntry e;
+    e.id = id;
+    e.kind = Kind::MOVE_TABLE;
+    e.rows = x.intervals();
+    e.domain = x.domain();
+    const auto& w = x.get_widths();
+    static_assert(std::tuple_size_v<std::remove_cv_t<std::remove_reference_t<decltype(w)>>> == N,
+                  "column codes and the structure's columns disagree in number");
+    for (size_t c = 0; c < N; ++c) {
+        e.cols.emplace_back(static_cast<uint8_t>(codes[c]), w[c]);
+        e.row_bits = static_cast<uint16_t>(e.row_bits + w[c]);
+    }
+    return e;
+}
+
+/** A move-table section source that serializes x, which must outlive the write. */
+template <typename Structure, size_t N>
+SectionSource move_table_source(Section id, Structure& x, const std::array<Col, N>& codes) {
+    return SectionSource{move_table_entry(id, x, codes), [&x](std::ostream& o) { x.serialize(o); }};
+}
+
+// --- Profiles --------------------------------------------------------------
+
+/**
+ * log2 of the text positions per entry of the start table of a starts-based
+ * permutation over domain positions in intervals intervals: the smallest
+ * shift with 2^shift * intervals >= START_TABLE_DENSITY * domain.
+ */
+inline constexpr uint64_t START_TABLE_DENSITY = 4;
+inline uint8_t start_table_shift(uint64_t domain, uint64_t intervals) {
+    unsigned s = 0;
+    while ((uint64_t(1) << s) * intervals < START_TABLE_DENSITY * domain && s < 62) ++s;
+    return static_cast<uint8_t>(s);
+}
+
+/** Which form of phi a tms profile loads. */
+enum class PhiForm { NONE, LENGTHS, STARTS };
+
+/** The name of the tms profile that loads LF and the given parts. */
+inline std::string tms_profile_name(bool psi, PhiForm phi, bool phi_inv) {
+    std::string s;
+    auto add = [&](const char* p) { s += s.empty() ? p : std::string("+") + p; };
+    if (psi) add("psi");
+    if (phi == PhiForm::LENGTHS) add("phi-len");
+    if (phi == PhiForm::STARTS) add("phi-starts");
+    if (phi != PhiForm::NONE && phi_inv) add("phi-inv");
+    return s.empty() ? "lf" : s;
+}
+
+/** The sections the tms profile with the given parts loads. */
+inline uint32_t tms_profile_mask(bool psi, PhiForm phi, bool phi_inv) {
+    uint32_t m = section_bit(Section::LF);
+    if (psi) m |= section_bit(Section::F_STARTS);
+    if (phi == PhiForm::LENGTHS) m |= section_bit(Section::PHI_LEN);
+    if (phi == PhiForm::STARTS) m |= section_bit(Section::PHI_START);
+    if (phi != PhiForm::NONE && phi_inv) m |= section_bit(Section::PHI_INV);
+    return m;
+}
+
+/**
+ * Every tms profile an index with header h's sections serves: LF with or
+ * without psi, no phi or either form, and phi_inv or not with phi.  A
+ * profile with phi_inv builds start tables at load, for phi_inv and for
+ * phi's starts-based form if loaded.
+ */
+inline std::vector<Profile> tms_profiles(const Header& h) {
+    std::vector<Profile> out;
+    const SectionEntry *f = h.find(Section::F_STARTS), *len = h.find(Section::PHI_LEN),
+                       *st = h.find(Section::PHI_START), *inv = h.find(Section::PHI_INV);
+    for (bool psi : {false, true}) {
+        if (psi && !f) continue;
+        for (PhiForm phi : {PhiForm::NONE, PhiForm::LENGTHS, PhiForm::STARTS}) {
+            if ((phi == PhiForm::LENGTHS && !len) || (phi == PhiForm::STARTS && !st)) continue;
+            for (bool pi : {false, true}) {
+                if (pi && (phi == PhiForm::NONE || !inv)) continue;
+                Profile p;
+                p.name = tms_profile_name(psi, phi, pi);
+                p.mask = tms_profile_mask(psi, phi, pi);
+                if (pi) {
+                    p.phi_inv_shift = start_table_shift(inv->domain, inv->rows);
+                    if (phi == PhiForm::STARTS) p.phi_shift = start_table_shift(st->domain, st->rows);
+                }
+                out.push_back(std::move(p));
+            }
+        }
+    }
+    return out;
+}
+
+/** The one profile of an ms index: everything. */
+inline std::vector<Profile> ms_profiles() {
+    Profile p;
+    p.name = "ms";
+    p.mask = section_bit(Section::LF) | section_bit(Section::MS_SPILL);
+    return {p};
+}
+
+/** Bytes of the start table built over a section: one entry per 2^shift positions, plus one. */
+inline uint64_t start_table_bytes(const SectionEntry& e, uint8_t shift) {
+    if (shift == NO_START_TABLE || e.domain == 0) return 0;
+    unsigned w = 0;
+    while (w < 64 && (e.rows - 1) >> w) ++w;
+    w = std::max(w, 1u);
+    const uint64_t entries = ((e.domain - 1) >> shift) + 2;
+    return (entries * w + 7) / 8 + 8;
+}
+
+// --- Reading -------------------------------------------------------------
+
+/**
+ * Reads a file's sections in order from a stream, counting the bytes taken
+ * so that each section's size can be checked and the sections not loaded
+ * skipped: by seeking where the stream can, else by reading past them.
+ */
+class Reader {
+public:
+    explicit Reader(std::istream& in) : buf_(in.rdbuf()), in_(&buf_) {
+        std::vector<char> b(HEADER_BYTES);
+        in_.read(b.data(), HEADER_BYTES);
+        if (in_.gcount() < 8 || !has_magic(b.data(), 8)) throw std::runtime_error("not an Orbit index (no ORBITIDX magic)");
+        if (!in_.good()) throw std::runtime_error("truncated Orbit index header");
+        header_ = decode_header(b.data());
+    }
+    const Header& header() const { return header_; }
+
+    /**
+     * Load the move table of section id into x, which has the given column
+     * codes, and check it against its entry.  Throws if the section is
+     * missing or disagrees.
+     */
+    template <typename Structure, size_t N>
+    void load_move_table(Section id, Structure& x, const std::array<Col, N>& codes) {
+        const SectionEntry& e = entry(id, Kind::MOVE_TABLE);
+        if (e.cols.size() != N) fail(e, "has another number of columns than this build reads");
+        for (size_t c = 0; c < N; ++c)
+            if (e.cols[c].first != static_cast<uint8_t>(codes[c]))
+                fail(e, std::string("has column ") + col_name(e.cols[c].first) + " where this build reads " +
+                            col_name(static_cast<uint8_t>(codes[c])));
+        seek(e.offset);
+        try {
+            x.load(in_);
+        } catch (const std::exception&) {
+            // A structure cut short fails a check of the bytes it did not get.
+            if (!in_.good()) fail(e, "is truncated");
+            throw;
+        }
+        check_end(e);
+        const auto& w = x.get_widths();
+        for (size_t c = 0; c < N; ++c)
+            if (w[c] != e.cols[c].second) fail(e, "has widths other than its header entry");
+        if (x.intervals() != e.rows || x.domain() != e.domain) fail(e, "has rows or domain other than its header entry");
+    }
+
+    /** The values of a U64_ARRAY section. */
+    std::vector<uint64_t> load_u64s(Section id) {
+        const SectionEntry& e = entry(id, Kind::U64_ARRAY);
+        if (e.bytes != e.rows * 8) fail(e, "has a size other than 8 bytes per value");
+        seek(e.offset);
+        std::vector<uint64_t> v(e.rows);
+        in_.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(e.bytes));
+        check_end(e);
+        return v;
+    }
+
+    /** The byte arrays of a SPILL_ARRAYS section. */
+    std::vector<std::vector<unsigned char>> load_arrays(Section id) {
+        const SectionEntry& e = entry(id, Kind::SPILL_ARRAYS);
+        seek(e.offset);
+        std::vector<std::vector<unsigned char>> v(e.rows);
+        for (auto& a : v) {
+            uint64_t size = 0;
+            in_.read(reinterpret_cast<char*>(&size), sizeof(size));
+            if (!in_.good() || size > e.bytes) fail(e, "is truncated or malformed");
+            a.resize(size);
+            in_.read(reinterpret_cast<char*>(a.data()), static_cast<std::streamsize>(size));
+        }
+        check_end(e);
+        return v;
+    }
+
+    /** The entry of section id, which must be present and of kind k. */
+    const SectionEntry& entry(Section id, Kind k) const {
+        const SectionEntry* e = header_.find(id);
+        if (!e) throw std::runtime_error(std::string("Orbit index lacks section ") + section_name(id));
+        if (e->kind != k) fail(*e, "is of another kind than expected");
+        return *e;
+    }
+
+private:
+    /** Counts the bytes read through it from src, buffering one byte for underflow. */
+    struct CountingBuf : std::streambuf {
+        std::streambuf* src;
+        uint64_t count = 0;
+        char ch = 0;
+        explicit CountingBuf(std::streambuf* s) : src(s) {}
+        int_type underflow() override {
+            const int_type c = src->sbumpc();
+            if (traits_type::eq_int_type(c, traits_type::eof())) return c;
+            ++count;
+            ch = traits_type::to_char_type(c);
+            setg(&ch, &ch, &ch + 1);
+            return c;
+        }
+        std::streamsize xsgetn(char* s, std::streamsize n) override {
+            std::streamsize got = 0;
+            if (n > 0 && gptr() < egptr()) {
+                *s++ = *gptr();
+                gbump(1);
+                got = 1;
+                --n;
+            }
+            const std::streamsize k = n > 0 ? src->sgetn(s, n) : 0;
+            count += static_cast<uint64_t>(k);
+            return got + k;
+        }
+        /** Position: bytes taken by the reader, not counting one buffered and unread. */
+        uint64_t pos() const { return count - static_cast<uint64_t>(egptr() - gptr()); }
+        /** Move forward to offset to, seeking src if it can, else reading. */
+        bool skip_to(uint64_t to) {
+            const uint64_t at = pos();
+            if (to < at) return false;
+            if (gptr() < egptr()) {
+                // The buffered byte is at position at; past it, src is at count.
+                if (to == at) return true;
+                gbump(1);
+            }
+            uint64_t gap = to - count;
+            if (gap == 0) return true;
+            if (src->pubseekoff(static_cast<std::streamoff>(gap), std::ios::cur, std::ios::in) != std::streampos(-1)) {
+                count = to;
+                return true;
+            }
+            char tmp[1 << 16];
+            while (gap > 0) {
+                const std::streamsize k = src->sgetn(tmp, static_cast<std::streamsize>(std::min<uint64_t>(gap, sizeof(tmp))));
+                if (k <= 0) return false;
+                gap -= static_cast<uint64_t>(k);
+                count += static_cast<uint64_t>(k);
+            }
+            return true;
+        }
+    };
+
+    [[noreturn]] static void fail(const SectionEntry& e, const std::string& what) {
+        throw std::runtime_error(std::string("Orbit index section ") + section_name(e.id) + " " + what);
+    }
+    void seek(uint64_t offset) {
+        if (!in_.good() || !buf_.skip_to(offset)) throw std::runtime_error("Orbit index sections out of reach (truncated?)");
+    }
+    void check_end(const SectionEntry& e) {
+        if (!in_.good()) fail(e, "is truncated");
+        if (buf_.pos() != e.offset + e.bytes) fail(e, "took a number of bytes other than its header entry");
+    }
+
+    CountingBuf buf_;
+    std::istream in_;
+    Header header_;
+};
+
+/** The header of the file at path, read from its first HEADER_BYTES alone. */
+Header read_header_file(const std::string& path);
+
+/** A description of h: its sections and profiles, with bytes and columns. */
+void describe_header(const Header& h, std::ostream& os);
+
+/**
+ * Check every section's CRC-32 against its entry and that the file ends with
+ * the last section.  Returns an empty string if all agree, else what differs.
+ */
+std::string verify_file(const std::string& path);
+
+/**
+ * Rewrite a legacy index (MSIX v4 or TMSX v8) at from as an ORBITIDX file at
+ * to, copying each structure's bytes without loading it.  info is appended to
+ * the provenance.  Returns an empty string on success, else the error.
+ */
+std::string rewrap_legacy(const std::string& from, const std::string& to, const std::string& info);
+
+}  // namespace orbit_idx
+
+#endif

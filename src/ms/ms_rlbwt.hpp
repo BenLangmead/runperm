@@ -26,6 +26,7 @@
 #include "ms_alphabet.hpp"
 #include "ms_constants.hpp"
 #include "step_stats.hpp"
+#include "index_format.hpp"
 #include <cassert>
 #include <iostream>
 #include <utility>
@@ -692,6 +693,11 @@ class MSIndexSpillLCP {
     uchar spill_split_bits_ = 0;
     std::array<bool, 256> occurs_{};  // occurs_[c]: byte c appears somewhere in the BWT
     std::array<uchar, 256> code_{};   // code_[c]: alphabet code of byte c if it occurs, else no_code
+    std::string info_;
+    // The move structure's column codes, in the order its rows hold them.
+    static constexpr std::array<orbit_idx::Col, 7> LF_COLS{
+        StoreAbsolutePositions ? orbit_idx::Col::START : orbit_idx::Col::LENGTH, orbit_idx::Col::POINTER,
+        orbit_idx::Col::OFFSET, orbit_idx::Col::CHARACTER, orbit_idx::Col::LCP_TOP, orbit_idx::Col::LCP_MIN_SUB, orbit_idx::Col::LCP_SPILL};
 
     void compute_codes() {
         for (size_t c = 0; c < 256; ++c) {
@@ -745,51 +751,63 @@ public:
     MSIndexSpillLCP() = default;
 
     /**
-     * Write the index: the Orbit move structure (including the integrated
-     * LCP columns) in Orbit's own packed serialization, then the spillover
-     * arrays and the scalar settings.  Integers are written in host byte
-     * order, as Orbit does.
+     * Write the index as an ORBITIDX file (see index_format.hpp): a header
+     * holding the scalar settings, then the Orbit move structure (including
+     * the integrated LCP columns) and the spillover arrays as sections.
      */
     size_t serialize(std::ostream& out) {
-        size_t bytes = idx_.serialize(out);
-        auto put = [&](ulint v) { out.write(reinterpret_cast<const char*>(&v), sizeof(v)); bytes += sizeof(v); };
-        put(max_lcp_top_);
-        put(max_lcp_min_sub_);
-        put(spill_align_);
-        put(spill_split_bits_);
-        put(spill_vectors_.size());
-        for (const auto& v : spill_vectors_) {
-            put(v.size());
-            out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
-            bytes += v.size();
+        using namespace orbit_idx;
+        Header h;
+        h.tool = Tool::MS;
+        h.n = idx_.domain();
+        h.scalars = {max_lcp_top_, max_lcp_min_sub_, spill_align_, spill_split_bits_};
+        h.profiles = ms_profiles();
+        h.info = info_;
+        ulint runs = 0;
+        for (ulint i = 0, prev = 256; i < idx_.intervals(); ++i) {
+            const uchar c = idx_.get_character(i);
+            runs += c != prev;
+            prev = c;
         }
-        return bytes;
+        h.bwt_runs = runs;
+        std::vector<SectionSource> srcs;
+        srcs.push_back(move_table_source(Section::LF, idx_, LF_COLS));
+        SectionEntry e;
+        e.id = Section::MS_SPILL;
+        e.kind = Kind::SPILL_ARRAYS;
+        e.rows = spill_vectors_.size();
+        srcs.push_back({e, [this](std::ostream& o) {
+                            for (const auto& v : spill_vectors_) {
+                                const uint64_t size = v.size();
+                                o.write(reinterpret_cast<const char*>(&size), sizeof(size));
+                                o.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
+                            }
+                        }});
+        return write_file(out, h, srcs);
     }
 
     /** Read an index written by serialize().  Throws on malformed input. */
     void load(std::istream& in) {
-        idx_.load(in);
-        auto get = [&]() {
-            ulint v = 0;
-            in.read(reinterpret_cast<char*>(&v), sizeof(v));
-            if (!in.good()) throw std::runtime_error("truncated ms index");
-            return v;
-        };
-        max_lcp_top_ = get();
-        max_lcp_min_sub_ = get();
-        spill_align_ = get();
-        spill_split_bits_ = static_cast<uchar>(get());
-        const ulint arrays = get();
+        using namespace orbit_idx;
+        Reader rd(in);
+        const Header& h = rd.header();
+        if (h.tool != Tool::MS) throw std::runtime_error("not an ms index");
+        max_lcp_top_ = h.scalars[0];
+        max_lcp_min_sub_ = h.scalars[1];
+        spill_align_ = h.scalars[2];
+        spill_split_bits_ = static_cast<uchar>(h.scalars[3]);
         const ulint expected = (spill_split_bits_ > 0) ? (ulint{1} << spill_split_bits_) : 1;
-        if (arrays != expected || spill_align_ == 0) throw std::runtime_error("inconsistent ms index settings");
-        spill_vectors_.assign(static_cast<size_t>(arrays), {});
-        for (auto& v : spill_vectors_) {
-            v.resize(static_cast<size_t>(get()));
-            in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size()));
-            if (!in.good() && !v.empty()) throw std::runtime_error("truncated ms spillover");
-        }
+        if (rd.entry(Section::MS_SPILL, Kind::SPILL_ARRAYS).rows != expected || spill_align_ == 0)
+            throw std::runtime_error("inconsistent ms index settings");
+        rd.load_move_table(Section::LF, idx_, LF_COLS);
+        spill_vectors_ = rd.load_arrays(Section::MS_SPILL);
+        info_ = h.info;
         compute_occurs();
     }
+
+    /** Build provenance written with the index, as "key=value" lines. */
+    const std::string& info() const { return info_; }
+    void set_info(std::string info) { info_ = std::move(info); }
 
     /** True if byte c occurs in the indexed text. */
     bool occurs(uchar c) const { return occurs_[c]; }

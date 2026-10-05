@@ -1,7 +1,6 @@
 /**
- * Serialization for MS spill index.
- * Binary format: magic "MSIX", version, r, bwt_heads, bwt_run_lengths,
- * run_data, spillover, max_lcp_top, max_lcp_min_sub.
+ * Serialization for MS spill index, as an ORBITIDX file (see
+ * index_format.hpp).
  *
  * Author: Ben Langmead (ben.langmead@gmail.com)
  * Date: Feb 17, 2026
