@@ -10,6 +10,7 @@
 #include "tms_smem.hpp"
 #include "ms_rlbwt.hpp"
 #include "tsv.hpp"
+#include "orient.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -493,6 +494,99 @@ bool test_tms_batch(const std::string& data_dir) {
     }
     std::cout << "  " << access_rows << " rows of packed access, " << checked << " batches and " << positions
               << " positions PASSED" << std::endl;
+    return true;
+}
+
+/**
+ * --orient on texts that hold both strands: each text is sequences and
+ * their reverse complements, separated, and patterns are drawn from it and
+ * from its reverse complement, with mutations, N and absent bytes.  The
+ * matching statistics from matching every read's reverse complement (rc),
+ * and from flipping reads by random base qualities (qual), converted back,
+ * must equal brute force and the forward query, for the ms index and for
+ * tms indexes in every mode.
+ */
+bool test_orient_both_strands() {
+    std::cout << "Testing --orient rc and qual on texts holding both strands" << std::endl;
+    std::mt19937 rng(73);
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    size_t checked = 0, flipped = 0;
+    for (int k = 0; k < 30; ++k) {
+        std::string text;
+        const int count = 1 + rng() % 4;
+        for (int i = 0; i < count; ++i) {
+            std::string w(1 + rng() % (k % 4 == 0 ? 8 : 300), 'A');
+            for (auto& c : w) c = "ACGT"[rng() % (k % 5 == 0 ? 2 : 4)];
+            if (k % 3 == 0 && w.size() > 10) w[rng() % w.size()] = 'N';
+            std::string r = w;
+            revcomp_in_place(r);
+            text += (text.empty() ? "" : "%") + w + "%" + r;
+        }
+        TextBwt t = make_text_bwt(text);
+        std::vector<ulint> tops;
+        for (const auto& l : t.lcps_per_run) tops.push_back(l[0]);
+        auto pats = fuzz_patterns(t.str, rng, 40);
+        for (auto P : fuzz_patterns(t.str, rng, 40)) {
+            revcomp_in_place(P);
+            pats.push_back(P);
+        }
+        std::vector<std::string> quals;
+        for (const auto& P : pats) {
+            std::string q(P.size(), 'I');
+            for (auto& c : q) c = static_cast<char>('!' + rng() % 41);
+            quals.push_back(q);
+        }
+        std::vector<std::vector<ulint>> want;
+        for (const auto& P : pats) want.push_back(naive_ms(t.str, P));
+
+        // Runs query(seqs, out) on the reads as oriented by o and converts
+        // the results back.
+        auto oriented = [&](ReadOrient o, auto query) {
+            std::vector<std::string> seqs = pats;
+            std::vector<char> flips;
+            flipped += orient_reads(seqs, &quals, o, flips);
+            std::vector<std::vector<ulint>> out;
+            query(seqs, out);
+            std::vector<ulint> scratch;
+            restore_orientation(flips, out, scratch);
+            return out;
+        };
+        auto check = [&](const std::vector<std::vector<ulint>>& got, const char* what) {
+            if (got != want) {
+                std::cout << "  FAILED: " << what << ", text of length " << text.size() << std::endl;
+                assert(false && "oriented matching statistics must equal brute force");
+                return false;
+            }
+            checked += pats.size();
+            return true;
+        };
+        auto ms_idx = ms_index_for(t);
+        for (ReadOrient o : {ReadOrient::FWD, ReadOrient::RC, ReadOrient::QUAL}) {
+            for (size_t kk : {1, 8}) {
+                auto got = oriented(o, [&](const std::vector<std::string>& seqs, std::vector<std::vector<ulint>>& out) {
+                    ms_query_batch(ms_idx, seqs, kk, out);
+                });
+                if (!check(got, "ms index")) return false;
+            }
+            auto one = oriented(o, [&](const std::vector<std::string>& seqs, std::vector<std::vector<ulint>>& out) {
+                for (const auto& P : seqs) out.push_back(ms_query(ms_idx, P));
+            });
+            if (!check(one, "ms_query")) return false;
+        }
+        for (const auto& opts : split_variants()) {
+            TmsIndex idx(t.heads, t.lens, opts, &tops);
+            for (TmsMode mode : modes)
+                for (ReadOrient o : {ReadOrient::FWD, ReadOrient::RC, ReadOrient::QUAL})
+                    for (size_t kk : {1, 8}) {
+                        auto got =
+                            oriented(o, [&](const std::vector<std::string>& seqs, std::vector<std::vector<ulint>>& out) {
+                                tms_query_batch(idx, seqs, kk, out, mode, nullptr);
+                            });
+                        if (!check(got, "tms index")) return false;
+                    }
+        }
+    }
+    std::cout << "  " << checked << " reads (" << flipped << " flipped) PASSED" << std::endl;
     return true;
 }
 
@@ -1310,6 +1404,8 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_tms_vs_ms_minishred(data_dir)) all_ran = false;
     std::cout << std::endl;
     test_tms_batch(data_dir);
+    std::cout << std::endl;
+    test_orient_both_strands();
     std::cout << std::endl;
     test_phi_inv();
     std::cout << std::endl;

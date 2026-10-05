@@ -48,6 +48,8 @@ tms-batch mini.tms --mode phiskip --positions
 tms-batch mini.tms --mode phi --positions
 tms-batch mini.tms --report smem-all
 tms-batch mini.tms --mode dual --report smem-one
+batch mini.idx --orient rc
+tms-batch mini.tms --mode dual --orient rc
 CMDS
 # The same reads as multi-line FASTA, FASTQ and one per line, with CRLF
 # line endings, blank lines, lower case, and odd records at the end: output
@@ -124,5 +126,37 @@ head -n 3000 ref.m.fq | cut -f2 | grep -v '^$' > b.txt
 head -n $(wc -l < a.txt) ref.m.txt | cut -f2 > c.txt
 cmp -s a.txt b.txt && cmp -s a.txt c.txt || { echo "formats disagree"; fails=$((fails + 1)); }
 echo "checked read formats"
+
+# --orient qual on FASTQ with varied qualities: output must not depend on
+# thread count, block size or K, and the flipped count must follow the rule
+# (mean quality of the last min(20, len) bases above that of the first).
+python3 - "$W" <<'PY'
+import random, sys
+d = sys.argv[1]
+t = open(d + '/text.txt').read().strip().replace('%', '').replace('$', '')
+r = random.Random(13)
+flips = 0
+with open(d + '/q.fq', 'w') as f:
+    for i in range(2000):
+        L = r.choice([0, 1, 15, 20, 21, 39, 40, 150, 150])
+        p = r.randrange(len(t) - L)
+        s = ''.join(c if r.random() > 0.02 else r.choice('ACGTN') for c in t[p:p + L])
+        q = ''.join(chr(33 + r.randrange(42)) for _ in range(L))
+        m = min(20, L)
+        flips += sum(map(ord, q[L - m:])) > sum(map(ord, q[:m]))
+        f.write('@q%d\n%s\n+\n%s\n' % (i, s, q))
+open(d + '/q.flips', 'w').write('%d\n' % flips)
+PY
+$M batch mini.idx q.fq -o ref.out --orient qual --interleave 0 2> err.txt || { echo "failed: orient qual"; cat err.txt; exit 1; }
+grep -q "flipped=$(cat q.flips) " err.txt || { echo "orient qual: wrong flipped count"; cat err.txt; fails=$((fails + 1)); }
+for k in 1 32; do for t in 1 3 8; do for b in 1 13 1000; do
+    $M batch mini.idx q.fq -o o.out --orient qual --interleave $k --threads $t --block-reads $b 2> /dev/null
+    cmp -s ref.out o.out || { echo "differs: orient qual k=$k t=$t b=$b"; fails=$((fails + 1)); }
+done; done; done
+# Refused: qual without qualities, and positions or SMEM reports with rc.
+$M batch mini.idx m.fa -o o.out --orient qual 2> /dev/null && { echo "orient qual accepted FASTA"; fails=$((fails + 1)); }
+$M tms-batch mini.tms m.fa -o o.out --orient rc --mode phi --positions 2> /dev/null && { echo "orient rc accepted --positions"; fails=$((fails + 1)); }
+$M tms-batch mini.tms m.fa -o o.out --orient rc --report smem-one 2> /dev/null && { echo "orient rc accepted an SMEM report"; fails=$((fails + 1)); }
+echo "checked orientation"
 
 if [ $fails -eq 0 ]; then echo "All thread checks PASSED"; else echo "$fails thread checks FAILED"; exit 1; fi

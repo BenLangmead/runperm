@@ -24,6 +24,7 @@
 #include "parallel_blocks.hpp"
 #include "read_chunks.hpp"
 #include "format_int.hpp"
+#include "orient.hpp"
 #include <zlib.h>
 #include <iostream>
 #include <string>
@@ -65,6 +66,7 @@ static void usage(const char* prog) {
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
+              << "            [--orient fwd|rc|qual]\n"
               << "              Load the index once and compute matching statistics for every\n"
               << "              read in READS (FASTA, FASTQ, or one sequence per line, in\n"
               << "              which blank lines are skipped; - for stdin; LF or CRLF line\n"
@@ -88,6 +90,19 @@ static void usage(const char* prog) {
               << "              part of the reads (numactl -N i -m i).  A summary goes to stderr:\n"
               << "              query_ns_per_base is the threads' summed query time per base,\n"
               << "              and wall_ns_per_base the elapsed time per base.\n"
+              << "              --orient sets which strand of each read is matched: fwd (the\n"
+              << "              default) matches the read as given; rc matches its reverse\n"
+              << "              complement, starting from the read's 5' end, and converts the\n"
+              << "              result back to the read's matching statistics; qual does so\n"
+              << "              only for reads whose last min(20, len) bases have a higher\n"
+              << "              mean base quality than their first, and needs FASTQ input.\n"
+              << "              rc and qual give the same output as fwd only for an index that\n"
+              << "              holds both strands of every sequence (as an FMD or a ropebwt3\n"
+              << "              index does); this cannot be detected from the index, so the\n"
+              << "              user must know it.  They refuse tms-batch's --positions and\n"
+              << "              SMEM reports.  The summary's flipped field counts the reads\n"
+              << "              matched on the other strand, and orient_s is the threads'\n"
+              << "              summed time flipping reads and converting their results.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--phi FILE]\n"
               << "            [--minima FILE] [--lcp-bin FILE] [--lf-split B] [--phi-split B]\n"
               << "            [--no-phi-inv]\n"
@@ -117,7 +132,7 @@ static void usage(const char* prog) {
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
               << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
-              << "            [--max-smem-positions N] [--phi-starts]\n"
+              << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
               << "              the others need phi).  Only the index's structures that the\n"
@@ -280,6 +295,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     bool write_output = true;
     size_t interleave = 32, threads = 1, block_reads = 0, block_bytes = 0;
     int gzip_level = -2;  // -2: from the output name; -1: none
+    ReadOrient orient = ReadOrient::FWD;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
@@ -293,6 +309,13 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             gzip_level = std::stoi(argv[++i]);
         else if (strcmp(argv[i], "--block-bytes") == 0 && i + 1 < argc)
             block_bytes = static_cast<size_t>(std::stoull(argv[++i]));
+        else if (strcmp(argv[i], "--orient") == 0 && i + 1 < argc) {
+            const std::string o = argv[++i];
+            if (o == "fwd") orient = ReadOrient::FWD;
+            else if (o == "rc") orient = ReadOrient::RC;
+            else if (o == "qual") orient = ReadOrient::QUAL;
+            else { std::cerr << "Unknown orientation: " << o << " (expected fwd, rc or qual)\n"; return 1; }
+        }
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -315,6 +338,14 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
             g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
+    }
+    // Positions found on the reverse complement would have to be mirrored
+    // onto the other strand, which needs each string's offset in the text,
+    // and the index does not store those.
+    if (orient != ReadOrient::FWD && (g_tms_positions || g_tms_report != TmsReport::MS)) {
+        std::cerr << "--orient rc and --orient qual give matching statistics only; they cannot be used with "
+                     "--positions or an SMEM report\n";
+        return 1;
     }
     threads = resolve_thread_count(threads);
     // Output named *.gz is gzip-compressed, each block as a gzip member by
@@ -376,7 +407,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     struct Block {
         ReadBuffer buf;
         ReadChunk chunk;
-        std::vector<std::string> names, seqs;
+        std::vector<std::string> names, seqs, quals;
     };
     // With --positions, a tab-separated field holds the positions (-1 for
     // none); with an SMEM report, a last one holds the SMEMs.
@@ -408,15 +439,20 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     struct Worker {
         QueryResults r, one;
         PerfCounters perf;
-        double query_s = 0.0, parse_s = 0.0, format_s = 0.0;
-        size_t reads = 0, bases = 0;
+        double query_s = 0.0, parse_s = 0.0, format_s = 0.0, orient_s = 0.0;
+        size_t reads = 0, bases = 0, flipped = 0;
         std::string packed;
+        std::vector<char> flips;
+        std::vector<ulint> scratch;
         std::function<void(Worker&, Block&, std::string&)> body;
         void process(Block& b, std::string& text) { body(*this, b, text); }
     };
     auto body = [&](Worker& w, Block& b, std::string& text) {
         auto tp = clock::now();
-        const size_t n = parse_chunk(b.chunk, b.names, b.seqs);
+        if (orient == ReadOrient::QUAL && b.chunk.format != ReadFormat::FASTQ)
+            throw std::runtime_error("--orient qual needs FASTQ input, for its base qualities");
+        const size_t n =
+            parse_chunk(b.chunk, b.names, b.seqs, orient == ReadOrient::QUAL ? &b.quals : nullptr);
         b.names.resize(n);
         b.seqs.resize(n);
         w.parse_s += std::chrono::duration<double>(clock::now() - tp).count();
@@ -431,6 +467,14 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             w.perf.stop();
             w.query_s += std::chrono::duration<double>(clock::now() - tq).count();
         };
+        // Reads to be matched on the other strand are reverse-complemented
+        // in place, and their results converted back after the query.
+        const bool oriented = orient != ReadOrient::FWD;
+        if (oriented) {
+            auto to = clock::now();
+            w.flipped += orient_reads(b.seqs, &b.quals, orient, w.flips);
+            w.orient_s += std::chrono::duration<double>(clock::now() - to).count();
+        }
         if (interleave == 0) {
             // One read at a time, without prefetching.  The block is timed
             // as a whole, so that timing each read does not add to it.
@@ -453,6 +497,11 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         } else {
             timed([&] { query_many(idx, b.seqs, interleave, w.r); });
         }
+        if (oriented) {
+            auto to = clock::now();
+            restore_orientation(w.flips, w.r.ms, w.scratch);
+            w.orient_s += std::chrono::duration<double>(clock::now() - to).count();
+        }
         if (write_output) {
             auto tf = clock::now();
             for (size_t j = 0; j < b.seqs.size(); ++j) format(text, b.names[j], w.r, j);
@@ -464,8 +513,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         }
     };
     PerfCounters perf;
-    double query_s = 0.0, read_s = 0.0, parse_s = 0.0, format_s = 0.0;
-    size_t n_reads = 0, n_bases = 0;
+    double query_s = 0.0, read_s = 0.0, parse_s = 0.0, format_s = 0.0, orient_s = 0.0;
+    size_t n_reads = 0, n_bases = 0, n_flipped = 0;
 #ifdef TMS_STATS
     TmsStats tms_total;
 #endif
@@ -473,32 +522,39 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     MsStats ms_total;
 #endif
     auto t_all = clock::now();
-    run_parallel_blocks<Block>(
-        threads, 4 * threads,
-        [&](size_t) { Worker w; w.body = body; return w; },
-        [&](Block& b) {
-            auto tr = clock::now();
-            const bool got = cutter.next(b.buf, b.chunk, target_bytes());
-            read_s += std::chrono::duration<double>(clock::now() - tr).count();
-            return got;
-        },
-        [&](const std::string& text) {
-            if (write_output) out->write(text.data(), static_cast<std::streamsize>(text.size()));
-        },
-        [&](Worker& w) {
-            perf.add(w.perf);
-            query_s += w.query_s;
-            parse_s += w.parse_s;
-            format_s += w.format_s;
-            n_reads += w.reads;
-            n_bases += w.bases;
+    try {
+        run_parallel_blocks<Block>(
+            threads, 4 * threads,
+            [&](size_t) { Worker w; w.body = body; return w; },
+            [&](Block& b) {
+                auto tr = clock::now();
+                const bool got = cutter.next(b.buf, b.chunk, target_bytes());
+                read_s += std::chrono::duration<double>(clock::now() - tr).count();
+                return got;
+            },
+            [&](const std::string& text) {
+                if (write_output) out->write(text.data(), static_cast<std::streamsize>(text.size()));
+            },
+            [&](Worker& w) {
+                perf.add(w.perf);
+                query_s += w.query_s;
+                parse_s += w.parse_s;
+                format_s += w.format_s;
+                orient_s += w.orient_s;
+                n_reads += w.reads;
+                n_bases += w.bases;
+                n_flipped += w.flipped;
 #ifdef TMS_STATS
-            tms_total += tms_stats;
+                tms_total += tms_stats;
 #endif
 #ifdef MS_STATS
-            ms_total += ms_stats;
+                ms_total += ms_stats;
 #endif
-        });
+            });
+    } catch (const std::exception& e) {
+        std::cerr << "batch: " << e.what() << "\n";
+        return 1;
+    }
     out->flush();
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
 #ifdef TMS_STATS
@@ -532,6 +588,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
               << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << read_s
               << " parse_s=" << parse_s << " format_s=" << format_s
+              << " orient=" << (orient == ReadOrient::FWD ? "fwd" : orient == ReadOrient::RC ? "rc" : "qual")
+              << " flipped=" << n_flipped << " orient_s=" << orient_s
               << " total_s=" << total_s
               << " query_ns_per_base=" << (n_bases ? query_s * 1e9 / n_bases : 0.0)
               << " wall_ns_per_base=" << (n_bases ? total_s * 1e9 / n_bases : 0.0) << "\n";

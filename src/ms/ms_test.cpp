@@ -13,6 +13,7 @@
 #include "rlbwt_io.hpp"
 #include "tms_test.hpp"
 #include "fmd_test.hpp"
+#include "orient.hpp"
 #include <cstdio>
 #include <iostream>
 #include <cassert>
@@ -243,6 +244,85 @@ void test_naive_matching_statistics_known() {
     for (size_t i = 0; i < ms.size(); ++i)
         assert(ms[i] == expected[i]);
     std::cout << "  PASSED" << std::endl;
+}
+
+/**
+ * Lengths of the longest substrings of P ending at each position that occur
+ * in T, by brute force.
+ */
+static std::vector<ulint> naive_match_ends(const std::string& T, const std::string& P) {
+    std::vector<ulint> e(P.size(), 0);
+    for (size_t j = 0; j < P.size(); ++j)
+        for (size_t L = j + 1; L >= 1; --L)
+            if (T.find(P.substr(j + 1 - L, L)) != std::string::npos) {
+                e[j] = static_cast<ulint>(L);
+                break;
+            }
+    return e;
+}
+
+/**
+ * ms_from_match_ends on hand examples (no match, a full match, the example
+ * of the read ACGT against a text holding CG on both strands) and on random
+ * patterns against brute force; ms_from_revcomp_query, revcomp_in_place and
+ * qual_prefers_rc on hand examples.
+ */
+void test_orient_conversion() {
+    std::cout << "Testing the conversion of reverse-complement query output to matching statistics" << std::endl;
+    auto conv = [](std::vector<ulint> e) {
+        std::vector<ulint> ms(e.size(), 99);
+        ms_from_match_ends(e.data(), e.size(), ms.data());
+        return ms;
+    };
+    using V = std::vector<ulint>;
+    assert(conv({}) == V{});
+    assert(conv({0}) == V{0});
+    assert(conv({1}) == V{1});
+    assert(conv({0, 0, 0, 0}) == (V{0, 0, 0, 0}));
+    assert(conv({1, 2, 3, 4, 5}) == (V{5, 4, 3, 2, 1}));
+    assert(conv({0, 1, 2, 0}) == (V{0, 2, 1, 0}));
+    assert(conv({1, 1, 1}) == (V{1, 1, 1}));
+    assert(conv({1, 2, 1, 2, 3}) == (V{2, 1, 3, 2, 1}));
+    assert(conv({0, 1, 0, 1, 2, 0}) == (V{0, 1, 0, 2, 1, 0}));
+    assert(naive_match_ends("CG%CG", "ACGT") == (V{0, 1, 2, 0}));
+    assert(naive_matching_statistics("CG%CG", "ACGT") == (V{0, 2, 1, 0}));
+
+    // The query on revcomp(ACGT) = ACGT gives 0 2 1 0, which reversed is E.
+    V v{0, 2, 1, 0}, scratch;
+    ms_from_revcomp_query(v, scratch);
+    assert(v == (V{0, 2, 1, 0}));
+
+    std::mt19937 rng(23);
+    size_t checked = 0;
+    for (int k = 0; k < 300; ++k) {
+        std::string T(1 + rng() % 60, 'A'), P(rng() % 40, 'A');
+        const char* alpha = k % 3 == 0 ? "AC" : "ACGT";
+        const size_t sigma = k % 3 == 0 ? 2 : 4;
+        for (auto& c : T) c = alpha[rng() % sigma];
+        for (auto& c : P) c = rng() % 10 == 0 ? 'N' : alpha[rng() % sigma];
+        const auto e = naive_match_ends(T, P);
+        assert(conv(e) == naive_matching_statistics(T, P) && "conversion must give brute-force MS");
+        checked += P.size();
+    }
+
+    std::string s = "ACGTNacgtXR";
+    revcomp_in_place(s);
+    assert(s == "RXacgtNACGT");
+    std::string q(30, 'I');
+    assert(!qual_prefers_rc(q) && !qual_prefers_rc("") && !qual_prefers_rc("5"));
+    q.back() = 'J';
+    assert(qual_prefers_rc(q));
+    q[0] = 'J';
+    assert(!qual_prefers_rc(q));
+    // Only the 20 bases at each end count: the middle of a 50-base read does not.
+    std::string mid(50, '#');
+    for (size_t i = 20; i < 30; ++i) mid[i] = 'I';
+    mid[49] = '$';
+    assert(qual_prefers_rc(mid));
+    // A read of at most 20 bases compares all its bases with themselves.
+    assert(!qual_prefers_rc("#I") && !qual_prefers_rc(std::string(19, '#') + "I"));
+    assert(qual_prefers_rc(std::string(20, '#') + "I"));
+    std::cout << "  " << checked << " random values PASSED" << std::endl;
 }
 
 /**
@@ -1161,6 +1241,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_build_spill_data_coalesce();
     std::cout << std::endl;
     test_naive_matching_statistics_known();
+    std::cout << std::endl;
+    test_orient_conversion();
     std::cout << std::endl;
     if (!test_ms_query_vs_naive_single_example(data_dir)) all_ran = false;
     std::cout << std::endl;
