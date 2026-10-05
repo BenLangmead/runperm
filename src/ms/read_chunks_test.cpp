@@ -5,8 +5,10 @@
  * that a plain line-by-line reader (Reference, below) gives, including the
  * numbering of reads given one per line.  The inputs cover FASTA, FASTQ and
  * one sequence per line, with CRLF line endings, blank lines, lower case,
- * quality strings of '@', a record longer than the blocks, and odd records
- * at the end.  Build with the address and undefined behavior sanitizers
+ * quality strings starting with '@' or '+', a record longer than the
+ * blocks, and odd records at the end.  FASTQ records are compared with
+ * their quality lines, which parse_chunk keeps when asked, and parsing
+ * without them must give the same names and sequences.  Build with the address and undefined behavior sanitizers
  * (make test-reader).
  */
 
@@ -44,7 +46,7 @@ public:
             name = header_name(pending_);
             if (!get_line(seq)) return false;
             get_line(line);  // +
-            get_line(line);  // qualities
+            if (get_line(line)) seq += "|" + line;  // qualities
             have_line_ = false;
         } else {
             name = header_name(pending_);
@@ -58,7 +60,8 @@ public:
                 seq += line;
             }
         }
-        for (auto& ch : seq) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        for (size_t i = 0; i < seq.size() && seq[i] != '|'; ++i)
+            seq[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(seq[i])));
         return true;
     }
 
@@ -88,20 +91,29 @@ static Records reference(const std::string& data) {
     return out;
 }
 
-// Splits data with ReadCutter into blocks of about `target` bytes.
+// Splits data with ReadCutter into blocks of about `target` bytes.  A FASTQ
+// record's sequence is followed by '|' and its quality line, if it has one.
 static bool cut(const std::string& data, size_t target, Records& out) {
     std::istringstream in(data);
     ReadCutter cutter(in);
     ReadBuffer buf;
     ReadChunk c;
-    std::vector<std::string> names, seqs;
+    std::vector<std::string> names, seqs, names2, seqs2, quals;
     out.clear();
     size_t numbered = 0;
     while (cutter.next(buf, c, target)) {
         if (c.format == ReadFormat::PLAIN && c.first != numbered) return false;  // reads numbered in order
-        const size_t n = parse_chunk(c, names, seqs);
+        const size_t n = parse_chunk(c, names, seqs, &quals);
+        if (parse_chunk(c, names2, seqs2) != n) return false;
         numbered += n;
-        for (size_t i = 0; i < n; ++i) out.emplace_back(names[i], seqs[i]);
+        for (size_t i = 0; i < n; ++i) {
+            if (names2[i] != names[i] || seqs2[i] != seqs[i]) return false;
+            if (c.format != ReadFormat::FASTQ && !quals[i].empty()) return false;
+            // An empty quality line and a missing one both parse as empty;
+            // only a read with bases can be told to lack one.
+            const bool has_qual = c.format == ReadFormat::FASTQ && !(quals[i].empty() && seqs[i].size() > 0);
+            out.emplace_back(names[i], has_qual ? seqs[i] + "|" + quals[i] : seqs[i]);
+        }
     }
     return true;
 }
@@ -127,7 +139,9 @@ static std::vector<std::pair<std::string, std::string>> inputs() {
         for (size_t j = 0; j < s.size(); j += w) fa += s.substr(j, w) + nl();
         if (pick(5) == 0) fa += nl();
         if (pick(5) == 0) fq += nl();
-        fq += "@q" + std::to_string(i) + " x" + nl() + s + nl() + "+" + nl() + std::string(s.size(), '@') + nl();
+        std::string q(s.size(), '@');
+        for (auto& c : q) c = "@@@+I#5"[pick(7)];
+        fq += "@q" + std::to_string(i) + " x" + nl() + s + nl() + "+" + nl() + q + nl();
         txt += s + nl();
         if (pick(5) == 0) txt += pick(2) ? nl() : nl() + nl();
     }

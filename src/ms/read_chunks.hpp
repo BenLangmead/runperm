@@ -20,7 +20,8 @@
  * - FASTA: a record is a header line and the lines up to the next line
  *   starting with '>', concatenated.
  * Names are the header after its first character, up to the first space,
- * tab or carriage return.
+ * tab or carriage return.  FASTQ quality lines are skipped unless the caller
+ * asks parse_chunk for them.
  */
 
 #ifndef _READ_CHUNKS_HPP
@@ -74,9 +75,12 @@ inline void append_upper(std::string& s, const char* b, size_t len) {
 
 /**
  * Parses the records of c into names[0 .. n) and seqs[0 .. n), reusing the
- * vectors' strings, and returns n.
+ * vectors' strings, and returns n.  If quals is given, (*quals)[0 .. n)
+ * receives the FASTQ quality lines as they are (empty for a record without
+ * one, and for every record of other formats).
  */
-inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, std::vector<std::string>& seqs) {
+inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, std::vector<std::string>& seqs,
+                          std::vector<std::string>* quals = nullptr) {
     using namespace read_chunks_detail;
     const char* p = c.data;
     const char* const end = p + c.size;
@@ -98,6 +102,10 @@ inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, s
         }
         names[n].clear();
         seqs[n].clear();
+        if (quals) {
+            if (quals->size() <= n) quals->resize(n + 1);
+            (*quals)[n].clear();
+        }
     };
     if (c.format == ReadFormat::PLAIN) {
         while (next_line()) {
@@ -119,7 +127,7 @@ inline size_t parse_chunk(const ReadChunk& c, std::vector<std::string>& names, s
             append_upper(seqs[n], lb, content_len(lb, le));
             ++n;
             next_line();  // +
-            next_line();  // qualities
+            if (next_line() && quals) (*quals)[n - 1].assign(lb, content_len(lb, le));
         }
     } else if (c.format == ReadFormat::FASTA) {
         bool have = false;
