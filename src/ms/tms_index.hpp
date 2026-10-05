@@ -86,11 +86,13 @@
 #include "orbit/common.hpp"
 #include "ms_alphabet.hpp"
 #include "mem_report.hpp"
+#include "step_stats.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <numeric>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <type_traits>
 #include <limits>
@@ -407,7 +409,11 @@ public:
     ulint get_length(ulint i) const { return lf_.get_length(i); }
     LFPos LF_step(LFPos p) { return lf_.LF(p); }
     LFPos start_LF(LFPos p) const { return lf_.start_next(p); }
-    LFPos finish_LF(LFPos p) const { return lf_.finish_next(p); }
+    LFPos finish_LF(LFPos p) const {
+        const LFPos q = lf_.finish_next(p);
+        MS_FF(FF_LF, q.interval - p.interval);
+        return q;
+    }
     void prefetch(ulint i) const { lf_.prefetch(i); }
     /** Prefetch LF rows lo to hi inclusive, lo <= hi, once per cache line. */
     void prefetch_rows(ulint lo, ulint hi) const { lf_.prefetch_rows(lo, hi); }
@@ -443,7 +449,11 @@ public:
         return next;
     }
     /** Resolve a psi point whose offset may run past its row's end. */
-    FLPos finish_psi(FLPos q) const { return lf_.finish_next(q); }
+    FLPos finish_psi(FLPos q) const {
+        const FLPos r = lf_.finish_next(q);
+        MS_FF(FF_PSI, r.interval - q.interval);
+        return r;
+    }
     FLPos resolve_psi(FLPos q) const { return finish_psi(q); }
     /**
      * One psi step on a psi point q, resolved or not: resolve it, set c to
@@ -681,6 +691,9 @@ public:
          */
         ulint step(Pos& p, ulint& lcp) const {
             ulint i = p.interval;
+#ifdef MS_STEP_STATS
+            const ulint from = i;
+#endif
             size_t row = rd_.row_start(i);
             ulint first = rd_.template get_at<START>(row);
             const ulint x = first + p.offset;
@@ -695,6 +708,7 @@ public:
                 next = rd_.template get_at<START>(row + rd_.row_width);
                 if (i == last_) next = n_;
             }
+            MS_FF((std::is_same_v<Perm, PhiInv> ? FF_PHI_INV : FF_PHI_WALK), i - from);
             const ulint off = x - first;
             ulint ptr, poff, l;
             if (span_) {
@@ -728,6 +742,27 @@ public:
     PhiInvWalker phi_inv_walker() const { return PhiInvWalker(phi_inv_, phi_inv_table_); }
 
     const LF& lf() const { return lf_; }
+    // The other structures, for development tools that read their rows
+    // directly; each is empty unless it was loaded.
+    const Phi& phi_perm() const { return phi_; }
+    const PhiLen& phi_len_perm() const { return phi_len_; }
+    const PhiInv& phi_inv_perm() const { return phi_inv_; }
+    /** Maximal runs of equal characters in LF's rows: the BWT runs. */
+    ulint bwt_runs() const { return bwt_runs_; }
+
+    /** The parts the index file at path holds, from its header.  Throws if it is not a tms index. */
+    static TmsParts held_parts(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        char magic[4] = {};
+        uint32_t v = 0, flags = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&v), sizeof(v));
+        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        if (!in.good() || std::memcmp(magic, MAGIC, 4) != 0) throw std::runtime_error("not a tms index");
+        if (v != VERSION) throw std::runtime_error("unsupported tms index version " + std::to_string(v));
+        return TmsParts{(flags & FLAG_PSI) != 0, (flags & FLAG_PHI) != 0, (flags & FLAG_PHI_INV) != 0,
+                        (flags & FLAG_PHI) != 0};
+    }
     /**
      * The alphabet code of byte c in LF's character column, or no_code if c
      * does not occur; and the code of c as an F character, its F block, or
@@ -772,11 +807,15 @@ public:
         uchar code(Row r) const { return static_cast<uchar>(lf.template get_at<chr_col>(r)); }
         /** Resolve an LF position whose offset may run past its interval's end; returns its row. */
         Row resolve_LF(LFPos& p) const {
+#ifdef MS_STEP_STATS
+            const ulint from = p.interval;
+#endif
             Row r = row(p.interval);
             for (ulint len = length(r); p.offset >= len; len = length(r)) {
                 p.offset -= len;
                 r = row(++p.interval);
             }
+            MS_FF(FF_LF, p.interval - from);
             return r;
         }
         /** start_LF of position p, resolved, whose row is r. */
@@ -808,11 +847,15 @@ public:
         }
         /** As TmsIndex::psi_step, with c the F character's code. */
         TMS_ALWAYS_INLINE FLPos psi_step(FLPos q, uchar& c) const {
+#ifdef MS_STEP_STATS
+            const ulint from = q.interval;
+#endif
             Row r = row(q.interval);
             for (ulint len = length(r); q.offset >= len; len = length(r)) {
                 q.offset -= len;
                 r = row(++q.interval);
             }
+            MS_FF(FF_PSI, q.interval - from);
             c = f_code(q.interval);
             const ulint span = lf.template get_span<chr_col>(r);
             FLPos next;

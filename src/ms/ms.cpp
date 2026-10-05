@@ -26,6 +26,7 @@
 #include "format_int.hpp"
 #include "orient.hpp"
 #include "ftab_survey.hpp"
+#include "split_report.hpp"
 #include <zlib.h>
 #include <iostream>
 #include <string>
@@ -171,6 +172,14 @@ static void usage(const char* prog) {
               << "              15), and the size of a dense table holding each k-mer's\n"
               << "              row after its cold-start walk.  --verify K checks the counts\n"
               << "              for k up to K against ms on every k-mer.\n"
+              << "  split-report INDEX_PATH [--threads T]\n"
+              << "              Development: for each move structure of an ms (MSIX) or tms\n"
+              << "              (TMSX) index, print the split parameters stored with it, its\n"
+              << "              intervals, longest interval and the length cap Orbit's length\n"
+              << "              capping implies, and its balance: how many input interval\n"
+              << "              starts lie inside each output interval, against the bound\n"
+              << "              2b - 1 that balancing factor b guarantees.  tms parts are\n"
+              << "              loaded a group at a time.\n"
               << "  tms-inspect INDEX_PATH [--phi-lengths]\n"
               << "              Print the structures' sizes and column widths.  --phi-lengths\n"
               << "              loads only LF and phi's lengths-based form.\n"
@@ -534,6 +543,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #endif
 #ifdef MS_STEP_STATS
     StepAgg step_total;
+    FFAgg ff_total;
 #endif
     auto t_all = clock::now();
     try {
@@ -566,6 +576,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #endif
 #ifdef MS_STEP_STATS
                 step_total += step_agg;
+                ff_total += ff_agg;
 #endif
             });
     } catch (const std::exception& e) {
@@ -600,6 +611,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #ifdef MS_STEP_STATS
     if (interleave == 0) step_total.print(std::cerr);
     else std::cerr << "stepstats: none recorded; steps are recorded with --interleave 0\n";
+    ff_total.print(std::cerr);
 #endif
     perf.report(std::cerr, n_bases);
     // query_s sums the threads' time in queries, parse_s their time
@@ -1067,6 +1079,17 @@ int main(int argc, char** argv) {
             if (bf != res.present[k]) return 1;
         }
         return 0;
+    }
+
+    if (cmd == "split-report") {
+        if (argc < 1) { std::cerr << "split-report requires INDEX_PATH\n"; return 1; }
+        size_t threads = 1;
+        for (int i = 1; i < argc; ++i) {
+            if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
+                threads = static_cast<size_t>(std::stoull(argv[++i]));
+            else { std::cerr << "Unknown split-report option: " << argv[i] << "\n"; return 1; }
+        }
+        return split_report::run(argv[0], resolve_thread_count(threads), std::cout);
     }
 
     if (cmd == "tms-inspect") {

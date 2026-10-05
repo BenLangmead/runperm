@@ -298,6 +298,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         if (PhiWalks && x.phi_on) {
             TMS_COUNT(phi_steps, 1);
             const PhiPos p = idx.finish_phi(x.p);
+            MS_FF((PhiStarts ? FF_PHI_STARTS : FF_PHI_LEN), p.interval - x.p.interval);
             x.phi_min = std::min(x.phi_min, idx.plcp(p));
             if (x.phi_min == 0 || --x.phi_left == 0) {
                 x.done = true;
@@ -362,7 +363,11 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     s.state = SCAN;
                 }
             } else if (s.state == PRED_POS) {
+#ifdef MS_STEP_STATS
+                const ulint from = s.ph.interval;
+#endif
                 s.ph = idx.finish_phi(s.ph);
+                MS_FF(FF_PHI_TOEHOLD, s.ph.interval - from);
                 consume(s, start_LF(s.pos));
                 advanced = true;
             } else {

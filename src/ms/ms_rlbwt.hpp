@@ -798,14 +798,24 @@ public:
     ulint get_length(Position p) const { return idx_.get_length(p); }
     uchar get_character(ulint i) { return idx_.get_character(i); }
     uchar get_character(Position p) { return idx_.get_character(p); }
-    Position LF(Position p) { return idx_.LF(p); }
+    Position LF(Position p) {
+#ifdef MS_STEP_STATS
+        return finish_LF(start_LF(p));
+#else
+        return idx_.LF(p);
+#endif
+    }
     /**
      * LF in two halves (see Orbit's start_next and finish_next):
      * finish_LF(start_LF(p)) equals LF(p), and start_LF reads only p's row,
      * so the landing row can be prefetched in between.
      */
     Position start_LF(Position p) const { return idx_.start_next(p); }
-    Position finish_LF(Position p) const { return idx_.finish_next(p); }
+    Position finish_LF(Position p) const {
+        const Position q = idx_.finish_next(p);
+        MS_FF(FF_LF, q.interval - p.interval);
+        return q;
+    }
     /** Hint that the row of interval i will be read soon. */
     void prefetch(ulint i) const { idx_.prefetch(i); }
     /** Hint that the rows of intervals lo to hi, lo <= hi, will be read soon. */
@@ -917,6 +927,9 @@ public:
         static_assert(NO_SPILL == 0, "NO_SPILL must scale to offset 0");
         return static_cast<size_t>(so) * spill_align_;
     }
+
+    /** The Orbit move structure, for development tools that read its rows directly. */
+    const IndexImpl& impl() const { return idx_; }
 
     /** Return per-column bit widths for the underlying PackedVector (length, pointer, offset, character, lcp_top, lcp_min_sub, lcp_spill). */
     const std::array<uchar, 7>& get_widths() const { return idx_.get_widths(); }
@@ -1294,6 +1307,7 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                         o -= len;
                         r = acc.row(++i);
                     }
+                    MS_FF(FF_LF, i - s.pos.interval);
                     pos.interval = i;
                     pos.offset = o;
                 } else {

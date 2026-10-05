@@ -217,6 +217,131 @@ struct StepProbe {
     ~StepProbe() { record(); }
 };
 
+/**
+ * Fast-forward lengths: for each move structure a query steps through, a
+ * histogram of how many intervals each fast-forward crosses after a move,
+ * that is, how far the landing interval lies past the one the pointer names.
+ * A move resolved with exponential search (starts-based phi) reads about
+ * 2 log2(k) + 2 interval starts to cross k intervals and a linear one k + 1,
+ * so each histogram also sums the starts an exponential search would read
+ * (exp_probes), which is the real count for starts-based phi and what it
+ * would be for the others.  Counts are kept for every move, whatever
+ * --interleave is.
+ */
+enum FFKind : int {
+    FF_LF,          // LF steps
+    FF_PSI,         // psi steps, over the same rows as LF in the psi and full layouts
+    FF_PHI_LEN,     // phi steps of matching statistics, lengths-based (linear)
+    FF_PHI_STARTS,  // phi steps of matching statistics, starts-based (exponential)
+    FF_PHI_TOEHOLD, // the phi step from a pred candidate's next row head to its tail, either form
+    FF_PHI_WALK,    // phi steps of SMEM position walks, starts-based (linear)
+    FF_PHI_INV,     // phi_inv steps of SMEM position walks, starts-based (linear)
+    FF_KINDS
+};
+
+inline const char* ff_kind_name(int k) {
+    static const char* names[] = {"lf", "psi", "phi_len", "phi_starts", "phi_toehold", "phi_walk", "phi_inv"};
+    return names[k];
+}
+
+/**
+ * The interval starts fast_forward_exponential (move_structure_impl.hpp)
+ * reads to cross k intervals, away from the table's end: one to test the
+ * next start, then the doubling probes, then the binary search.
+ */
+inline step_ulint exp_probes(step_ulint k) {
+    if (k == 0) return 1;
+    step_ulint probes = 1, hi = 1;
+    while (hi <= k) { ++probes; hi *= 2; }
+    ++probes;  // the doubling probe that fails
+    step_ulint lo = hi / 2;
+    while (lo + 1 < hi) {
+        ++probes;
+        const step_ulint mid = lo + (hi - lo) / 2;
+        if (k >= mid) lo = mid;
+        else hi = mid;
+    }
+    return probes;
+}
+
+struct FFHist {
+    // Crossings 0 to B - 1 are counted apart, longer ones in bucket B.
+    static constexpr size_t B = 1024;
+    std::array<step_ulint, B + 1> by_k{};
+    std::array<step_ulint, 64> by_probes{};
+    step_ulint moves = 0, crossed = 0, probes = 0, max = 0;
+
+    void add(step_ulint k) {
+        ++moves;
+        crossed += k;
+        max = std::max(max, k);
+        ++by_k[std::min<step_ulint>(k, B)];
+        const step_ulint p = exp_probes(k);
+        probes += p;
+        ++by_probes[std::min<step_ulint>(p, 63)];
+    }
+    FFHist& operator+=(const FFHist& o) {
+        for (size_t i = 0; i <= B; ++i) by_k[i] += o.by_k[i];
+        for (size_t i = 0; i < 64; ++i) by_probes[i] += o.by_probes[i];
+        moves += o.moves; crossed += o.crossed; probes += o.probes; max = std::max(max, o.max);
+        return *this;
+    }
+    /** The smallest k with at least fraction q of the moves crossing k or fewer. */
+    step_ulint quantile(double q) const {
+        const double want = q * double(moves);
+        step_ulint acc = 0;
+        for (size_t i = 0; i <= B; ++i) {
+            acc += by_k[i];
+            if (double(acc) >= want) return i;
+        }
+        return B;
+    }
+    step_ulint range(size_t lo, size_t hi) const {
+        step_ulint s = 0;
+        for (size_t i = lo; i <= std::min(hi, B); ++i) s += by_k[i];
+        return s;
+    }
+};
+
+struct FFAgg {
+    std::array<FFHist, FF_KINDS> h;
+    FFAgg& operator+=(const FFAgg& o) {
+        for (int k = 0; k < FF_KINDS; ++k) h[k] += o.h[k];
+        return *this;
+    }
+    /**
+     * One line per structure with moves: the mean, p50, p99 and largest
+     * crossing count, the shares crossing 0, 1, 2-3, 4-7 and 8 or more, the
+     * mean starts read by linear (k + 1) and exponential search, and then
+     * the histogram of crossings as k:count pairs.
+     */
+    void print(std::ostream& os) const {
+        for (int k = 0; k < FF_KINDS; ++k) {
+            const FFHist& x = h[k];
+            if (x.moves == 0) continue;
+            const double m = double(x.moves);
+            os << "ffstats: kind=" << ff_kind_name(k) << " moves=" << x.moves << " mean=" << double(x.crossed) / m
+               << " p50=" << x.quantile(0.5) << " p99=" << x.quantile(0.99) << " p999=" << x.quantile(0.999)
+               << " max=" << x.max << " share0=" << double(x.range(0, 0)) / m
+               << " share1=" << double(x.range(1, 1)) / m << " share2_3=" << double(x.range(2, 3)) / m
+               << " share4_7=" << double(x.range(4, 7)) / m << " share8plus=" << double(x.range(8, FFHist::B)) / m
+               << " linear_reads=" << double(x.crossed + x.moves) / m << " exp_reads=" << double(x.probes) / m
+               << "\n";
+            os << "ffhist: kind=" << ff_kind_name(k);
+            for (size_t i = 0; i <= FFHist::B; ++i)
+                if (x.by_k[i]) os << ' ' << i << (i == FFHist::B ? "+" : "") << ':' << x.by_k[i];
+            os << "\n";
+        }
+    }
+};
+
+inline thread_local FFAgg ff_agg;
+#define MS_FF(kind, k) (ff_agg.h[(kind)].add(static_cast<step_ulint>(k)))
+
 #endif /* MS_STEP_STATS */
+
+#ifndef MS_FF
+#define MS_FF(kind, k) ((void)0)
+#endif
 
 #endif /* _STEP_STATS_HPP */
