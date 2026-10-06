@@ -27,6 +27,12 @@
  *    move structure over the same rows.  LF has integrated columns per row:
  *    PSI_INT and PSI_OFF, psi's pointer and offset for the row's head, and
  *    PHI_INT and PHI_OFF, the phi point of its head row's text position.
+ *    Queries read phi points only at rows that start a BWT run: row 0, and
+ *    the candidates of a reposition, the head of the nearest run of the
+ *    wanted character below and the row after the tail of the nearest one
+ *    above.  phi's intervals start at the text positions of run heads, so
+ *    such a phi point has offset 0: PHI_INT holds the phi interval that
+ *    starts there (0 at rows that start no run), and PHI_OFF has width 0.
  *    The phi point of a tail row is one phi step from the next row's head's
  *    phi point, so a reposition reads both candidates' start points from
  *    rows its scan has already read.
@@ -258,8 +264,8 @@ private:
             lf_enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
         }
         phase("tms_lf_enc");
-        // With phi, the PHI_INT and PHI_OFF columns of each LF row.
-        orbit::packed_matrix<2> phi_cols;
+        // With phi, the PHI_INT column of each LF row (see the file comment).
+        orbit::packed_matrix<1> phi_cols;
         if (run_tops) {
             if (run_tops->size() != heads.size()) throw std::invalid_argument("run_tops must have one value per run");
             // build_phi frees LF's encoding once its walk is done, and it is
@@ -298,13 +304,11 @@ private:
             widths[col(TmsLFCols::PSI_OFF)] = orbit::bit_width(max_off);
         }
         if (has_phi_) {
-            ulint max_int = 0, max_off = 0;
-            for (size_t k = 0; k < phi_cols.size(); ++k) {
-                max_int = std::max(max_int, phi_cols.get<0>(k));
-                max_off = std::max(max_off, phi_cols.get<1>(k));
-            }
+            ulint max_int = 0;
+            for (size_t k = 0; k < phi_cols.size(); ++k) max_int = std::max(max_int, phi_cols.get<0>(k));
             widths[col(TmsLFCols::PHI_INT)] = orbit::bit_width(max_int);
-            widths[col(TmsLFCols::PHI_OFF)] = orbit::bit_width(max_off);
+            // Every phi point read has offset 0, so PHI_OFF takes no bits.
+            widths[col(TmsLFCols::PHI_OFF)] = 0;
         }
         lf_ = LF(lf_enc, widths, LF::in_place_data);
         lf_enc = Enc();
@@ -317,11 +321,8 @@ private:
             std::vector<uchar>().swap(row_heads);
         }
         if (has_phi_) {
-            for (size_t k = 0; k < phi_cols.size(); ++k) {
-                lf_.template set_data<TmsLFCols::PHI_INT>(k, phi_cols.get<0>(k));
-                lf_.template set_data<TmsLFCols::PHI_OFF>(k, phi_cols.get<1>(k));
-            }
-            phi_cols = orbit::packed_matrix<2>();
+            for (size_t k = 0; k < phi_cols.size(); ++k) lf_.template set_data<TmsLFCols::PHI_INT>(k, phi_cols.get<0>(k));
+            phi_cols = orbit::packed_matrix<1>();
         }
         phase("tms_assemble");
         if (has_phi_len_) {
@@ -1327,7 +1328,7 @@ private:
     template <typename Lens, typename Enc, typename Tops, typename Phase, typename Release>
     void build_phi(const Lens& lens, const Enc& lf_enc,
                    const Tops& run_tops, const orbit::split_params& sp, bool with_inv,
-                   orbit::packed_matrix<2>& phi_cols, Phase&& phase, Release&& release_enc) {
+                   orbit::packed_matrix<1>& phi_cols, Phase&& phase, Release&& release_enc) {
         const ulint lf_count = lf_enc.intervals();
         const ulint n = lf_enc.domain();
         // top holds 1 + the LCP at each LF interval that starts an original
@@ -1386,17 +1387,19 @@ private:
             [&](size_t x) { return top_of(order[x]); }, n, sp);
         std::vector<ulint>().swap(order);
         phase("tms_phi");
-        // Each LF row head's phi point, located with a start table; an offset
-        // into a phi interval fits phi's own offset column.
+        // The phi interval that starts at each run head's text position,
+        // located with a start table (see the file comment); rows that start
+        // no run get 0.
         phi_table_ = StartTable(phi_, start_table_shift(phi_.domain(), phi_.intervals()));
-        phi_cols = orbit::packed_matrix<2>(
-            lf_count, {orbit::bit_width(phi_.intervals() - 1), phi_.get_widths()[Phi::offset_column()]});
+        phi_cols = orbit::packed_matrix<1>(lf_count, {orbit::bit_width(phi_.intervals() - 1)});
         {
             const PhiWalker w = phi_walker();
             for (ulint k = 0; k < lf_count; ++k) {
-                const PhiPos q = w.locate(sa_head[k]);
-                phi_cols.set<0>(k, q.interval);
-                phi_cols.set<1>(k, q.offset);
+                if (!differs[k]) {
+                    phi_cols.set<0>(k, 0);
+                    continue;
+                }
+                phi_cols.set<0>(k, run_head_phi_interval(w, sa_head[k]));
             }
         }
         phi_table_ = StartTable();
@@ -1448,7 +1451,7 @@ private:
     template <typename Lens, typename Enc, typename Phase, typename Release>
     void build_phi_from_samples(const std::vector<uchar>& heads, const Lens& lens, const Enc& lf_enc,
                                 TmsPhiSamples& samples, const orbit::split_params& sp, bool with_inv,
-                                orbit::packed_matrix<2>& phi_cols, Phase&& phase, Release&& release_enc) {
+                                orbit::packed_matrix<1>& phi_cols, Phase&& phase, Release&& release_enc) {
         const ulint R = samples.size(), n = lf_enc.domain(), lf_count = lf_enc.intervals();
         if (samples.tail.size() != R || samples.top.size() != R)
             throw std::invalid_argument("phi samples must have as many tails and tops as heads");
@@ -1530,23 +1533,20 @@ private:
         }
         samples.tail = orbit::int_vector();
         samples.top = orbit::int_vector();
-        // Each run head's phi point, located with a start table; an offset
-        // into a phi interval fits phi's own offset column.
+        // The phi interval that starts at each run head's text position,
+        // located with a start table (see the file comment); rows that start
+        // no run get 0.
         phi_table_ = StartTable(phi_, start_table_shift(phi_.domain(), phi_.intervals()));
-        phi_cols = orbit::packed_matrix<2>(
-            lf_count, {orbit::bit_width(phi_.intervals() - 1), phi_.get_widths()[Phi::offset_column()]});
+        phi_cols = orbit::packed_matrix<1>(lf_count, {orbit::bit_width(phi_.intervals() - 1)});
         {
             const PhiWalker w = phi_walker();
             ulint r = 0, x = 0;
             for (ulint k = 0; k < lf_count; ++k) {
                 if (!run_start[k]) {
                     phi_cols.set<0>(k, 0);
-                    phi_cols.set<1>(k, 0);
                     continue;
                 }
-                const PhiPos q = w.locate(head[x]);
-                phi_cols.set<0>(k, q.interval);
-                phi_cols.set<1>(k, q.offset);
+                phi_cols.set<0>(k, run_head_phi_interval(w, head[x]));
                 x += heads[r] == orbit::TERMINATOR ? ulint(lens[r]) : 1;
                 ++r;
             }
@@ -1558,6 +1558,17 @@ private:
     }
 
     static constexpr ulint NOT_A_RUN_HEAD = std::numeric_limits<ulint>::max();
+
+    /**
+     * The phi interval that starts at text position x, a run head's.  Throws
+     * if none starts there: LF's phi columns store no offset (see the file
+     * comment).
+     */
+    static ulint run_head_phi_interval(const PhiWalker& w, ulint x) {
+        const PhiPos q = w.locate(x);
+        if (q.offset != 0) throw std::logic_error("no phi interval starts at a run head's text position");
+        return q.interval;
+    }
 };
 
 #endif /* _TMS_INDEX_HPP */

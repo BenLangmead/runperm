@@ -46,7 +46,7 @@ The file ends where the last section ends; `ms index-verify` checks this along w
 | 40 | u32 | CRC-32 (IEEE) of the payload |
 | 48 | (u8, u8)[12] | (column code, width) per column, in row order |
 
-Column codes: 1 len, 2 start, 3 ptr, 4 off, 5 chr, 16 psi_int, 17 psi_off, 18 phi_int, 19 phi_off, 20 plcp, 21 plcpb, 32 lcp_top, 33 lcp_min_sub, 34 lcp_spill. A width of 0 means the column takes no bits and reads as 0, as with the LF columns a tms layout omits. Column 0 says whether a move table stores lengths (`len`) or absolute starts (`start`).
+Column codes: 1 len, 2 start, 3 ptr, 4 off, 5 chr, 16 psi_int, 17 psi_off, 18 phi_int, 19 phi_off, 20 plcp, 21 plcpb, 32 lcp_top, 33 lcp_min_sub, 34 lcp_spill. A width of 0 means the column takes no bits and reads as 0, as with the LF columns a tms layout omits. Column 0 says whether a move table stores lengths (`len`) or absolute starts (`start`). In a tms LF, `phi_int` holds, at each row that starts a BWT run, the φ interval that starts at that row's text position (0 at other rows), and `phi_off` has width 0, since the φ points queries read all have offset 0. Indexes rewrapped from TMSX v8 keep the nonzero `phi_off` width their builds gave it, which loads and answers the same.
 
 Payloads:
 

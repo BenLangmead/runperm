@@ -982,7 +982,8 @@ bool test_layouts(const std::string& data_dir) {
             TmsIndex phi_built(in.heads, in.lens, phi_opts, &in.tops);
             TmsIndex phi_noinv_built(in.heads, in.lens, phi_noinv_opts, &in.tops);
             TmsIndex psi = round_trip(psi_built), phi = round_trip(phi_built), phi_noinv = round_trip(phi_noinv_built);
-            // Parts held, and LF columns of width 0 exactly where a part is missing.
+            // Parts held, and LF columns of width 0 exactly where a part is
+            // missing, and PHI_OFF, whose phi points all have offset 0.
             auto parts_are = [](const TmsIndex& x, bool a, bool b, bool c) {
                 return x.has_psi() == a && x.has_phi() == b && x.has_phi_inv() == c;
             };
@@ -994,10 +995,11 @@ bool test_layouts(const std::string& data_dir) {
             constexpr size_t PSI_INT = TmsIndex::LF::template data_column<TmsLFCols::PSI_INT>();
             for (size_t c = 0; c < fw.size(); ++c) {
                 const bool psi_col = c == PSI_INT || c == PSI_INT + 1, phi_col = c == PSI_INT + 2 || c == PSI_INT + 3;
-                assert(fw[c] > 0);
+                const bool phi_off = c == PSI_INT + 3;
+                assert((fw[c] > 0) == !phi_off);
                 // The phi layout's LF has other rows, without the union
                 // with the images, so only its zero widths are compared.
-                assert(sw[c] == (phi_col ? 0 : fw[c]) && (hw[c] == 0) == psi_col);
+                assert(sw[c] == (phi_col ? 0 : fw[c]) && (hw[c] == 0) == (psi_col || phi_off));
             }
             assert(psi.packed_access().fits() && phi.packed_access().fits());
 
@@ -1374,6 +1376,20 @@ bool test_phi_import() {
                 TmsIndex walked(t.heads, t.lens, o, &tops),
                     built(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
                 TmsIndex imported = round_trip(built);
+                // Both routes store a phi interval at each row that starts a
+                // run, 0 elsewhere, and no offsets: their LFs are the same.
+                {
+                    const auto &a = walked.lf(), &b = imported.lf();
+                    constexpr size_t phi_off = TmsIndex::LF::template data_column<TmsLFCols::PHI_OFF>();
+                    assert(a.get_widths() == b.get_widths() && a.get_widths()[phi_off] == 0);
+                    assert(a.intervals() == b.intervals());
+                    for (ulint k = 0; k < a.intervals(); ++k) {
+                        assert(a.get_length(k) == b.get_length(k));
+                        assert(a.template get<TmsLFCols::PHI_INT>(k) == b.template get<TmsLFCols::PHI_INT>(k));
+                        assert(a.template get<TmsLFCols::PSI_INT>(k) == b.template get<TmsLFCols::PSI_INT>(k));
+                        assert(a.template get<TmsLFCols::PSI_OFF>(k) == b.template get<TmsLFCols::PSI_OFF>(k));
+                    }
+                }
                 assert(imported.phi_intervals() == walked.phi_intervals());
                 assert(imported.phi_inv_intervals() == walked.phi_inv_intervals());
                 check_phi_against(imported, t.sa, t.isa, t.lcp);
