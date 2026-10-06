@@ -50,12 +50,13 @@ enum class TmsReport {
  * or without positions, and then a report, read.  Positions and SMEM reports
  * need the toehold's text position, which phi's starts-based form gives;
  * matching statistics alone walk the narrower lengths-based form.  Walking
- * the rows of an SMEM for SMEM_ALL needs phi_inv.
+ * the rows of an SMEM for SMEM_ALL needs phi_inv.  ORACLE reads LF alone
+ * for matching statistics.
  */
 inline TmsParts tms_query_parts(TmsMode mode, bool positions, TmsReport report) {
     TmsParts p;
-    p.psi = mode != TmsMode::PHI;
-    p.phi = mode != TmsMode::PSI || positions || report != TmsReport::MS;
+    p.psi = mode != TmsMode::PHI && mode != TmsMode::ORACLE;
+    p.phi = (mode != TmsMode::PSI && mode != TmsMode::ORACLE) || positions || report != TmsReport::MS;
     p.phi_inv = report == TmsReport::SMEM_ALL;
     p.phi_starts = positions || report != TmsReport::MS;
     return p;

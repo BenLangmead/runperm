@@ -60,7 +60,7 @@ This section describes the current `ms` binary, not the format.
 
 - **Orbit-ms:** every query loads every section.
 - **Orbit-tms:** a query always loads LF, whole, with every column the layout keeps (`TmsIndex::sections_for`). It then adds:
-  - **F_STARTS** if the query walks psi;
+  - **F_STARTS** if the query walks psi (not in the oracle mode, which computes no LCE);
   - **PHI_START** if it needs text positions (`--positions`, an SMEM report, or `--phi-starts`), or else **PHI_LEN** if it walks phi;
   - **PHI_INV** for `--report smem-all`. In that case it also builds a start table for PHI_START and for PHI_INV. Each has `((domain - 1) >> shift) + 2` entries of `max(1, bit_width(rows - 1))` bits, where `shift` is the smallest with `2^shift * rows >= 4 * domain`, computed from the section's entry.
 
@@ -71,7 +71,9 @@ This section describes the current `ms` binary, not the format.
 | `--mode phi` with `--phi-starts`, `--positions` or `--report smem-one` | LF, PHI_START |
 | `--mode phiskip` or `dual` | LF, F_STARTS, PHI_LEN |
 | psi with `--positions` or `--report smem-one`; phiskip or dual with those or `--phi-starts` | LF, F_STARTS, PHI_START |
-| `--report smem-all` | LF, PHI_START, PHI_INV, plus F_STARTS outside phi mode |
+| `--mode oracle` (replaying recorded repositions) | LF |
+| `--mode oracle` with `--positions` or `--report smem-one` | LF, PHI_START |
+| `--report smem-all` | LF, PHI_START, PHI_INV, plus F_STARTS outside phi and oracle modes |
 
 `ms index-plan INDEX` prints, for the index at hand, the sections and start tables each `tms-batch` command line loads and the RAM they take.
 

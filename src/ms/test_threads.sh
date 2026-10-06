@@ -159,4 +159,31 @@ $M tms-batch mini.tms m.fa -o o.out --orient rc --mode phi --positions 2> /dev/n
 $M tms-batch mini.tms m.fa -o o.out --orient rc --report smem-one 2> /dev/null && { echo "orient rc accepted an SMEM report"; fails=$((fails + 1)); }
 echo "checked orientation"
 
+# The oracle mode: outcomes recorded in any mode, with any K, T and B, are
+# the same file, and replaying it with any K, T and B gives the recording
+# modes' output, with and without positions, as does recording and replaying
+# the reverse complements with --orient rc.
+$M tms-batch mini.tms reads.fa -o ref.out --oracle-write ref.orc 2> err.txt || { echo "failed: oracle-write"; cat err.txt; exit 1; }
+$M tms-batch mini.tms reads.fa -o ref.pos --mode phi --positions 2> /dev/null
+for rec in "psi 0 1 1000" "phi 7 3 13" "dual 32 8 1" "phiskip 1 17 13"; do
+    set -- $rec
+    $M tms-batch mini.tms reads.fa -o o.out --mode $1 --interleave $2 --threads $3 --block-reads $4 --oracle-write o.orc 2> /dev/null
+    cmp -s ref.orc o.orc || { echo "oracle differs: recorded with $rec"; fails=$((fails + 1)); }
+    cmp -s ref.out o.out || { echo "differs: recording with $rec"; fails=$((fails + 1)); }
+done
+for k in 0 1 7 32; do for t in 1 3 8; do for b in 1 13 1000; do
+    $M tms-batch mini.tms reads.fa -o o.out --mode oracle --oracle ref.orc --interleave $k --threads $t --block-reads $b 2> err.txt \
+        || { echo "failed: oracle k=$k t=$t b=$b"; cat err.txt; fails=$((fails + 1)); continue; }
+    cmp -s ref.out o.out || { echo "differs: oracle k=$k t=$t b=$b"; fails=$((fails + 1)); }
+    $M tms-batch mini.tms reads.fa -o o.out --mode oracle --positions --oracle ref.orc --interleave $k --threads $t --block-reads $b 2> /dev/null
+    cmp -s ref.pos o.out || { echo "differs: oracle --positions k=$k t=$t b=$b"; fails=$((fails + 1)); }
+done; done; done
+$M tms-batch mini.tms reads.fa -o ref.rc --mode dual --orient rc --oracle-write rc.orc 2> /dev/null
+$M tms-batch mini.tms reads.fa -o o.out --mode oracle --orient rc --oracle rc.orc --threads 3 --block-reads 13 2> /dev/null
+cmp -s ref.rc o.out || { echo "differs: oracle --orient rc"; fails=$((fails + 1)); }
+# Refused: the oracle mode without an oracle, an oracle for other reads.
+$M tms-batch mini.tms reads.fa -o o.out --mode oracle 2> /dev/null && { echo "oracle mode accepted no oracle"; fails=$((fails + 1)); }
+$M tms-batch mini.tms m.fa -o o.out --mode oracle --oracle ref.orc 2> /dev/null && { echo "oracle accepted other reads"; fails=$((fails + 1)); }
+echo "checked oracle"
+
 if [ $fails -eq 0 ]; then echo "All thread checks PASSED"; else echo "$fails thread checks FAILED"; exit 1; fi

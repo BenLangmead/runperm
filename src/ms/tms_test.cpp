@@ -960,6 +960,119 @@ bool throws(F f, const char* what) {
 }  // namespace
 
 /**
+ * The oracle mode: reposition outcomes recorded by every other mode, for
+ * several numbers of patterns in flight, are the same, and replaying them
+ * in the oracle mode, with any number in flight, packed or column access,
+ * with and without positions, through a file and on an index loaded with LF
+ * alone, gives the lengths and positions of the other modes.  Replays that
+ * do not fit the query are refused.
+ */
+bool test_tms_oracle(const std::string& data_dir) {
+    std::cout << "Testing the oracle mode against the recording modes" << std::endl;
+    std::mt19937 rng(53);
+    const auto inputs = batch_inputs(data_dir, rng);
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    size_t replays = 0, decisions = 0;
+    for (const auto& in : inputs) {
+        auto pats = fuzz_patterns(in.text, rng, in.text.size() > 5000 ? 80 : 150);
+        for (const auto& o : {split_variants()[0], split_variants()[3]}) {
+            TmsIndex idx(in.heads, in.lens, o, &in.tops);
+            std::vector<std::vector<ulint>> want, want_pos;
+            tms_query_batch(idx, pats, 8, want, TmsMode::PSI, &want_pos);
+            std::vector<std::vector<TmsDecision>> first;
+            for (TmsMode mode : modes)
+                for (size_t k : {1, 3, 32}) {
+                    std::vector<std::vector<ulint>> len;
+                    std::vector<std::vector<TmsDecision>> rec;
+                    tms_query_batch(idx, pats, k, len, mode, nullptr, true, nullptr, nullptr, &rec);
+                    assert(len == want);
+                    assert(rec.size() == pats.size());
+                    if (first.empty()) first = rec;
+                    for (size_t j = 0; j < rec.size(); ++j) {
+                        if (rec[j].size() != first[j].size()) {
+                            std::cout << "  FAILED: recorded outcomes differ in mode " << int(mode) << ", k " << k
+                                      << std::endl;
+                            assert(false && "recorded outcomes must not depend on mode or k");
+                            return false;
+                        }
+                        for (size_t i = 0; i < rec[j].size(); ++i)
+                            assert(rec[j][i].interval == first[j][i].interval && rec[j][i].len == first[j][i].len);
+                    }
+                }
+            TmsOracle oracle;
+            oracle.move_runs = idx.move_runs();
+            oracle.append(first);
+            decisions += oracle.decisions.size();
+            // Through the file format.
+            std::stringstream file;
+            oracle.write(file);
+            TmsOracle read;
+            read.read(file);
+            assert(read.move_runs == oracle.move_runs && read.offsets == oracle.offsets);
+            assert(read.decisions.size() == oracle.decisions.size());
+            const TmsParts lf_need = tms_query_parts(TmsMode::ORACLE, false, TmsReport::MS);
+            const TmsParts pos_need = tms_query_parts(TmsMode::ORACLE, true, TmsReport::MS);
+            assert(!lf_need.psi && !lf_need.phi && !pos_need.psi && pos_need.phi && pos_need.phi_starts);
+            TmsIndex lf_only = round_trip(idx, &lf_need), with_pos = round_trip(idx, &pos_need);
+            assert(!lf_only.has_psi() && !lf_only.has_phi());
+            for (size_t k : {1, 2, 3, 32, 1000})
+                for (int access = 0; access < 4; ++access) {
+                    const bool packed = access < 2, positions = access % 2 == 1;
+                    // Replay a slice of the patterns too, as a block of reads does.
+                    const size_t first_pat = k == 3 ? pats.size() / 3 : 0;
+                    const std::vector<std::string> sub(pats.begin() + first_pat, pats.end());
+                    const TmsOracleView view = TmsOracleView::of(read, first_pat, sub.size());
+                    std::vector<std::vector<ulint>> len, pos;
+                    tms_query_batch(positions ? with_pos : lf_only, sub, k, len, TmsMode::ORACLE,
+                                    positions ? &pos : nullptr, packed, nullptr, &view);
+                    bool ok = len.size() == sub.size();
+                    for (size_t j = 0; ok && j < sub.size(); ++j) {
+                        ok = len[j] == want[first_pat + j];
+                        if (ok && positions) ok = pos[j] == want_pos[first_pat + j];
+                    }
+                    if (!ok) {
+                        std::cout << "  FAILED replay: k " << k << ", packed " << packed << ", positions " << positions
+                                  << std::endl;
+                        assert(false && "the oracle mode must give the other modes' output");
+                        return false;
+                    }
+                    ++replays;
+                }
+            // Refusals: no oracle, an oracle for other intervals, and too few
+            // or too many outcomes for a pattern.
+            std::vector<std::vector<ulint>> len;
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(lf_only, pats, 8, len, TmsMode::ORACLE); },
+                                                 "replay"));
+            TmsOracleView bad = TmsOracleView::of(read, 0, pats.size());
+            bad.move_runs += 1;
+            assert(throws<std::invalid_argument>(
+                [&] { tms_query_batch(lf_only, pats, 8, len, TmsMode::ORACLE, nullptr, true, nullptr, &bad); }, "LF intervals"));
+            size_t with_rep = 0;
+            while (with_rep < pats.size() && first[with_rep].empty()) ++with_rep;
+            if (with_rep < pats.size()) {
+                // A pattern's outcomes without its last one, and with its
+                // last one twice.
+                const std::vector<std::string> one{pats[with_rep]};
+                TmsOracle fewer, more;
+                fewer.move_runs = more.move_runs = read.move_runs;
+                fewer.append({std::vector<TmsDecision>(first[with_rep].begin(), first[with_rep].end() - 1)});
+                auto extra = first[with_rep];
+                extra.push_back(extra.back());
+                more.append({extra});
+                const TmsOracleView fv = TmsOracleView::of(fewer, 0, 1), mv = TmsOracleView::of(more, 0, 1);
+                assert(throws<std::runtime_error>(
+                    [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE, nullptr, true, nullptr, &fv); }, "fewer"));
+                assert(throws<std::runtime_error>(
+                    [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE, nullptr, true, nullptr, &mv); }, "more"));
+            }
+            assert(throws<std::runtime_error>([&] { TmsOracleView::of(read, 1, pats.size()); }, "fewer patterns"));
+        }
+    }
+    std::cout << "  " << decisions << " recorded repositions and " << replays << " replays PASSED" << std::endl;
+    return true;
+}
+
+/**
  * Indexes built with the psi and phi layouts, and full indexes loaded with
  * only the parts a query needs, give the same output as the full index for
  * every query they can serve, with packed and column access and several
@@ -1563,6 +1676,13 @@ size_t check_tms_with_ftab(TmsIndex& idx, const std::vector<std::string>& pats, 
                 ++checked;
             }
     }
+    // Recording takes no table, which skips some of the repositions.
+    if (idx.has_psi()) {
+        std::vector<std::vector<ulint>> got;
+        std::vector<std::vector<TmsDecision>> rec;
+        assert(throws<std::invalid_argument>(
+            [&] { tms_query_batch(idx, pats, 8, got, TmsMode::PSI, nullptr, true, &ft, nullptr, &rec); }, "ftab"));
+    }
     return checked;
 }
 
@@ -1850,6 +1970,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_smem_report(data_dir);
     std::cout << std::endl;
     test_layouts(data_dir);
+    std::cout << std::endl;
+    test_tms_oracle(data_dir);
     std::cout << std::endl;
     test_lf_rows(data_dir);
     std::cout << std::endl;

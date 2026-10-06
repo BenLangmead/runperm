@@ -31,6 +31,8 @@
 #include "ftab_file.hpp"
 #include <zlib.h>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <string>
 #include <cstring>
 #include <cstdlib>
@@ -153,10 +155,11 @@ static void usage(const char* prog) {
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
-              << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
+              << "            [--mode psi|phi|phiskip|dual|oracle] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
               << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
               << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
+              << "            [--oracle-write FILE | --oracle FILE]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
               << "              the others need phi).  Only the index's structures that the\n"
@@ -180,6 +183,20 @@ static void usage(const char* prog) {
               << "              loads its starts-based form instead, as positions and SMEM\n"
               << "              reports do.  Results do not depend on the mode, K or\n"
               << "              --phi-starts.\n"
+              << "              --oracle-write FILE (with any mode but oracle) records every\n"
+              << "              reposition's outcome, and --mode oracle --oracle FILE replays\n"
+              << "              them: on a mismatch it moves to the recorded row and length\n"
+              << "              without scanning for the candidates or computing an LCE, so it\n"
+              << "              reads only LF (and phi with --positions or an SMEM report).  It\n"
+              << "              is a lower bound on the time of the other modes, and its output\n"
+              << "              is theirs.  Replay needs the same reads, in the same order, and\n"
+              << "              an index with the same LF intervals (the same build and layout);\n"
+              << "              it does not depend on K, T or B.  FILE holds u64s, little-endian:\n"
+              << "              the magic \"TMSORC01\" (8 bytes), the index's LF interval count,\n"
+              << "              the read count R, the reposition count D, R per-read reposition\n"
+              << "              counts in input order, then D (interval, length) pairs: the LF\n"
+              << "              interval moved to (its tail row if above the current interval,\n"
+              << "              else its head row) and the match length before the LF step.\n"
               << "  tms-text   INDEX_PATH\n"
               << "              Print the indexed text, read back with LF.  For a string\n"
               << "              collection (one terminator per string, as in an FMD), print\n"
@@ -290,6 +307,7 @@ struct QueryResults {
     std::vector<std::vector<ulint>> ms;
     std::vector<std::vector<ulint>> pos;  // tms positions, with --positions or an SMEM report
     std::vector<TmsSmemHits> hits;        // tms SMEMs, with an SMEM report
+    std::vector<std::vector<TmsDecision>> decisions;  // tms reposition outcomes, with --oracle-write
 };
 
 // The ftab built at index load with --ftab, or null.
@@ -297,12 +315,12 @@ static const ftab::Ftab* g_ftab = nullptr;
 
 // Results of one read go to slot 0 of r.  With an ftab, the batched engine
 // with one read, since ms_query takes no table.
-static void query_one(MSIndexSpillLCP<false>& idx, const std::string& s, QueryResults& r) {
+static void query_one(MSIndexSpillLCP<false>& idx, const std::string& s, QueryResults& r, size_t) {
     if (g_ftab) return ms_query_batch(idx, {s}, 1, r.ms, g_ftab);
     r.ms.resize(1);
     r.ms[0] = ms_query(idx, s);
 }
-static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::string>& p, size_t k, QueryResults& r) {
+static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t) {
     ms_query_batch(idx, p, k, r.ms, g_ftab);
 }
 // tms-batch settings, from its command line.  They are read-only once the
@@ -313,25 +331,35 @@ static bool g_tms_phi_starts = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
 static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
+// With --oracle-write, each query records its reposition outcomes; with
+// --mode oracle, they are replayed from g_tms_oracle, read from --oracle.
+static bool g_tms_record = false;
+static TmsOracle g_tms_oracle;
 
 // With an SMEM report, the SMEMs are found as part of the query.  smem_k
 // walks are in flight when smem-all lists positions (0 lists them one SMEM
-// at a time).
-static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t smem_k) {
+// at a time).  first_read is the index of p[0] among all the reads, which
+// says where its recorded repositions are in the oracle mode.
+static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t smem_k,
+                       size_t first_read) {
     const bool smems = g_tms_report != TmsReport::MS;
-    tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr, true, g_ftab);
+    TmsOracleView view{};
+    const bool replay = g_tms_mode == TmsMode::ORACLE;
+    if (replay) view = TmsOracleView::of(g_tms_oracle, first_read, p.size());
+    tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr, true, g_ftab,
+                    replay ? &view : nullptr, g_tms_record ? &r.decisions : nullptr);
     if (!smems) return;
     tms_report_smems_batch(idx, r.ms, r.pos, g_tms_min_smem_len, g_tms_report, smem_k, r.hits,
                            g_tms_max_smem_positions);
 }
-static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r) {
-    query_many(idx, p, k, r, k);
+static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t first_read) {
+    query_many(idx, p, k, r, k, first_read);
 }
 // One read at a time runs the batched engine with one read: it is faster
 // than tms_query, the plain psi reference, whereas ms_query is as fast as
 // ms's engine with one read.  smem-all lists positions one SMEM at a time.
-static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r) {
-    query_many(idx, {s}, 1, r, 0);
+static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r, size_t first_read) {
+    query_many(idx, {s}, 1, r, 0, first_read);
 }
 
 /**
@@ -349,6 +377,7 @@ static int tms_query_flag(int argc, char** argv, int& i) {
         else if (m == "phi") g_tms_mode = TmsMode::PHI;
         else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
         else if (m == "dual") g_tms_mode = TmsMode::DUAL;
+        else if (m == "oracle") g_tms_mode = TmsMode::ORACLE;
         else { std::cerr << "Unknown mode: " << m << "\n"; return -1; }
     }
     else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
@@ -412,6 +441,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     size_t interleave = 32, threads = 1, block_reads = 0, block_bytes = 0;
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
+    std::string oracle_path, oracle_write_path;
     int q = 0;
     unsigned ftab_k = 0;  // 0: no ftab built at load
     std::string ftab_path;  // a stored ftab to load
@@ -445,6 +475,10 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
             g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--oracle") == 0 && i + 1 < argc)
+            oracle_path = argv[++i];
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--oracle-write") == 0 && i + 1 < argc)
+            oracle_write_path = argv[++i];
         else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
     }
     // Positions found on the reverse complement would have to be mirrored
@@ -483,6 +517,23 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             return 1;
         }
     }
+    const bool oracle_mode = std::is_same_v<Index, TmsIndex> && g_tms_mode == TmsMode::ORACLE;
+    if (oracle_mode != !oracle_path.empty()) {
+        std::cerr << "--mode oracle and --oracle FILE go together\n";
+        return 1;
+    }
+    if (oracle_mode && !oracle_write_path.empty()) {
+        std::cerr << "--oracle-write records with another mode; the oracle mode replays\n";
+        return 1;
+    }
+    if ((oracle_mode || !oracle_write_path.empty()) && (ftab_k > 0 || !ftab_path.empty())) {
+        std::cerr << "--oracle and --oracle-write take no ftab, which skips some repositions\n";
+        return 1;
+    }
+    g_tms_record = !oracle_write_path.empty();
+    // The oracle's reads are numbered across the whole input, so blocks are
+    // parsed as they are read, in order, to number them.
+    const bool number_reads = oracle_mode || g_tms_record;
     threads = resolve_thread_count(threads);
     // Output named *.gz is gzip-compressed, each block as a gzip member by
     // the thread that formats it; members written one after another form one
@@ -501,6 +552,21 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         return 1;
     }
     Index& idx = *opt;
+    if (oracle_mode) {
+        std::ifstream oin(oracle_path, std::ios::binary);
+        if (!oin.good()) { std::cerr << "Failed to open oracle: " << oracle_path << "\n"; return 1; }
+        try {
+            g_tms_oracle.read(oin);
+        } catch (const std::exception& e) {
+            std::cerr << oracle_path << ": " << e.what() << "\n";
+            return 1;
+        }
+    }
+    std::ofstream oracle_out;
+    if (g_tms_record) {
+        oracle_out.open(oracle_write_path, std::ios::binary);
+        if (!oracle_out.good()) { std::cerr << "Failed to open oracle output: " << oracle_write_path << "\n"; return 1; }
+    }
     const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
     // The ftab is loaded, or built on every CPU, after the index, and is
     // interleaved over the memory nodes as the index is.
@@ -569,7 +635,27 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         ReadBuffer buf;
         ReadChunk chunk;
         std::vector<std::string> names, seqs, quals;
+        bool parsed = false;    // names, seqs and quals hold the chunk's reads
+        size_t first_read = 0;  // with number_reads, the index of the block's first read
     };
+    // Parse a block's reads, timed into *parse_s.
+    auto parse_block = [&](Block& b, double* parse_s) {
+        auto tp = clock::now();
+        if (orient == ReadOrient::QUAL && b.chunk.format != ReadFormat::FASTQ)
+            throw std::runtime_error("--orient qual needs FASTQ input, for its base qualities");
+        const size_t n =
+            parse_chunk(b.chunk, b.names, b.seqs, orient == ReadOrient::QUAL ? &b.quals : nullptr);
+        b.names.resize(n);
+        b.seqs.resize(n);
+        b.parsed = true;
+        *parse_s += std::chrono::duration<double>(clock::now() - tp).count();
+    };
+    // With --oracle-write, each block's recorded repositions, by its first
+    // read, until they are written in order at the end.
+    std::mutex record_mu;
+    std::map<size_t, TmsOracle> recorded;
+    size_t reads_numbered = 0;
+    double numbering_parse_s = 0.0;
     // With --positions, a tab-separated field holds the positions (-1 for
     // none); with an SMEM report, a last one holds the SMEMs.
     auto format = [&](std::string& text, const std::string& nm, const QueryResults& r, size_t j) {
@@ -609,14 +695,9 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         void process(Block& b, std::string& text) { body(*this, b, text); }
     };
     auto body = [&](Worker& w, Block& b, std::string& text) {
-        auto tp = clock::now();
-        if (orient == ReadOrient::QUAL && b.chunk.format != ReadFormat::FASTQ)
-            throw std::runtime_error("--orient qual needs FASTQ input, for its base qualities");
-        const size_t n =
-            parse_chunk(b.chunk, b.names, b.seqs, orient == ReadOrient::QUAL ? &b.quals : nullptr);
-        b.names.resize(n);
-        b.seqs.resize(n);
-        w.parse_s += std::chrono::duration<double>(clock::now() - tp).count();
+        if (!b.parsed) parse_block(b, &w.parse_s);
+        b.parsed = false;
+        const size_t n = b.seqs.size();
         w.reads += n;
         for (const auto& sq : b.seqs) w.bases += sq.size();
         seen_records.fetch_add(n, std::memory_order_relaxed);
@@ -642,9 +723,11 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             const size_t n_reads = b.seqs.size();
             timed([&] {
                 w.r.ms.resize(n_reads);
+                if (g_tms_record) w.r.decisions.resize(n_reads);
                 for (size_t j = 0; j < n_reads; ++j) {
-                    query_one(idx, b.seqs[j], w.one);
+                    query_one(idx, b.seqs[j], w.one, b.first_read + j);
                     w.r.ms[j] = std::move(w.one.ms[0]);
+                    if (g_tms_record) w.r.decisions[j] = std::move(w.one.decisions[0]);
                     if (!w.one.pos.empty()) {
                         w.r.pos.resize(n_reads);
                         w.r.pos[j] = std::move(w.one.pos[0]);
@@ -656,7 +739,13 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
                 }
             });
         } else {
-            timed([&] { query_many(idx, b.seqs, interleave, w.r); });
+            timed([&] { query_many(idx, b.seqs, interleave, w.r, b.first_read); });
+        }
+        if (g_tms_record) {
+            TmsOracle part;
+            part.append(w.r.decisions);
+            std::lock_guard<std::mutex> lk(record_mu);
+            recorded.emplace(b.first_read, std::move(part));
         }
         if (oriented) {
             auto to = clock::now();
@@ -695,6 +784,12 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
                 auto tr = clock::now();
                 const bool got = cutter.next(b.buf, b.chunk, target_bytes());
                 read_s += std::chrono::duration<double>(clock::now() - tr).count();
+                // Called under the input lock, in input order.
+                if (got && number_reads) {
+                    parse_block(b, &numbering_parse_s);
+                    b.first_read = reads_numbered;
+                    reads_numbered += b.seqs.size();
+                }
                 return got;
             },
             [&](const std::string& text) {
@@ -726,6 +821,32 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     }
     out->flush();
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
+    parse_s += numbering_parse_s;
+    if (oracle_mode && reads_numbered != g_tms_oracle.patterns()) {
+        std::cerr << "batch: the oracle holds " << g_tms_oracle.patterns() << " reads but the input has "
+                  << reads_numbered << "\n";
+        return 1;
+    }
+    if (g_tms_record) {
+        if constexpr (std::is_same_v<Index, TmsIndex>) {
+            TmsOracle all;
+            all.move_runs = idx.move_runs();
+            for (const auto& [first, part] : recorded) {
+                for (size_t j = 0; j < part.patterns(); ++j)
+                    all.offsets.push_back(all.offsets.back() + part.offsets[j + 1] - part.offsets[j]);
+                all.decisions.insert(all.decisions.end(), part.decisions.begin(), part.decisions.end());
+            }
+            try {
+                all.write(oracle_out);
+                oracle_out.close();
+            } catch (const std::exception& e) {
+                std::cerr << "batch: " << e.what() << "\n";
+                return 1;
+            }
+            std::cerr << "oracle: reads=" << all.patterns() << " repositions=" << all.decisions.size()
+                      << " bytes=" << 32 + 8 * all.patterns() + 16 * all.decisions.size() << "\n";
+        }
+    }
 #ifdef TMS_STATS
     {
         const TmsStats& tms_stats = tms_total;
@@ -1392,8 +1513,8 @@ int main(int argc, char** argv) {
             os << "  = " << mb(total);
             return os.str();
         };
-        const char* modes[] = {"psi", "phi", "phiskip", "dual"};
-        const TmsMode mode_of[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+        const char* modes[] = {"psi", "phi", "phiskip", "dual", "oracle"};
+        const TmsMode mode_of[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL, TmsMode::ORACLE};
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
         if (query) {
@@ -1404,7 +1525,7 @@ int main(int argc, char** argv) {
         }
         std::vector<std::string> names, plans;
         std::vector<std::string> rows;
-        for (int m = 0; m < 4; ++m)
+        for (int m = 0; m < 5; ++m)
             for (int r = 0; r < 3; ++r)
                 for (int pos = 0; pos < 2; ++pos)
                     for (int ps = 0; ps < 2; ++ps) {
