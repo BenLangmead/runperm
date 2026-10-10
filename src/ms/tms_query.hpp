@@ -18,6 +18,7 @@
 
 #include "tms_index.hpp"
 #include "step_stats.hpp"
+#include "ftab.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -176,12 +177,15 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * (TMS_NO_POS with a statistic of 0).  PHI, PHISKIP, DUAL and positions need
  * an index with phi, and PSI, PHISKIP and DUAL one with psi.  PhiStarts
  * says which form of phi the walks and the toehold use; positions need the
- * starts-based form.
+ * starts-based form.  With an ftab (ftab.hpp) built for idx, a pattern
+ * whose last k-mer occurs starts from the table's state, k steps in; a
+ * mode that walks phi, or positions, needs a table with a toehold, and
+ * positions need its window positions.
  */
 template <TmsMode Mode, bool Positions, bool PhiStarts, class Access>
 inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vector<std::string>& patterns, size_t k,
                                  std::vector<std::vector<ulint>>& out_len,
-                                 std::vector<std::vector<ulint>>* out_pos) {
+                                 std::vector<std::vector<ulint>>* out_pos, const ftab::Ftab* ft = nullptr) {
     using LFPos = TmsIndex::LFPos;
     using FLPos = TmsIndex::FLPos;
     using PhiPos = TmsIndex::PhiPosOf<PhiStarts>;
@@ -238,6 +242,15 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     if constexpr (Toehold) init_ph = idx.resolve_phi(idx.template phi_at_head<PhiStarts>(0));
     std::vector<Slot> slots(k);
     size_t next = 0;
+    // With an ftab, each pattern's key, and how many patterns ahead of the
+    // one starting its table entry is prefetched.
+    std::vector<uint64_t> keys;
+    const size_t ahead = k;
+    if (ft) {
+        keys.resize(patterns.size());
+        for (size_t j = 0; j < patterns.size(); ++j) keys[j] = ft->key(patterns[j].data(), patterns[j].size());
+        for (size_t j = 0; j < std::min(ahead, patterns.size()); ++j) ft->prefetch(keys[j]);
+    }
 #ifdef MS_STEP_STATS
     // Steps are recorded only with one pattern in flight, so that each
     // visit's time belongs to one step.
@@ -258,6 +271,33 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
             s.pos = idx.first();
             s.ph = init_ph;
             s.state = STEP;
+            if (ft) {
+                if (j + ahead < patterns.size()) ft->prefetch(keys[j + ahead]);
+                ftab::Entry e;
+                if (ft->lookup(keys[j], e)) {
+                    const unsigned kk = ft->k();
+                    const size_t m = patterns[j].size();
+                    for (unsigned d = 0; d < kk; ++d) out_len[j][m - 1 - d] = d + 1;
+                    if constexpr (Toehold) {
+                        s.ph.interval = e.toehold_interval;
+                        s.ph.offset = e.toehold_offset;
+                        if constexpr (PhiStarts) s.ph.idx = idx.phi_start(e.toehold_interval) + e.toehold_offset;
+                    }
+                    if constexpr (Positions) {
+                        // The window's positions are those the walk over
+                        // each suffix of the k-mer ends on.
+                        for (unsigned d = 0; d + 1 < kk; ++d) s.ms_pos[m - 1 - d] = ft->window(d + 1, keys[j]);
+                        s.ms_pos[m - kk] = s.ph.idx;
+                    }
+                    if (m == kk) continue;
+                    s.pos.interval = e.interval;
+                    s.pos.offset = e.offset;
+                    s.len = kk;
+                    s.i = m - kk;
+                    acc.prefetch(e.interval);
+                    if constexpr (Toehold) idx.template prefetch_phi<PhiStarts>(s.ph.interval);
+                }
+            }
 #ifdef MS_STEP_STATS
             s.m = patterns[j].size();
             if (record_steps) step_rec.begin(s.pat, s.m, out_len[j].data());
@@ -517,20 +557,24 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
 inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patterns, size_t k,
                             std::vector<std::vector<ulint>>& out_len,
                             TmsMode mode = TmsMode::PSI, std::vector<std::vector<ulint>>* out_pos = nullptr,
-                            bool packed = true) {
+                            bool packed = true, const ftab::Ftab* ft = nullptr) {
     if ((mode != TmsMode::PSI || out_pos) && !idx.has_phi())
         throw std::invalid_argument("this mode or positions need an index built with phi");
     if (out_pos && !idx.has_phi_starts())
         throw std::invalid_argument("positions need phi's starts-based form, which this index was loaded without");
     if (mode != TmsMode::PHI && !idx.has_psi()) throw std::invalid_argument("this mode needs an index with psi");
+    if (ft && (mode != TmsMode::PSI || out_pos) && !ft->has_toehold())
+        throw std::invalid_argument("this mode or positions need an ftab with a toehold");
+    if (ft && out_pos && !ft->has_window()) throw std::invalid_argument("positions need an ftab with window positions");
     auto run = [&](auto m) {
         constexpr TmsMode M = decltype(m)::value;
         auto with = [&](const auto acc) {
             // Without positions, phi's lengths-based form when present: its
             // rows are narrower.
-            if (out_pos) tms_query_batch_impl<M, true, true>(idx, acc, patterns, k, out_len, out_pos);
-            else if (idx.has_phi_lengths()) tms_query_batch_impl<M, false, false>(idx, acc, patterns, k, out_len, nullptr);
-            else tms_query_batch_impl<M, false, true>(idx, acc, patterns, k, out_len, nullptr);
+            if (out_pos) tms_query_batch_impl<M, true, true>(idx, acc, patterns, k, out_len, out_pos, ft);
+            else if (idx.has_phi_lengths())
+                tms_query_batch_impl<M, false, false>(idx, acc, patterns, k, out_len, nullptr, ft);
+            else tms_query_batch_impl<M, false, true>(idx, acc, patterns, k, out_len, nullptr, ft);
         };
         const TmsIndex::PackedAccess pa = idx.packed_access();
         if (packed && pa.fits()) with(pa);

@@ -6,6 +6,7 @@
  */
 
 #include "ms_test.hpp"
+#include "ftab_build.hpp"
 #include "ms_rlbwt.hpp"
 #include "ms_io.hpp"
 #include "serialize.hpp"
@@ -765,11 +766,21 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
     }
     std::vector<std::vector<ulint>> want;
     for (const auto& P : patterns) want.push_back(ms_query(*idx, P));
+    // Tables of several k, built on one thread and on several.
+    std::vector<ftab::Ftab> tabs;
+    for (unsigned fk : {1u, 3u, 6u, 10u}) tabs.push_back(ftab::build_ms(*idx, fk, fk % 2 ? 3 : 1).tab);
     for (size_t k : {1, 2, 3, 4, 7, 16, 64, 1000}) {
         std::vector<std::vector<ulint>> got, got_narrow;
         ms_query_batch(*idx, patterns, k, got);
         ms_query_batch_impl(*idx, idx->column_access(), patterns, k, got_narrow);
-        if (got != want || got_narrow != want) {
+        bool tabs_agree = true;
+        for (const auto& ft : tabs) {
+            std::vector<std::vector<ulint>> with_tab, with_tab_narrow;
+            ms_query_batch(*idx, patterns, k, with_tab, &ft);
+            ms_query_batch_impl(*idx, idx->column_access(), patterns, k, with_tab_narrow, &ft);
+            tabs_agree = tabs_agree && with_tab == want && with_tab_narrow == want;
+        }
+        if (got != want || got_narrow != want || !tabs_agree) {
             std::cout << "  FAILED for " << name << (SP ? " (absolute)" : "") << " with " << k << " in flight"
                       << std::endl;
             assert(false && "ms_query_batch must match ms_query");

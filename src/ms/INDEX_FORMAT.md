@@ -77,6 +77,10 @@ This section describes the current `ms` binary, not the format.
 
 Because LF is loaded whole, a phi-mode query on a full-layout index also loads the PSI columns and the union rows it does not read. Build `--layout phi` for phi-only work.
 
+## Companion files
+
+An ftab (FTAB_FORMAT.md), a table of query states by k-mer that `batch` and `tms-batch` take with `--ftab-file`, is stored as a file of its own next to its index. Its header links it to the index through copies of the fixed fields and of the section entries its walk read.
+
 ## Info text
 
 The info text records provenance as `key=value` lines: `built_by` (the command line) and `built_at` (UTC). A rewrapped index records `rewrapped_from`, `rewrapped_by` and `rewrapped_at` instead.

@@ -556,6 +556,8 @@ public:
     ulint plcp(PhiLenPos p) const { return phi_len_.template get<TmsPhiCols::PLCP>(p.interval) - p.offset; }
     /** phi's intervals, the same in both forms. */
     ulint phi_intervals() const { return has_phi_starts_ ? phi_.intervals() : phi_len_.intervals(); }
+    /** The length of phi interval i, in whichever form is present. */
+    ulint phi_length(ulint i) const { return has_phi_starts_ ? phi_.get_length(i) : phi_len_.get_length(i); }
     /** The first text position of phi interval i. */
     ulint phi_start(ulint i) const { return phi_.get_start(i); }
     /** The phi point of text position x, by binary search over interval starts narrowed by the start table. */

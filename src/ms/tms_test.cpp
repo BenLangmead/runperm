@@ -11,8 +11,11 @@
 #include "ms_rlbwt.hpp"
 #include "tsv.hpp"
 #include "orient.hpp"
+#include "ftab_build.hpp"
+#include "ftab_file.hpp"
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -1494,6 +1497,334 @@ bool test_phi_import() {
     return true;
 }
 
+namespace {
+
+/** The ORBITIDX header of an index, as its file would hold it. */
+template <class Index>
+orbit_idx::Header header_of(Index& idx) {
+    std::stringstream ss;
+    idx.serialize(ss);
+    return ftab::index_header_of(ss);
+}
+
+/** A table written to its file format and read back, with its header in h. */
+ftab::Ftab ftab_round_trip(const ftab::Ftab& tab, const orbit_idx::Header& ih, ftab::FileHeader& h) {
+    std::stringstream ss;
+    ftab::FileHeader w = ftab::make_header(ih, tab);
+    w.present = tab.present();
+    w.info = "test=1\n";
+    ftab::write(ss, w, tab);
+    h = ftab::read_header(ss);
+    ftab::Ftab back = ftab::read_payload(ss, h, true);
+    assert(back.table_words() == tab.table_words() && back.window_words() == tab.window_words());
+    assert(h.present == w.present && h.info == w.info && ftab::link_mismatch(h, ih).empty());
+    return back;
+}
+
+/** Number of distinct j-mers over ACGT in T, for each j from 0 to k. */
+std::vector<uint64_t> brute_present(const std::string& T, unsigned k) {
+    std::vector<uint64_t> out(k + 1, 0);
+    out[0] = 1;
+    for (unsigned j = 1; j <= k; ++j) {
+        std::set<std::string> seen;
+        for (size_t i = 0; i + j <= T.size(); ++i) {
+            const std::string w = T.substr(i, j);
+            if (w.find_first_not_of("ACGT") == std::string::npos) seen.insert(w);
+        }
+        out[j] = seen.size();
+    }
+    return out;
+}
+
+/**
+ * Lengths and positions from tms_query_batch with table ft in every mode
+ * idx serves, with and without positions, packed and column access and
+ * several patterns in flight, against want and want_pos (positions without
+ * a table).  Returns the batches compared.
+ */
+size_t check_tms_with_ftab(TmsIndex& idx, const std::vector<std::string>& pats, const ftab::Ftab& ft,
+                           const std::vector<std::vector<ulint>>& want, const std::vector<std::vector<ulint>>* want_pos,
+                           const std::string& what) {
+    size_t checked = 0;
+    for (TmsMode mode : {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL}) {
+        if ((mode != TmsMode::PHI && !idx.has_psi()) || (mode != TmsMode::PSI && !idx.has_phi())) continue;
+        for (size_t k : {1, 3, 32})
+            for (int access = 0; access < 4; ++access) {
+                const bool packed = access < 2, with_pos = access % 2 == 1;
+                if (with_pos && !want_pos) continue;
+                std::vector<std::vector<ulint>> got, pos;
+                tms_query_batch(idx, pats, k, got, mode, with_pos ? &pos : nullptr, packed, &ft);
+                if (got != want || (with_pos && pos != *want_pos)) {
+                    std::cout << "  FAILED tms (" << what << "): ftab k " << ft.k() << ", mode " << int(mode) << ", k " << k
+                              << ", packed " << packed << ", positions " << with_pos << std::endl;
+                    assert(false && "tms_query_batch with an ftab must match it without");
+                    return checked;
+                }
+                ++checked;
+            }
+    }
+    return checked;
+}
+
+}  // namespace
+
+/**
+ * Tables of several k, built on one thread and on several, for the tms
+ * indexes (full, psi and phi layouts, several splittings) of each fuzz text
+ * and minishred and the ms index of each fuzz text, each written to the
+ * file format and read back.  The walk's counts of occurring j-mers at every
+ * depth match brute force; tables built on different thread counts are the
+ * same bits; and the batched queries with the table give exactly what they
+ * give without it: lengths in every mode the layout serves, and positions
+ * where it has phi, with packed and column access.  An index loaded with
+ * phi's lengths-based form alone builds a table with a toehold and no window
+ * positions, which serves the modes that walk phi without positions.
+ * Patterns are the fuzz patterns plus exact substrings of each length up to
+ * 14, so that table hits, reads of exactly k characters and shorter ones all
+ * occur.
+ */
+bool test_ftab(const std::string& data_dir) {
+    std::cout << "Testing ftab against queries without it" << std::endl;
+    std::mt19937 rng(43);
+    const auto inputs = batch_inputs(data_dir, rng);
+    size_t checked = 0, hits = 0, tables = 0;
+    for (const auto& in : inputs) {
+        const std::string& T = in.text;
+        auto pats = fuzz_patterns(T, rng, in.text.size() > 5000 ? 100 : 200);
+        const size_t tlen = T.size() - 1;
+        for (size_t len = 1; len <= 14; ++len)
+            for (int r = 0; r < 4 && len <= tlen; ++r) pats.push_back(T.substr(rng() % (tlen - len + 1), len));
+        std::vector<TmsIndex> idxs;
+        for (const auto& o : split_variants()) idxs.emplace_back(in.heads, in.lens, o, &in.tops);
+        for (size_t v : {0, 1}) {
+            TmsBuildOptions psi_opts = split_variants()[v], phi_opts = split_variants()[v];
+            psi_opts.layout = TmsLayout::PSI;
+            phi_opts.layout = TmsLayout::PHI;
+            TmsIndex psi_built(in.heads, in.lens, psi_opts), phi_built(in.heads, in.lens, phi_opts, &in.tops);
+            idxs.push_back(round_trip(psi_built));
+            idxs.push_back(round_trip(phi_built));
+        }
+        std::vector<std::vector<ulint>> want, want_pos;
+        for (const auto& P : pats) want.push_back(tms_query(idxs[0], P));
+        {
+            std::vector<std::vector<ulint>> got;
+            tms_query_batch(idxs[0], pats, 32, got, TmsMode::PSI, &want_pos);
+            assert(got == want);
+        }
+        const std::vector<uint64_t> bf = brute_present(T, 5);
+        for (auto& idx : idxs) {
+            const orbit_idx::Header ih = header_of(idx);
+            for (unsigned fk : {1u, 2u, 5u, 9u}) {
+                const ftab::Built b1 = ftab::build_tms(idx, fk, 1), b4 = ftab::build_tms(idx, fk, 4);
+                assert(b1.tab.table_words() == b4.tab.table_words() && b1.tab.window_words() == b4.tab.window_words());
+                assert(b1.present == b4.present && b1.present[fk] == b1.tab.present());
+                assert(b1.tab.has_toehold() == idx.has_phi() && b1.tab.has_window() == idx.has_phi());
+                for (unsigned j = 0; j <= std::min(fk, 5u); ++j)
+                    if (b1.present[j] != bf[j]) {
+                        std::cout << "  FAILED tms: occurring " << j << "-mers differ from brute force" << std::endl;
+                        assert(false && "the walk must count exactly the occurring j-mers");
+                        return false;
+                    }
+                ftab::FileHeader h;
+                const ftab::Ftab ft = ftab_round_trip(fk % 2 ? b4.tab : b1.tab, ih, h);
+                ++tables;
+                checked += check_tms_with_ftab(idx, pats, ft, want, idx.has_phi() ? &want_pos : nullptr, "built");
+                for (const auto& P : pats) {
+                    ftab::Entry e;
+                    hits += ft.lookup(ft.key(P.data(), P.size()), e);
+                }
+                // A query that needs a toehold or window positions refuses a table without them.
+                if (!idx.has_phi()) {
+                    std::vector<std::vector<ulint>> got, pos;
+                    bool refused = false;
+                    try {
+                        TmsIndex& full = idxs[0];
+                        tms_query_batch(full, pats, 8, got, TmsMode::PHI, nullptr, true, &ft);
+                    } catch (const std::invalid_argument&) {
+                        refused = true;
+                    }
+                    assert(refused && "a mode that walks phi needs a table with a toehold");
+                }
+            }
+            // phi's lengths-based form alone: a toehold without window positions.
+            if (idx.has_phi()) {
+                TmsParts need = idx.parts();
+                need.phi_starts = false;
+                need.psi = false;
+                TmsIndex len_only = round_trip(idx, &need);
+                const ftab::Built b = ftab::build_tms(len_only, 5, 3);
+                assert(b.tab.has_toehold() && !b.tab.has_window());
+                checked += check_tms_with_ftab(len_only, pats, b.tab, want, nullptr, "lengths form");
+                bool refused = false;
+                try {
+                    std::vector<std::vector<ulint>> got, pos;
+                    tms_query_batch(idx, pats, 8, got, TmsMode::PHI, &pos, true, &b.tab);
+                } catch (const std::invalid_argument&) {
+                    refused = true;
+                }
+                assert(refused && "positions need a table with window positions");
+            }
+        }
+    }
+    // The ms index over each fuzz text: table counts and batch results.
+    std::mt19937 rng2(47);
+    for (const auto& s : fuzz_texts(rng2)) {
+        TextBwt t = make_text_bwt(s);
+        auto idx = ms_index_for(t);
+        const orbit_idx::Header ih = header_of(idx);
+        auto pats = fuzz_patterns(t.str, rng2, 200);
+        const size_t tlen = t.str.size() - 1;
+        for (size_t len = 1; len <= 14; ++len)
+            for (int r = 0; r < 4 && len <= tlen; ++r) pats.push_back(t.str.substr(rng2() % (tlen - len + 1), len));
+        std::vector<std::vector<ulint>> want;
+        for (const auto& P : pats) want.push_back(ms_query(idx, P));
+        for (unsigned fk : {1u, 2u, 5u, 12u}) {
+            const ftab::Built b = ftab::build_ms(idx, fk, fk % 2 ? 4 : 1);
+            if (fk <= 5 && b.tab.present() != ftab_survey::brute_force(idx, fk)) {
+                std::cout << "  FAILED ms: occurring " << fk << "-mers differ from brute force" << std::endl;
+                assert(false && "ftab must hold exactly the occurring k-mers");
+                return false;
+            }
+            assert(b.present[fk] == b.tab.present() && !b.tab.has_toehold());
+            ftab::FileHeader h;
+            const ftab::Ftab ft = ftab_round_trip(b.tab, ih, h);
+            ++tables;
+            for (size_t k : {1, 3, 32}) {
+                std::vector<std::vector<ulint>> got, got_narrow;
+                ms_query_batch(idx, pats, k, got, &ft);
+                ms_query_batch_impl(idx, idx.column_access(), pats, k, got_narrow, &ft);
+                if (got != want || got_narrow != want) {
+                    std::cout << "  FAILED ms: ftab k " << fk << ", k " << k << std::endl;
+                    assert(false && "ms_query_batch with an ftab must match ms_query");
+                    return false;
+                }
+                ++checked;
+            }
+        }
+    }
+    std::cout << "  " << tables << " tables, " << checked << " batches, " << hits << " tms table hits PASSED" << std::endl;
+    return true;
+}
+
+/**
+ * An ftab's link to its index: it matches the index it was built from, and
+ * one whose header differs only in its info text (as a rewrap's does), and
+ * is refused, naming the field, by an index of the same text with other
+ * split settings or layout and by an index of another text.
+ */
+bool test_ftab_link(const std::string& data_dir) {
+    std::cout << "Testing ftab links to their indexes" << std::endl;
+    std::mt19937 rng(53);
+    const auto inputs = batch_inputs(data_dir, rng);
+    size_t refused = 0;
+    auto mismatch = [&](const ftab::FileHeader& h, const orbit_idx::Header& ih, const std::string& field) {
+        const std::string bad = ftab::link_mismatch(h, ih);
+        if (bad.empty() || bad.find(field) == std::string::npos) {
+            std::cout << "  FAILED: expected a mismatch in " << field << ", got \"" << bad << "\"" << std::endl;
+            assert(false && "a link must name the field that differs");
+            return false;
+        }
+        ++refused;
+        return true;
+    };
+    for (size_t a = 0; a + 1 < inputs.size(); ++a) {
+        const Input& in = inputs[a];
+        const Input& other = inputs[a + 1];
+        if (in.text.size() < 50 || other.text.size() < 50) continue;
+        auto variants = split_variants();
+        TmsIndex x(in.heads, in.lens, variants[0], &in.tops), y(in.heads, in.lens, variants[3], &in.tops);
+        TmsIndex z(other.heads, other.lens, variants[0], &other.tops);
+        TmsBuildOptions phi_split = variants[1], psi_opts = variants[0];
+        psi_opts.layout = TmsLayout::PSI;
+        TmsIndex w(in.heads, in.lens, phi_split, &in.tops), p(in.heads, in.lens, psi_opts);
+        const orbit_idx::Header hx = header_of(x);
+        ftab::FileHeader h;
+        ftab_round_trip(ftab::build_tms(x, 4, 2).tab, hx, h);
+        // Its own index, and the same with other info text.
+        orbit_idx::Header rewrapped = hx;
+        rewrapped.info = "rewrapped_from=elsewhere\n";
+        if (!ftab::link_mismatch(h, rewrapped).empty()) {
+            std::cout << "  FAILED: a rewrapped header must match" << std::endl;
+            assert(false);
+            return false;
+        }
+        const orbit_idx::Header hy = header_of(y), hz = header_of(z), hw = header_of(w), hp = header_of(p);
+        if (hy.find(orbit_idx::Section::LF)->crc != hx.find(orbit_idx::Section::LF)->crc && !mismatch(h, hy, "section LF"))
+            return false;
+        if (!mismatch(h, hw, "section ")) return false;
+        if (!mismatch(h, hp, "layout")) return false;
+        if (!mismatch(h, hz, other.text.size() != in.text.size() ? "n" : "")) return false;
+        // ms: the same text with another LF split, and another text.
+        if (in.text.find_first_not_of("ACGT$") == std::string::npos) {
+            TextBwt t = make_text_bwt(in.text.substr(0, in.text.size() - 1));
+            auto mi = ms_index_for(t);
+            const orbit_idx::Header hm = header_of(mi);
+            ftab::FileHeader hmf;
+            ftab_round_trip(ftab::build_ms(mi, 3, 1).tab, hm, hmf);
+            if (!mismatch(hmf, hx, "tool") || !mismatch(h, hm, "tool")) return false;
+        }
+    }
+    std::cout << "  " << refused << " mismatches named PASSED" << std::endl;
+    return true;
+}
+
+/**
+ * The auto rule: the largest k whose table fits in the budget, then down
+ * while occupancy is under the minimum, on constructed sizes and counts and
+ * on the tms indexes of the fuzz texts.
+ */
+bool test_ftab_auto(const std::string& data_dir) {
+    std::cout << "Testing ftab-build --auto's choice of k" << std::endl;
+    ftab::Shape s;
+    s.interval = 10;
+    s.offset = 5;
+    for (unsigned k = 1; k <= 12; ++k) {
+        s.k = k;
+        const double bytes = double(s.payload_bytes());
+        assert(ftab::largest_fitting_k(s, bytes) == k);
+        assert(ftab::largest_fitting_k(s, bytes - 1) == std::max(1u, k - 1));
+    }
+    s.k = 0;
+    assert(ftab::largest_fitting_k(s, 0) == 1);
+    auto present_with = [](std::vector<double> occ) {
+        std::vector<uint64_t> p(occ.size());
+        for (size_t j = 0; j < occ.size(); ++j) p[j] = uint64_t(occ[j] * double(uint64_t{1} << (2 * j)) + 0.5);
+        return p;
+    };
+    assert(ftab::step_down(6, present_with({1, 1, 1, 0.9, 0.8, 0.79, 0.5}), 0.8) == 4);
+    assert(ftab::step_down(6, present_with({1, 1, 1, 0.9, 0.85, 0.8, 0.8}), 0.8) == 6);
+    assert(ftab::step_down(6, present_with({1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5}), 0.8) == 1);
+    std::mt19937 rng(59);
+    const auto inputs = batch_inputs(data_dir, rng);
+    size_t cases = 0;
+    for (const auto& in : inputs) {
+        if (in.text.size() < 100) continue;
+        TmsIndex idx(in.heads, in.lens, split_variants()[0], &in.tops);
+        const ftab::Shape base = ftab::tms_shape(idx, 2);
+        const std::vector<uint64_t> bf = brute_present(in.text, 7);
+        for (unsigned target : {3u, 5u, 7u}) {
+            ftab::Shape t = base;
+            t.k = target;
+            const uint64_t index_bytes = uint64_t(double(t.payload_bytes()) / 0.05) + 1;
+            ftab::AutoChoice choice;
+            auto build = [&](const ftab::Shape& sh) { return ftab::build_tms(idx, sh, 2); };
+            const ftab::Built b = ftab::build_auto(base, index_bytes, ftab::AutoRule{}, build, choice);
+            unsigned want = target;
+            while (want > 1 && double(bf[want]) < 0.8 * double(uint64_t{1} << (2 * want))) --want;
+            if (choice.k_fit != target || choice.k != want || b.tab.k() != want) {
+                std::cout << "  FAILED auto: fit " << choice.k_fit << " (want " << target << "), k " << choice.k
+                          << " (want " << want << ")" << std::endl;
+                assert(false && "--auto must follow its rule");
+                return false;
+            }
+            assert(b.tab.table_words() == ftab::build_tms(idx, want, 1).tab.table_words());
+            ++cases;
+        }
+    }
+    std::cout << "  " << cases << " indexes PASSED" << std::endl;
+    return true;
+}
+
 bool run_all_tests(const std::string& data_dir) {
     bool all_ran = true;
     test_orbit_structures();
@@ -1503,6 +1834,12 @@ bool run_all_tests(const std::string& data_dir) {
     if (!test_tms_vs_ms_minishred(data_dir)) all_ran = false;
     std::cout << std::endl;
     test_tms_batch(data_dir);
+    std::cout << std::endl;
+    test_ftab(data_dir);
+    std::cout << std::endl;
+    test_ftab_link(data_dir);
+    std::cout << std::endl;
+    test_ftab_auto(data_dir);
     std::cout << std::endl;
     test_orient_both_strands();
     std::cout << std::endl;

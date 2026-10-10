@@ -7,6 +7,8 @@
 # phi point it reads has offset 0), so its LF section may differ in that
 # column's width alone.  Each new index must also pass index-verify, and
 # queries on the rewrapped index must print what they print on the new one.
+# An ftab of either holds the same table, and that of the new index links to
+# the rewrapped one where their sections are equal.
 #
 # Usage: test_rewrap.sh OLD_MS NEW_MS DATA_DIR [WORK_DIR]
 set -euo pipefail
@@ -65,6 +67,20 @@ check() {  # name, build command, options...
     "$NEW" index-rewrap "$W/$name.legacy" "$W/$name.rewrapped" > /dev/null
     same "$W/$name.new" "$W/$name.rewrapped" || { echo "$name: rewrapped index differs from a new build"; exit 1; }
     "$NEW" index-verify "$W/$name.rewrapped" > /dev/null || { echo "$name: index-verify failed"; exit 1; }
+    # ftabs of the new build and of the rewrap hold the same table.  The
+    # new build's links to the rewrap, whose info text differs, unless the
+    # rewrap's LF keeps a phi_off column, which makes its LF another section.
+    "$NEW" ftab-build "$W/$name.new" "$W/$name.ftab" --k 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
+    "$NEW" ftab-build "$W/$name.rewrapped" "$W/$name.rw.ftab" --k 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
+    cmp -s -i 4096 "$W/$name.ftab" "$W/$name.rw.ftab" || { echo "$name: the rewrap's ftab holds another table"; exit 1; }
+    case "$name" in
+        tms_full* | tms_phi*)
+            if "$NEW" ftab-verify "$W/$name.rewrapped" "$W/$name.ftab" 2> "$W/err" > /dev/null || ! grep -q "section LF" "$W/err"; then
+                echo "$name: ftab-verify must refuse a rewrap whose LF keeps phi_off"; exit 1
+            fi ;;
+        *)
+            "$NEW" ftab-verify "$W/$name.rewrapped" "$W/$name.ftab" > /dev/null || { echo "$name: ftab-verify refused the rewrap"; exit 1; } ;;
+    esac
     echo "$name: rewrap equals a new build"
 }
 

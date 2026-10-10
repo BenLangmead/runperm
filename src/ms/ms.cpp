@@ -27,6 +27,8 @@
 #include "orient.hpp"
 #include "ftab_survey.hpp"
 #include "split_report.hpp"
+#include "ftab_build.hpp"
+#include "ftab_file.hpp"
 #include <zlib.h>
 #include <iostream>
 #include <string>
@@ -44,6 +46,11 @@
 #include <iomanip>
 #include <thread>
 #include <ctime>
+
+// The commit this binary was built from (see the Makefile).
+#ifndef MS_COMMIT
+#define MS_COMMIT "unknown"
+#endif
 
 /** Print usage message. */
 static void usage(const char* prog) {
@@ -72,7 +79,7 @@ static void usage(const char* prog) {
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
-              << "            [--orient fwd|rc|qual]\n"
+              << "            [--orient fwd|rc|qual] [--ftab-file FILE | --ftab | --ftab-k K]\n"
               << "              Load the index once and compute matching statistics for every\n"
               << "              read in READS (FASTA, FASTQ, or one sequence per line, in\n"
               << "              which blank lines are skipped; - for stdin; LF or CRLF line\n"
@@ -109,6 +116,16 @@ static void usage(const char* prog) {
               << "              SMEM reports.  The summary's flipped field counts the reads\n"
               << "              matched on the other strand, and orient_s is the threads'\n"
               << "              summed time flipping reads and converting their results.\n"
+              << "              --ftab-file FILE loads a table (from ftab-build) of the query\n"
+              << "              state after each K-mer over ACGT; a read whose last K bases\n"
+              << "              occur in the text starts K steps in.  Results are unchanged.\n"
+              << "              The table must have been built from this index: its link to\n"
+              << "              the index is checked against the index's header, and a table\n"
+              << "              of another index is refused.  --ftab instead builds the table\n"
+              << "              after loading the index, on every CPU (K = 14, or --ftab-k K,\n"
+              << "              which implies --ftab).  tms-batch takes a table in every mode,\n"
+              << "              with or without positions; a table built from a psi layout\n"
+              << "              serves --mode psi without positions or SMEM reports only.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--phi FILE]\n"
               << "            [--minima FILE] [--lcp-bin FILE] [--lf-split B] [--phi-split B]\n"
               << "            [--no-phi-inv]\n"
@@ -139,6 +156,7 @@ static void usage(const char* prog) {
               << "            [--mode psi|phi|phiskip|dual] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
               << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
+              << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
               << "              the others need phi).  Only the index's structures that the\n"
@@ -167,6 +185,20 @@ static void usage(const char* prog) {
               << "              collection (one terminator per string, as in an FMD), print\n"
               << "              each string and its $, one per line, in the BWT order of\n"
               << "              their terminators.  An FMD's N prints as N.\n"
+              << "  ftab-build INDEX_PATH FTAB_PATH [--k K | --auto] [--threads T]\n"
+              << "              Build the ftab of an index (see batch --ftab-file) and write it\n"
+              << "              to its own file.  --k K sets K; --auto (the default) takes the\n"
+              << "              largest K whose table fits in 5% of the index file's bytes, then\n"
+              << "              steps K down by one while fewer than 80% of its K-mers occur.\n"
+              << "              --threads T builds on T threads (default 0, every CPU).  A tms\n"
+              << "              index with phi gets a table with a toehold and window\n"
+              << "              positions, which serves every mode, positions and SMEM reports.\n"
+              << "  ftab-verify INDEX_PATH FTAB_PATH [--crc]\n"
+              << "              Check, from the two headers alone, that the ftab was built from\n"
+              << "              this index; on a mismatch, name the field that differs and exit\n"
+              << "              nonzero.  --crc also checks the ftab's payload CRC-32s.\n"
+              << "  ftab-info  FTAB_PATH\n"
+              << "              Print an ftab's header: k, fields, occupancy, link, provenance.\n"
               << "  ftab-survey INDEX_PATH [--kmin K] [--kmax K] [--threads T] [--verify K]\n"
               << "              Development: count the k-mers over ACGT that occur in the\n"
               << "              text, for each k from --kmin (default 6) to --kmax (default\n"
@@ -260,13 +292,18 @@ struct QueryResults {
     std::vector<TmsSmemHits> hits;        // tms SMEMs, with an SMEM report
 };
 
-// Results of one read go to slot 0 of r.
+// The ftab built at index load with --ftab, or null.
+static const ftab::Ftab* g_ftab = nullptr;
+
+// Results of one read go to slot 0 of r.  With an ftab, the batched engine
+// with one read, since ms_query takes no table.
 static void query_one(MSIndexSpillLCP<false>& idx, const std::string& s, QueryResults& r) {
+    if (g_ftab) return ms_query_batch(idx, {s}, 1, r.ms, g_ftab);
     r.ms.resize(1);
     r.ms[0] = ms_query(idx, s);
 }
 static void query_many(MSIndexSpillLCP<false>& idx, const std::vector<std::string>& p, size_t k, QueryResults& r) {
-    ms_query_batch(idx, p, k, r.ms);
+    ms_query_batch(idx, p, k, r.ms, g_ftab);
 }
 // tms-batch settings, from its command line.  They are read-only once the
 // queries start.
@@ -282,7 +319,7 @@ static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
 // at a time).
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t smem_k) {
     const bool smems = g_tms_report != TmsReport::MS;
-    tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr);
+    tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr, true, g_ftab);
     if (!smems) return;
     tms_report_smems_batch(idx, r.ms, r.pos, g_tms_min_smem_len, g_tms_report, smem_k, r.hits,
                            g_tms_max_smem_positions);
@@ -376,8 +413,13 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
     int q = 0;
+    unsigned ftab_k = 0;  // 0: no ftab built at load
+    std::string ftab_path;  // a stored ftab to load
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--ftab") == 0) ftab_k = ftab_k ? ftab_k : 14;
+        else if (strcmp(argv[i], "--ftab-k") == 0 && i + 1 < argc) ftab_k = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (strcmp(argv[i], "--ftab-file") == 0 && i + 1 < argc) ftab_path = argv[++i];
         else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
         else if (strcmp(argv[i], "--interleave") == 0 && i + 1 < argc)
             interleave = static_cast<size_t>(std::stoull(argv[++i]));
@@ -413,6 +455,34 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
                      "--positions or an SMEM report\n";
         return 1;
     }
+    if (ftab_k > 31) { std::cerr << "--ftab-k must be between 1 and 31\n"; return 1; }
+    if (ftab_k > 0 && !ftab_path.empty()) { std::cerr << "--ftab-file cannot be used with --ftab or --ftab-k\n"; return 1; }
+    // A stored table is checked against the index's header before either is
+    // loaded.  A tms query that walks phi or reports positions needs its
+    // toehold, and positions its window positions.
+    ftab::FileHeader ftab_header;
+    if (!ftab_path.empty()) {
+        try {
+            ftab_header = ftab::read_header_file(ftab_path);
+            const std::string bad = ftab::link_mismatch(ftab_header, orbit_idx::read_header_file(idx_path));
+            if (!bad.empty()) {
+                std::cerr << ftab_path << " was not built from " << idx_path << ": " << bad << "\n";
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        }
+        const bool positions = g_tms_positions || g_tms_report != TmsReport::MS;
+        if (std::is_same_v<Index, TmsIndex> && (g_tms_mode != TmsMode::PSI || positions) && !ftab_header.shape.toehold) {
+            std::cerr << ftab_path << " holds no toehold (it was built from a psi layout), which this query needs\n";
+            return 1;
+        }
+        if (std::is_same_v<Index, TmsIndex> && positions && !ftab_header.shape.window) {
+            std::cerr << ftab_path << " holds no window positions, which positions and SMEM reports need\n";
+            return 1;
+        }
+    }
     threads = resolve_thread_count(threads);
     // Output named *.gz is gzip-compressed, each block as a gzip member by
     // the thread that formats it; members written one after another form one
@@ -432,6 +502,31 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     }
     Index& idx = *opt;
     const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+    // The ftab is loaded, or built on every CPU, after the index, and is
+    // interleaved over the memory nodes as the index is.
+    std::optional<ftab::Ftab> tab;
+    double ftab_s = 0.0;
+    if (ftab_k > 0 || !ftab_path.empty()) {
+        const auto tf = clock::now();
+        InterleavedAllocation spread;
+        try {
+            if (!ftab_path.empty()) {
+                tab = ftab::read_file(ftab_path, ftab_header);
+                ftab_k = tab->k();
+            } else {
+                const size_t build_threads = resolve_thread_count(0);
+                if constexpr (std::is_same_v<Index, TmsIndex>) tab = ftab::build_tms(idx, ftab_k, build_threads).tab;
+                else tab = ftab::build_ms(idx, ftab_k, build_threads).tab;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "ftab: " << e.what() << "\n";
+            return 1;
+        }
+        ftab_s = std::chrono::duration<double>(clock::now() - tf).count();
+        g_ftab = &*tab;
+        std::cerr << "ftab: k=" << ftab_k << " entry_bits=" << tab->entry_bits() << " bytes=" << tab->bytes()
+                  << (ftab_path.empty() ? " build_s=" : " load_s=") << ftab_s << "\n";
+    }
 
     std::ifstream fin;
     std::istream* in = &std::cin;
@@ -665,7 +760,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     // output.  read_s is the time the input lock was held for reading; wall_ns_per_base is
     // the elapsed time of the whole read, query and write phase per base.
     std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
-              << " index_load_s=" << load_s << " query_s=" << query_s << " read_s=" << read_s
+              << " index_load_s=" << load_s << " ftab_k=" << ftab_k << " ftab_s=" << ftab_s << " query_s=" << query_s << " read_s=" << read_s
               << " parse_s=" << parse_s << " format_s=" << format_s
               << " orient=" << (orient == ReadOrient::FWD ? "fwd" : orient == ReadOrient::RC ? "rc" : "qual")
               << " flipped=" << n_flipped << " orient_s=" << orient_s
@@ -1081,6 +1176,110 @@ int main(int argc, char** argv) {
         idx.describe(std::cout);
         std::cout << "Built tms index: " << idx_path << " (runs=" << heads.size() << ", bytes=" << bytes
                   << ", load_s=" << load_s << ", build_s=" << build_s << ")\n";
+        return 0;
+    }
+
+    if (cmd == "ftab-build") {
+        if (argc < 2) { std::cerr << "ftab-build requires INDEX_PATH and FTAB_PATH\n"; return 1; }
+        const std::string idx_path = argv[0], out_path = argv[1];
+        unsigned k = 0;  // 0: --auto
+        size_t threads = 0;
+        for (int i = 2; i < argc; ++i) {
+            if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) k = static_cast<unsigned>(std::stoul(argv[++i]));
+            else if (strcmp(argv[i], "--auto") == 0) k = 0;
+            else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
+                threads = static_cast<size_t>(std::stoull(argv[++i]));
+            else { std::cerr << "Unknown ftab-build option: " << argv[i] << "\n"; return 1; }
+        }
+        if (k > ftab::max_k) { std::cerr << "--k must be between 1 and 31\n"; return 1; }
+        threads = resolve_thread_count(threads);
+        using clock = std::chrono::steady_clock;
+        try {
+            const orbit_idx::Header ih = orbit_idx::read_header_file(idx_path);
+            const uint64_t index_bytes = std::filesystem::file_size(idx_path);
+            const auto t0 = clock::now();
+            std::optional<MSIndexSpillLCP<false>> ms_idx;
+            std::optional<TmsIndex> tms_idx;
+            if (ih.tool == orbit_idx::Tool::MS) ms_idx = ms_serialize::read_index(idx_path);
+            else tms_idx = read_tms_index(idx_path);
+            if (!ms_idx && !tms_idx) { std::cerr << "Failed to load index: " << idx_path << "\n"; return 1; }
+            const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
+            const auto t1 = clock::now();
+            const ftab::Shape base = ms_idx ? ftab::ms_shape(*ms_idx, threads) : ftab::tms_shape(*tms_idx, threads);
+            auto build = [&](const ftab::Shape& s) {
+                return ms_idx ? ftab::build_ms(*ms_idx, s, threads) : ftab::build_tms(*tms_idx, s, threads);
+            };
+            ftab::AutoChoice choice;
+            const ftab::AutoRule rule;
+            ftab::Built b;
+            if (k == 0) b = ftab::build_auto(base, index_bytes, rule, build, choice);
+            else {
+                ftab::Shape s = base;
+                s.k = k;
+                b = build(s);
+            }
+            const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
+            ftab::FileHeader h = ftab::make_header(ih, b.tab);
+            h.rule = k == 0 ? ftab::KRule::AUTO : ftab::KRule::GIVEN;
+            h.present = b.present[b.tab.k()];
+            h.built_at = static_cast<uint64_t>(std::time(nullptr));
+            h.index_bytes = index_bytes;
+            std::ostringstream info;
+            info << build_info() << "commit=" << MS_COMMIT << "\nindex_path=" << idx_path << "\n";
+            if (k == 0) {
+                info << "k_rule=auto: largest k with table bytes <= " << rule.budget << " of index bytes (k=" << choice.k_fit
+                     << "), then down while occupancy < " << rule.min_occupancy << "\noccupancy=";
+                const unsigned lo = choice.k_fit > 4 ? choice.k_fit - 4 : 1;
+                for (unsigned j = lo; j <= choice.k_fit; ++j)
+                    info << (j > lo ? " " : "") << j << ":" << std::setprecision(4) << ftab::occupancy(choice.present, j);
+                info << "\n";
+            } else {
+                info << "k_rule=given\n";
+            }
+            info << "threads=" << threads << "\nbuild_s=" << build_s << "\n";
+            h.info = info.str();
+            ftab::write_file(out_path, h, b.tab);
+            std::cout << "Built ftab: " << out_path << " (k=" << b.tab.k() << ", entry_bits=" << b.tab.entry_bits()
+                      << ", bytes=" << b.tab.bytes() << ", occupancy=" << h.occupancy() << ", load_s=" << load_s
+                      << ", build_s=" << build_s << ")\n";
+        } catch (const std::exception& e) {
+            std::cerr << "ftab-build: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (cmd == "ftab-verify") {
+        if (argc < 2) { std::cerr << "ftab-verify requires INDEX_PATH and FTAB_PATH\n"; return 1; }
+        bool crc = false;
+        for (int i = 2; i < argc; ++i) {
+            if (strcmp(argv[i], "--crc") == 0) crc = true;
+            else { std::cerr << "Unknown ftab-verify option: " << argv[i] << "\n"; return 1; }
+        }
+        try {
+            ftab::FileHeader h = ftab::read_header_file(argv[1]);
+            const std::string bad = ftab::link_mismatch(h, orbit_idx::read_header_file(argv[0]));
+            if (!bad.empty()) {
+                std::cerr << argv[1] << " was not built from " << argv[0] << ": " << bad << "\n";
+                return 1;
+            }
+            if (crc) ftab::read_file(argv[1], h, true);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        }
+        std::cout << argv[1] << " matches " << argv[0] << (crc ? ", and its payload CRC-32s match" : "") << "\n";
+        return 0;
+    }
+
+    if (cmd == "ftab-info") {
+        if (argc < 1) { std::cerr << "ftab-info requires FTAB_PATH\n"; return 1; }
+        try {
+            ftab::describe(ftab::read_header_file(argv[0]), std::cout);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            return 1;
+        }
         return 0;
     }
 

@@ -2,6 +2,11 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -I../../include -I. -O3 -pthread
 
+# The commit recorded in the ftabs this binary builds; outside a git checkout
+# (as from git archive), pass MS_COMMIT=... on the command line.
+MS_COMMIT ?= $(shell c=$$(git rev-parse --short=12 HEAD 2>/dev/null) && { git diff --quiet HEAD -- . 2>/dev/null || c=$$c-dirty; echo $$c; } || echo unknown)
+CXXFLAGS += -DMS_COMMIT='"$(MS_COMMIT)"'
+
 MS_SRCS = ms.cpp tsv.cpp ms_io.cpp index_format.cpp ms_test.cpp inspect.cpp tms_test.cpp fmd_test.cpp
 
 MS_HDRS = $(wildcard *.hpp) $(shell find ../../include -name '*.hpp')
@@ -35,7 +40,7 @@ debug: ms
 tms_chain_bench: tms_chain_bench.cpp index_format.cpp $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp index_format.cpp
 
-.PHONY: test test-threads test-reader test-rewrap all clean debug bench
+.PHONY: test test-threads test-reader test-rewrap test-ftab all clean debug bench
 test: ms
 	./ms test ../../data
 
@@ -50,6 +55,10 @@ test-reader: read_chunks_test
 # Output identity across interleave, thread count and block size
 test-threads: ms
 	./test_threads.sh ./ms ../../data
+
+# Stored ftabs: ftab-build, ftab-verify and byte identity with --ftab-file
+test-ftab: ms
+	./test_ftab.sh ./ms ../../data
 
 # index-rewrap against new builds: OLD is an ms binary that writes the
 # earlier formats (MSIX v4, TMSX v8), as built from commit f82f172

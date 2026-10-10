@@ -202,6 +202,52 @@ T get(const char* b, size_t at) {
 }
 }  // namespace detail
 
+/** Write section entry e as the SECTION_ENTRY_BYTES bytes at b[at]. */
+inline void encode_entry(std::vector<char>& b, size_t at, const SectionEntry& e) {
+    using detail::put;
+    if (e.cols.size() > MAX_COLS) throw std::length_error("a move table has more columns than the header holds");
+    put<uint16_t>(b, at, static_cast<uint16_t>(e.id));
+    put<uint16_t>(b, at + 2, static_cast<uint16_t>(e.kind));
+    put<uint8_t>(b, at + 4, static_cast<uint8_t>(e.cols.size()));
+    put<uint16_t>(b, at + 6, e.row_bits);
+    put<uint64_t>(b, at + 8, e.offset);
+    put<uint64_t>(b, at + 16, e.bytes);
+    put<uint64_t>(b, at + 24, e.rows);
+    put<uint64_t>(b, at + 32, e.domain);
+    put<uint32_t>(b, at + 40, e.crc);
+    for (size_t c = 0; c < e.cols.size(); ++c) {
+        put<uint8_t>(b, at + 48 + 2 * c, e.cols[c].first);
+        put<uint8_t>(b, at + 49 + 2 * c, e.cols[c].second);
+    }
+}
+
+/**
+ * The section entry in the SECTION_ENTRY_BYTES bytes at b + at.  Throws,
+ * naming the file kind what, if its columns are malformed.
+ */
+inline SectionEntry decode_entry(const char* b, size_t at, const char* what) {
+    using detail::get;
+    SectionEntry e;
+    e.id = static_cast<Section>(get<uint16_t>(b, at));
+    e.kind = static_cast<Kind>(get<uint16_t>(b, at + 2));
+    const size_t nc = get<uint8_t>(b, at + 4);
+    e.row_bits = get<uint16_t>(b, at + 6);
+    e.offset = get<uint64_t>(b, at + 8);
+    e.bytes = get<uint64_t>(b, at + 16);
+    e.rows = get<uint64_t>(b, at + 24);
+    e.domain = get<uint64_t>(b, at + 32);
+    e.crc = get<uint32_t>(b, at + 40);
+    if (nc > MAX_COLS) throw std::runtime_error(std::string("malformed ") + what + " header: too many columns");
+    unsigned bits = 0;
+    for (size_t c = 0; c < nc; ++c) {
+        e.cols.emplace_back(get<uint8_t>(b, at + 48 + 2 * c), get<uint8_t>(b, at + 49 + 2 * c));
+        bits += e.cols.back().second;
+    }
+    if (bits != e.row_bits)
+        throw std::runtime_error(std::string("malformed ") + what + " header: row bits disagree with widths");
+    return e;
+}
+
 /** Bytes the header's tables and info take; at most HEADER_BYTES. */
 inline size_t header_used(const Header& h) {
     return FIXED_BYTES + h.sections.size() * SECTION_ENTRY_BYTES + h.info.size();
@@ -225,20 +271,7 @@ inline std::vector<char> encode_header(const Header& h) {
     for (size_t i = 0; i < SCALARS; ++i) put<uint64_t>(b, 48 + 8 * i, h.scalars[i]);
     size_t at = FIXED_BYTES;
     for (const auto& e : h.sections) {
-        if (e.cols.size() > MAX_COLS) throw std::length_error("a move table has more columns than the header holds");
-        put<uint16_t>(b, at, static_cast<uint16_t>(e.id));
-        put<uint16_t>(b, at + 2, static_cast<uint16_t>(e.kind));
-        put<uint8_t>(b, at + 4, static_cast<uint8_t>(e.cols.size()));
-        put<uint16_t>(b, at + 6, e.row_bits);
-        put<uint64_t>(b, at + 8, e.offset);
-        put<uint64_t>(b, at + 16, e.bytes);
-        put<uint64_t>(b, at + 24, e.rows);
-        put<uint64_t>(b, at + 32, e.domain);
-        put<uint32_t>(b, at + 40, e.crc);
-        for (size_t c = 0; c < e.cols.size(); ++c) {
-            put<uint8_t>(b, at + 48 + 2 * c, e.cols[c].first);
-            put<uint8_t>(b, at + 49 + 2 * c, e.cols[c].second);
-        }
+        encode_entry(b, at, e);
         at += SECTION_ENTRY_BYTES;
     }
     std::memcpy(b.data() + at, h.info.data(), h.info.size());
@@ -273,23 +306,7 @@ inline Header decode_header(const char* b) {
     size_t at = FIXED_BYTES;
     uint64_t end = HEADER_BYTES;
     for (size_t i = 0; i < ns; ++i, at += SECTION_ENTRY_BYTES) {
-        SectionEntry e;
-        e.id = static_cast<Section>(get<uint16_t>(b, at));
-        e.kind = static_cast<Kind>(get<uint16_t>(b, at + 2));
-        const size_t nc = get<uint8_t>(b, at + 4);
-        e.row_bits = get<uint16_t>(b, at + 6);
-        e.offset = get<uint64_t>(b, at + 8);
-        e.bytes = get<uint64_t>(b, at + 16);
-        e.rows = get<uint64_t>(b, at + 24);
-        e.domain = get<uint64_t>(b, at + 32);
-        e.crc = get<uint32_t>(b, at + 40);
-        if (nc > MAX_COLS) throw std::runtime_error("malformed Orbit index header: too many columns");
-        unsigned bits = 0;
-        for (size_t c = 0; c < nc; ++c) {
-            e.cols.emplace_back(get<uint8_t>(b, at + 48 + 2 * c), get<uint8_t>(b, at + 49 + 2 * c));
-            bits += e.cols.back().second;
-        }
-        if (bits != e.row_bits) throw std::runtime_error("malformed Orbit index header: row bits disagree with widths");
+        SectionEntry e = decode_entry(b, at, "Orbit index");
         if (e.offset % SECTION_ALIGN != 0 || e.offset < end)
             throw std::runtime_error("malformed Orbit index header: sections out of order or unaligned");
         if (h.find(e.id)) throw std::runtime_error("malformed Orbit index header: a section appears twice");

@@ -27,6 +27,7 @@
 #include "ms_constants.hpp"
 #include "step_stats.hpp"
 #include "index_format.hpp"
+#include "ftab.hpp"
 #include <cassert>
 #include <iostream>
 #include <utility>
@@ -1259,11 +1260,13 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
  * reposition_target and starts its LF step.  Rows are read through the row
  * access acc (see MSIndexSpillLCP::PackedAccess); with packed access, a
  * visit resolves the LF step and reads the landing row's columns itself.
- * out[j] receives the statistics for patterns[j].
+ * With an ftab (ftab.hpp) built for idx, a pattern whose last k-mer occurs
+ * starts from the table's state, k steps in.  out[j] receives the
+ * statistics for patterns[j].
  */
 template <bool SP, class Access>
 inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, const std::vector<std::string>& patterns,
-                                size_t k, std::vector<std::vector<ulint>>& out) {
+                                size_t k, std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr) {
     constexpr bool packed = std::is_same_v<Access, typename MSIndexSpillLCP<SP>::PackedAccess>;
     using Position = typename MSIndexSpillLCP<SP>::position;
     struct Slot {
@@ -1287,13 +1290,38 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
     for (size_t c = 0; c < 256; ++c) codes[c] = idx.code(static_cast<uchar>(c));
     std::vector<Slot> slots(k);
     size_t next = 0;
-    // Start the next nonempty pattern; returns false when none are left.
+    // With an ftab, each pattern's key, and how many patterns ahead of the
+    // one starting its table entry is prefetched.
+    std::vector<uint64_t> keys;
+    const size_t ahead = k;
+    if (ft) {
+        keys.resize(patterns.size());
+        for (size_t j = 0; j < patterns.size(); ++j) keys[j] = ft->key(patterns[j].data(), patterns[j].size());
+        for (size_t j = 0; j < std::min(ahead, patterns.size()); ++j) ft->prefetch(keys[j]);
+    }
+    // Start the next pattern that has characters left to match; returns
+    // false when none are left.
     auto start = [&](Slot& s) {
         while (next < patterns.size()) {
             const size_t j = next++;
-            out[j].assign(patterns[j].size(), 0);
-            if (patterns[j].empty()) continue;
-            s = Slot{patterns[j].data(), out[j].data(), patterns[j].size(), idx.first(), 0, false};
+            const size_t m = patterns[j].size();
+            out[j].assign(m, 0);
+            if (m == 0) continue;
+            s = Slot{patterns[j].data(), out[j].data(), m, idx.first(), 0, false};
+            if (ft) {
+                if (j + ahead < patterns.size()) ft->prefetch(keys[j + ahead]);
+                ftab::Entry e;
+                if (ft->lookup(keys[j], e)) {
+                    const unsigned kk = ft->k();
+                    for (unsigned d = 0; d < kk; ++d) out[j][m - 1 - d] = d + 1;
+                    if (m == kk) continue;
+                    s.pos.interval = e.interval;
+                    s.pos.offset = e.offset;
+                    s.match_len = kk;
+                    s.i = m - kk;
+                    acc.prefetch(e.interval);
+                }
+            }
             return true;
         }
         return false;
@@ -1368,12 +1396,12 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
 
 template <bool SP>
 inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
-                           std::vector<std::vector<ulint>>& out) {
+                           std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr) {
     if constexpr (MSIndexSpillLCP<SP>::packed_access_supported) {
         const auto acc = idx.packed_access();
-        if (acc.fits()) return ms_query_batch_impl(idx, acc, patterns, k, out);
+        if (acc.fits()) return ms_query_batch_impl(idx, acc, patterns, k, out, ft);
     }
-    ms_query_batch_impl(idx, idx.column_access(), patterns, k, out);
+    ms_query_batch_impl(idx, idx.column_access(), patterns, k, out, ft);
 }
 
 /**
