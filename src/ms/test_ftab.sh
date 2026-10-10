@@ -91,7 +91,7 @@ for idx in "${INDEXES[@]}"; do
             for m in "${modes[@]}"; do
                 cmds+=("tms-batch|--mode $m")
                 if [ "$layout" != psi ]; then
-                    cmds+=("tms-batch|--mode $m --positions" "tms-batch|--mode $m --report smem-one" "tms-batch|--mode $m --report smem-all --max-smem-positions 20")
+                    cmds+=("tms-batch|--mode $m --positions" "tms-batch|--mode $m --report smem-one" "tms-batch|--mode $m --report smem-all --max-smem-positions 20 --min-smem-len 12")
                     cmds+=("tms-batch|--mode $m --phi-starts")
                 fi
             done
