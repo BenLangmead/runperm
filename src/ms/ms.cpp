@@ -155,7 +155,7 @@ static void usage(const char* prog) {
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
-              << "            [--mode psi|phi|phiskip|dual|oracle] [--positions]\n"
+              << "            [--mode psi|phi|phiskip|dual|oracle|oracle-scan] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
               << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
               << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
@@ -189,8 +189,13 @@ static void usage(const char* prog) {
               << "              without scanning for the candidates or computing an LCE, so it\n"
               << "              reads only LF (and phi with --positions or an SMEM report).  It\n"
               << "              is a lower bound on the time of the other modes, and its output\n"
-              << "              is theirs.  Replay needs the same reads, in the same order, and\n"
-              << "              an index with the same LF intervals (the same build and layout);\n"
+              << "              is theirs.  --mode oracle-scan replays the same file with less\n"
+              << "              given: the recorded interval says only which side (pred above\n"
+              << "              or succ below) to scan, and that side is scanned for the\n"
+              << "              candidate as the other modes do; the recorded length still\n"
+              << "              stands in for the LCE.  Replay needs the same reads, in the\n"
+              << "              same order, and an index with the same LF intervals (the same\n"
+              << "              build and layout);\n"
               << "              it does not depend on K, T or B.  FILE holds u64s, little-endian:\n"
               << "              the magic \"TMSORC01\" (8 bytes), the index's LF interval count,\n"
               << "              the read count R, the reposition count D, R per-read reposition\n"
@@ -344,7 +349,7 @@ static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t 
                        size_t first_read) {
     const bool smems = g_tms_report != TmsReport::MS;
     TmsOracleView view{};
-    const bool replay = g_tms_mode == TmsMode::ORACLE;
+    const bool replay = g_tms_mode == TmsMode::ORACLE || g_tms_mode == TmsMode::ORACLE_SCAN;
     if (replay) view = TmsOracleView::of(g_tms_oracle, first_read, p.size());
     tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr, true, g_ftab,
                     replay ? &view : nullptr, g_tms_record ? &r.decisions : nullptr);
@@ -378,6 +383,7 @@ static int tms_query_flag(int argc, char** argv, int& i) {
         else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
         else if (m == "dual") g_tms_mode = TmsMode::DUAL;
         else if (m == "oracle") g_tms_mode = TmsMode::ORACLE;
+        else if (m == "oracle-scan") g_tms_mode = TmsMode::ORACLE_SCAN;
         else { std::cerr << "Unknown mode: " << m << "\n"; return -1; }
     }
     else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
@@ -517,9 +523,10 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             return 1;
         }
     }
-    const bool oracle_mode = std::is_same_v<Index, TmsIndex> && g_tms_mode == TmsMode::ORACLE;
+    const bool oracle_mode = std::is_same_v<Index, TmsIndex> &&
+                             (g_tms_mode == TmsMode::ORACLE || g_tms_mode == TmsMode::ORACLE_SCAN);
     if (oracle_mode != !oracle_path.empty()) {
-        std::cerr << "--mode oracle and --oracle FILE go together\n";
+        std::cerr << "--mode oracle or oracle-scan and --oracle FILE go together\n";
         return 1;
     }
     if (oracle_mode && !oracle_write_path.empty()) {
@@ -1513,8 +1520,9 @@ int main(int argc, char** argv) {
             os << "  = " << mb(total);
             return os.str();
         };
-        const char* modes[] = {"psi", "phi", "phiskip", "dual", "oracle"};
-        const TmsMode mode_of[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL, TmsMode::ORACLE};
+        const char* modes[] = {"psi", "phi", "phiskip", "dual", "oracle", "oracle-scan"};
+        const TmsMode mode_of[] = {TmsMode::PSI,  TmsMode::PHI,    TmsMode::PHISKIP,
+                                   TmsMode::DUAL, TmsMode::ORACLE, TmsMode::ORACLE_SCAN};
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
         if (query) {
@@ -1525,7 +1533,7 @@ int main(int argc, char** argv) {
         }
         std::vector<std::string> names, plans;
         std::vector<std::string> rows;
-        for (int m = 0; m < 5; ++m)
+        for (int m = 0; m < 6; ++m)
             for (int r = 0; r < 3; ++r)
                 for (int pos = 0; pos < 2; ++pos)
                     for (int ps = 0; ps < 2; ++ps) {
@@ -1540,7 +1548,7 @@ int main(int argc, char** argv) {
                             plans.push_back(describe_plan(need));
                         }
                         std::ostringstream row;
-                        row << "  " << std::left << std::setw(8) << modes[m] << std::setw(9) << reports[r] << std::setw(12)
+                        row << "  " << std::left << std::setw(12) << modes[m] << std::setw(9) << reports[r] << std::setw(12)
                             << (pos ? "--positions" : "") << std::setw(13) << (ps ? "--phi-starts" : "") << std::right
                             << name;
                         rows.push_back(row.str());

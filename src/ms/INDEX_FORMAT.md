@@ -71,8 +71,8 @@ This section describes the current `ms` binary, not the format.
 | `--mode phi` with `--phi-starts`, `--positions` or `--report smem-one` | LF, PHI_START |
 | `--mode phiskip` or `dual` | LF, F_STARTS, PHI_LEN |
 | psi with `--positions` or `--report smem-one`; phiskip or dual with those or `--phi-starts` | LF, F_STARTS, PHI_START |
-| `--mode oracle` (replaying recorded repositions) | LF |
-| `--mode oracle` with `--positions` or `--report smem-one` | LF, PHI_START |
+| `--mode oracle` or `oracle-scan` (replaying recorded repositions) | LF |
+| `--mode oracle` or `oracle-scan` with `--positions` or `--report smem-one` | LF, PHI_START |
 | `--report smem-all` | LF, PHI_START, PHI_INV, plus F_STARTS outside phi and oracle modes |
 
 `ms index-plan INDEX` prints, for the index at hand, the sections and start tables each `tms-batch` command line loads and the RAM they take.

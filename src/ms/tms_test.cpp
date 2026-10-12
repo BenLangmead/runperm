@@ -960,12 +960,13 @@ bool throws(F f, const char* what) {
 }  // namespace
 
 /**
- * The oracle mode: reposition outcomes recorded by every other mode, for
+ * The oracle modes: reposition outcomes recorded by every other mode, for
  * several numbers of patterns in flight, are the same, and replaying them
- * in the oracle mode, with any number in flight, packed or column access,
- * with and without positions, through a file and on an index loaded with LF
- * alone, gives the lengths and positions of the other modes.  Replays that
- * do not fit the query are refused.
+ * in the oracle and oracle-scan modes, with any number in flight, packed or
+ * column access, with and without positions, through a file and on an index
+ * loaded with LF alone, gives the lengths and positions of the other modes.
+ * Replays that do not fit the query are refused, and oracle-scan refuses an
+ * interval its scan does not find.
  */
 bool test_tms_oracle(const std::string& data_dir) {
     std::cout << "Testing the oracle mode against the recording modes" << std::endl;
@@ -1015,6 +1016,7 @@ bool test_tms_oracle(const std::string& data_dir) {
             assert(!lf_need.psi && !lf_need.phi && !pos_need.psi && pos_need.phi && pos_need.phi_starts);
             TmsIndex lf_only = round_trip(idx, &lf_need), with_pos = round_trip(idx, &pos_need);
             assert(!lf_only.has_psi() && !lf_only.has_phi());
+            for (TmsMode replay_mode : {TmsMode::ORACLE, TmsMode::ORACLE_SCAN})
             for (size_t k : {1, 2, 3, 32, 1000})
                 for (int access = 0; access < 4; ++access) {
                     const bool packed = access < 2, positions = access % 2 == 1;
@@ -1023,7 +1025,7 @@ bool test_tms_oracle(const std::string& data_dir) {
                     const std::vector<std::string> sub(pats.begin() + first_pat, pats.end());
                     const TmsOracleView view = TmsOracleView::of(read, first_pat, sub.size());
                     std::vector<std::vector<ulint>> len, pos;
-                    tms_query_batch(positions ? with_pos : lf_only, sub, k, len, TmsMode::ORACLE,
+                    tms_query_batch(positions ? with_pos : lf_only, sub, k, len, replay_mode,
                                     positions ? &pos : nullptr, packed, nullptr, &view);
                     bool ok = len.size() == sub.size();
                     for (size_t j = 0; ok && j < sub.size(); ++j) {
@@ -1031,8 +1033,8 @@ bool test_tms_oracle(const std::string& data_dir) {
                         if (ok && positions) ok = pos[j] == want_pos[first_pat + j];
                     }
                     if (!ok) {
-                        std::cout << "  FAILED replay: k " << k << ", packed " << packed << ", positions " << positions
-                                  << std::endl;
+                        std::cout << "  FAILED replay: mode " << int(replay_mode) << ", k " << k << ", packed "
+                                  << packed << ", positions " << positions << std::endl;
                         assert(false && "the oracle mode must give the other modes' output");
                         return false;
                     }
@@ -1064,6 +1066,27 @@ bool test_tms_oracle(const std::string& data_dir) {
                     [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE, nullptr, true, nullptr, &fv); }, "fewer"));
                 assert(throws<std::runtime_error>(
                     [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE, nullptr, true, nullptr, &mv); }, "more"));
+                for (TmsMode m : {TmsMode::ORACLE, TmsMode::ORACLE_SCAN}) {
+                    assert(throws<std::invalid_argument>(
+                        [&] { tms_query_batch(lf_only, one, 1, len, m); }, "replay"));
+                    assert(throws<std::runtime_error>(
+                        [&] { tms_query_batch(lf_only, one, 1, len, m, nullptr, true, nullptr, &fv); }, "fewer"));
+                }
+                // oracle-scan refuses any interval but the one its scan
+                // finds, the nearest candidate on the recorded side: here
+                // the first outcome's interval moved one above and one below.
+                for (int delta : {-1, 1}) {
+                    auto moved = first[with_rep];
+                    if (delta < 0 && moved[0].interval == 0) continue;
+                    moved[0].interval += delta;
+                    TmsOracle bad_one;
+                    bad_one.move_runs = read.move_runs;
+                    bad_one.append({moved});
+                    const TmsOracleView bv = TmsOracleView::of(bad_one, 0, 1);
+                    assert(throws<std::runtime_error>(
+                        [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE_SCAN, nullptr, true, nullptr, &bv); },
+                        "oracle"));
+                }
             }
             assert(throws<std::runtime_error>([&] { TmsOracleView::of(read, 1, pats.size()); }, "fewer patterns"));
         }
