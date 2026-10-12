@@ -28,6 +28,7 @@
 #include "step_stats.hpp"
 #include "index_format.hpp"
 #include "ftab.hpp"
+#include "reposition_oracle.hpp"
 #include <cassert>
 #include <iostream>
 #include <utility>
@@ -1249,6 +1250,21 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
     return out;
 }
 
+/** How ms_query_batch repositions. */
+enum class MsMode {
+    STANDARD,     // scan both sides for the target, taking the LCP bounds as the scans go
+    ORACLE,       // replay recorded outcomes: no scan and no LCP bounds (see RepositionOracle)
+    ORACLE_SCAN,  // replay recorded outcomes' side and length, but scan that side for the target
+};
+
+namespace ms_detail {
+// Per-pattern oracle state of the batched engine, as a base of its slot so
+// that it takes no room when neither recording nor replaying.
+struct NoOracleSlot {};
+struct ReplaySlot { const RepositionDecision *orc, *orc_end; RepositionDecision orc_now; };
+struct RecordSlot { std::vector<RepositionDecision>* rec; };
+}  // namespace ms_detail
+
 /**
  * Matching statistics for many patterns at once, giving the same results as
  * ms_query on each.  Up to k patterns are in flight.  Each LF step is split
@@ -1263,13 +1279,30 @@ inline std::vector<ulint> ms_query(MSIndexSpillLCP<SP>& idx, const std::string& 
  * With an ftab (ftab.hpp) built for idx, a pattern whose last k-mer occurs
  * starts from the table's state, k steps in.  out[j] receives the
  * statistics for patterns[j].
+ *
+ * With Record, (*record)[j] receives every reposition outcome of patterns[j]
+ * in order: the run moved to and the match length before the LF step.
+ * ORACLE replays such outcomes from *replay: on a mismatch it takes the next
+ * recorded run and length and prefetches the run's row, and on the next
+ * visit moves there, reading neither the rows around the current one nor its
+ * spillover record.  ORACLE_SCAN prefetches the rows on the side of the
+ * current run that the recorded run is on, and on the next visit scans that
+ * side alone for the nearest run of the character, as the standard mode
+ * does but without taking LCP bounds, and moves there with the recorded
+ * length.  The run its scan finds must be the recorded one.
  */
-template <bool SP, class Access>
+template <bool SP, MsMode Mode = MsMode::STANDARD, bool Record = false, class Access>
 inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, const std::vector<std::string>& patterns,
-                                size_t k, std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr) {
+                                size_t k, std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr,
+                                const RepositionOracleView* replay = nullptr,
+                                std::vector<std::vector<RepositionDecision>>* record = nullptr) {
     constexpr bool packed = std::is_same_v<Access, typename MSIndexSpillLCP<SP>::PackedAccess>;
+    constexpr bool Replay = Mode != MsMode::STANDARD;
+    static_assert(!(Replay && Record), "the oracle modes replay outcomes rather than recording them");
     using Position = typename MSIndexSpillLCP<SP>::position;
-    struct Slot {
+    using OracleSlot = std::conditional_t<
+        Replay, ms_detail::ReplaySlot, std::conditional_t<Record, ms_detail::RecordSlot, ms_detail::NoOracleSlot>>;
+    struct Slot : OracleSlot {
         const char* pat;       // the pattern being matched
         ulint* ms;             // its output array
         size_t i;              // pattern[i - 1] is the next character to match
@@ -1283,6 +1316,7 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
     constexpr ulint rep_window = 8;
     const ulint last_run = idx.move_runs() - 1;
     out.resize(patterns.size());
+    if constexpr (Record) record->resize(patterns.size());
     if (k == 0) k = 1;
     // The alphabet codes of all bytes, kept local so that stores to the
     // output cannot force them to be reloaded.
@@ -1306,8 +1340,18 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
             const size_t j = next++;
             const size_t m = patterns[j].size();
             out[j].assign(m, 0);
+            if constexpr (Record) (*record)[j].clear();
             if (m == 0) continue;
-            s = Slot{patterns[j].data(), out[j].data(), m, idx.first(), 0, false};
+            s = Slot{};
+            s.pat = patterns[j].data();
+            s.ms = out[j].data();
+            s.i = m;
+            s.pos = idx.first();
+            if constexpr (Replay) {
+                s.orc = replay->decisions + replay->offsets[j];
+                s.orc_end = replay->decisions + replay->offsets[j + 1];
+            }
+            if constexpr (Record) s.rec = &(*record)[j];
             if (ft) {
                 if (j + ahead < patterns.size()) ft->prefetch(keys[j + ahead]);
                 ftab::Entry e;
@@ -1334,10 +1378,49 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
             Slot& s = *sp;
             const uchar c = static_cast<uchar>(s.pat[s.i - 1]);
             if (s.repositioning) {
-                auto opt = reposition_target_impl(idx, acc, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
-                assert(opt && opt->second != LCP_GAP);
-                s.ms[s.i - 1] = s.match_len = std::min(s.match_len, opt->second) + 1;
-                s.pos = idx.start_LF(opt->first);
+                if constexpr (Replay) {
+                    const RepositionDecision o = s.orc_now;
+                    const ulint cur = s.pos.interval, v = o.interval;
+                    const bool up = v < cur;
+                    MS_COUNT(repositions, 1);
+                    if constexpr (Mode == MsMode::ORACLE_SCAN) {
+                        // The standard mode's walk on the recorded side,
+                        // reading each row's character alone.
+                        ulint w = cur;
+                        bool found = false;
+                        if (up) {
+                            while (w > 0) {
+                                MS_COUNT(walk_up, 1);
+                                if (acc.code(acc.tail(acc.row(--w))) == codes[c]) { found = true; break; }
+                            }
+                        } else {
+                            while (w < last_run) {
+                                MS_COUNT(walk_down, 1);
+                                if (acc.code(acc.tail(acc.row(++w))) == codes[c]) { found = true; break; }
+                            }
+                        }
+                        if (!found || w != v)
+                            throw std::runtime_error("the scan found another run than the oracle recorded; was it "
+                                                     "recorded on this index and these patterns?");
+                    }
+                    Position from{};
+                    if (up) {
+                        from.interval = v + 1;
+                        from = idx.up(from);
+                    } else {
+                        from.interval = v - 1;
+                        from = idx.down(from);
+                    }
+                    s.ms[s.i - 1] = s.match_len = o.len + 1;
+                    s.pos = idx.start_LF(from);
+                } else {
+                    auto opt = reposition_target_impl(idx, acc, s.pos.interval, static_cast<ulint>(s.pos.offset), c);
+                    assert(opt && opt->second != LCP_GAP);
+                    if constexpr (Record)
+                        s.rec->push_back(RepositionDecision{opt->first.interval, std::min(s.match_len, opt->second)});
+                    s.ms[s.i - 1] = s.match_len = std::min(s.match_len, opt->second) + 1;
+                    s.pos = idx.start_LF(opt->first);
+                }
                 s.repositioning = false;
             } else {
                 // Resolve the pending LF step and read the landing row.
@@ -1377,10 +1460,24 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                     // Prefetch what the reposition reads first and do it on
                     // the next visit; this character is not consumed yet.
                     const ulint cur = pos.interval;
-                    const ulint lo = cur > rep_window ? cur - rep_window : 0;
-                    const ulint hi = std::min(cur + rep_window, last_run);
-                    acc.prefetch_rows(lo, hi);
-                    idx.prefetch_spill(cur, acc.spill(r));
+                    if constexpr (Replay) {
+                        if (s.orc == s.orc_end)
+                            throw std::runtime_error("the oracle has fewer repositions for a pattern than its query makes");
+                        const RepositionDecision o = *s.orc++;
+                        const ulint v = o.interval;
+                        if (v == cur || v > last_run || o.len > s.match_len)
+                            throw std::runtime_error("an oracle decision does not fit the query; was it recorded "
+                                                     "on this index and these patterns?");
+                        s.orc_now = o;
+                        if constexpr (Mode == MsMode::ORACLE) acc.prefetch(v);
+                        else if (v < cur) acc.prefetch_rows(cur > rep_window ? cur - rep_window : 0, cur - 1);
+                        else acc.prefetch_rows(cur + 1, std::min(cur + rep_window, last_run));
+                    } else {
+                        const ulint lo = cur > rep_window ? cur - rep_window : 0;
+                        const ulint hi = std::min(cur + rep_window, last_run);
+                        acc.prefetch_rows(lo, hi);
+                        idx.prefetch_spill(cur, acc.spill(r));
+                    }
                     s.pos = pos;
                     s.repositioning = true;
                     ++sp;
@@ -1388,20 +1485,54 @@ inline void ms_query_batch_impl(MSIndexSpillLCP<SP>& idx, const Access acc, cons
                 }
             }
             acc.prefetch(s.pos.interval);
+            if constexpr (Replay) {
+                if (s.i == 1 && s.orc != s.orc_end)
+                    throw std::runtime_error("the oracle has more repositions for a pattern than its query makes");
+            }
             if (--s.i > 0 || start(s)) ++sp;
             else s = *--end;
         }
     }
 }
 
+/**
+ * ms_query_batch_impl in the given mode, through packed access when the
+ * index's columns fit it, else column access.  With record, the reposition
+ * outcomes are recorded there (standard mode only); the oracle modes replay
+ * them from replay, which must be recorded on an index with the same LF
+ * intervals, for the same patterns.  Recording and replaying take no ftab,
+ * since a table skips the repositions of a pattern's last k characters.
+ */
 template <bool SP>
 inline void ms_query_batch(MSIndexSpillLCP<SP>& idx, const std::vector<std::string>& patterns, size_t k,
-                           std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr) {
-    if constexpr (MSIndexSpillLCP<SP>::packed_access_supported) {
-        const auto acc = idx.packed_access();
-        if (acc.fits()) return ms_query_batch_impl(idx, acc, patterns, k, out, ft);
+                           std::vector<std::vector<ulint>>& out, const ftab::Ftab* ft = nullptr,
+                           MsMode mode = MsMode::STANDARD, const RepositionOracleView* replay = nullptr,
+                           std::vector<std::vector<RepositionDecision>>* record = nullptr) {
+    const bool oracle = mode != MsMode::STANDARD;
+    if (ft && (oracle || record))
+        throw std::invalid_argument("recording or replaying repositions takes no ftab, which skips some of them");
+    if (oracle && !replay) throw std::invalid_argument("the oracle modes need recorded repositions to replay");
+    if (!oracle && replay) throw std::invalid_argument("only the oracle modes replay recorded repositions");
+    if (oracle && record) throw std::invalid_argument("the oracle modes cannot record repositions");
+    if (oracle && replay->move_runs != idx.move_runs())
+        throw std::invalid_argument("the oracle was recorded on an index with other LF intervals");
+    auto run = [&](auto m, auto rec) {
+        constexpr MsMode M = decltype(m)::value;
+        constexpr bool R = decltype(rec)::value;
+        if constexpr (MSIndexSpillLCP<SP>::packed_access_supported) {
+            const auto acc = idx.packed_access();
+            if (acc.fits()) return ms_query_batch_impl<SP, M, R>(idx, acc, patterns, k, out, ft, replay, record);
+        }
+        ms_query_batch_impl<SP, M, R>(idx, idx.column_access(), patterns, k, out, ft, replay, record);
+    };
+    switch (mode) {
+        case MsMode::STANDARD:
+            if (record) run(std::integral_constant<MsMode, MsMode::STANDARD>{}, std::true_type{});
+            else run(std::integral_constant<MsMode, MsMode::STANDARD>{}, std::false_type{});
+            break;
+        case MsMode::ORACLE: run(std::integral_constant<MsMode, MsMode::ORACLE>{}, std::false_type{}); break;
+        case MsMode::ORACLE_SCAN: run(std::integral_constant<MsMode, MsMode::ORACLE_SCAN>{}, std::false_type{}); break;
     }
-    ms_query_batch_impl(idx, idx.column_access(), patterns, k, out, ft);
 }
 
 /**

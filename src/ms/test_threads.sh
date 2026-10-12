@@ -191,4 +191,34 @@ $M tms-batch mini.tms reads.fa -o o.out --mode oracle-scan 2> /dev/null && { ech
 $M tms-batch mini.tms m.fa -o o.out --mode oracle --oracle ref.orc 2> /dev/null && { echo "oracle accepted other reads"; fails=$((fails + 1)); }
 echo "checked oracle"
 
+# The same for batch on the ms index: recordings with any K, T and B are the
+# same file, and oracle and oracle-scan replays of it, with any K, T and B
+# and with --orient rc, give the standard mode's output.
+$M batch mini.idx reads.fa -o ms_ref.out --oracle-write ms_ref.orc 2> err.txt || { echo "failed: batch --oracle-write"; cat err.txt; exit 1; }
+cmp -s ms_ref.out <($M batch mini.idx reads.fa -o /dev/stdout 2> /dev/null) || { echo "differs: batch recording"; fails=$((fails + 1)); }
+for rec in "0 1 1000" "7 3 13" "32 8 1"; do
+    set -- $rec
+    $M batch mini.idx reads.fa -o o.out --interleave $1 --threads $2 --block-reads $3 --oracle-write o.orc 2> /dev/null
+    cmp -s ms_ref.orc o.orc || { echo "ms oracle differs: recorded with $rec"; fails=$((fails + 1)); }
+done
+for om in oracle oracle-scan; do
+for k in 0 1 7 32; do for t in 1 3 8; do for b in 1 13 1000; do
+    $M batch mini.idx reads.fa -o o.out --mode $om --oracle ms_ref.orc --interleave $k --threads $t --block-reads $b 2> err.txt \
+        || { echo "failed: batch $om k=$k t=$t b=$b"; cat err.txt; fails=$((fails + 1)); continue; }
+    cmp -s ms_ref.out o.out || { echo "differs: batch $om k=$k t=$t b=$b"; fails=$((fails + 1)); }
+done; done; done
+done
+$M batch mini.idx reads.fa -o ms_ref.rc --orient rc --oracle-write ms_rc.orc 2> /dev/null
+for om in oracle oracle-scan; do
+    $M batch mini.idx reads.fa -o o.out --mode $om --orient rc --oracle ms_rc.orc --threads 3 --block-reads 13 2> /dev/null
+    cmp -s ms_ref.rc o.out || { echo "differs: batch $om --orient rc"; fails=$((fails + 1)); }
+done
+# Refused: an oracle mode without an oracle, an oracle for other reads, the
+# tms index's oracle (other LF intervals), and recording with an ftab.
+$M batch mini.idx reads.fa -o o.out --mode oracle 2> /dev/null && { echo "batch oracle accepted no oracle"; fails=$((fails + 1)); }
+$M batch mini.idx m.fa -o o.out --mode oracle-scan --oracle ms_ref.orc 2> /dev/null && { echo "batch oracle-scan accepted other reads"; fails=$((fails + 1)); }
+$M batch mini.idx reads.fa -o o.out --mode oracle --oracle ref.orc 2> /dev/null && { echo "batch accepted the tms index's oracle"; fails=$((fails + 1)); }
+$M batch mini.idx reads.fa -o o.out --ftab-k 4 --oracle-write o.orc 2> /dev/null && { echo "batch recorded with an ftab"; fails=$((fails + 1)); }
+echo "checked batch oracle"
+
 if [ $fails -eq 0 ]; then echo "All thread checks PASSED"; else echo "$fails thread checks FAILED"; exit 1; fi

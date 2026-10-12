@@ -980,11 +980,11 @@ bool test_tms_oracle(const std::string& data_dir) {
             TmsIndex idx(in.heads, in.lens, o, &in.tops);
             std::vector<std::vector<ulint>> want, want_pos;
             tms_query_batch(idx, pats, 8, want, TmsMode::PSI, &want_pos);
-            std::vector<std::vector<TmsDecision>> first;
+            std::vector<std::vector<RepositionDecision>> first;
             for (TmsMode mode : modes)
                 for (size_t k : {1, 3, 32}) {
                     std::vector<std::vector<ulint>> len;
-                    std::vector<std::vector<TmsDecision>> rec;
+                    std::vector<std::vector<RepositionDecision>> rec;
                     tms_query_batch(idx, pats, k, len, mode, nullptr, true, nullptr, nullptr, &rec);
                     assert(len == want);
                     assert(rec.size() == pats.size());
@@ -1000,14 +1000,14 @@ bool test_tms_oracle(const std::string& data_dir) {
                             assert(rec[j][i].interval == first[j][i].interval && rec[j][i].len == first[j][i].len);
                     }
                 }
-            TmsOracle oracle;
+            RepositionOracle oracle;
             oracle.move_runs = idx.move_runs();
             oracle.append(first);
             decisions += oracle.decisions.size();
             // Through the file format.
             std::stringstream file;
             oracle.write(file);
-            TmsOracle read;
+            RepositionOracle read;
             read.read(file);
             assert(read.move_runs == oracle.move_runs && read.offsets == oracle.offsets);
             assert(read.decisions.size() == oracle.decisions.size());
@@ -1023,7 +1023,7 @@ bool test_tms_oracle(const std::string& data_dir) {
                     // Replay a slice of the patterns too, as a block of reads does.
                     const size_t first_pat = k == 3 ? pats.size() / 3 : 0;
                     const std::vector<std::string> sub(pats.begin() + first_pat, pats.end());
-                    const TmsOracleView view = TmsOracleView::of(read, first_pat, sub.size());
+                    const RepositionOracleView view = RepositionOracleView::of(read, first_pat, sub.size());
                     std::vector<std::vector<ulint>> len, pos;
                     tms_query_batch(positions ? with_pos : lf_only, sub, k, len, replay_mode,
                                     positions ? &pos : nullptr, packed, nullptr, &view);
@@ -1045,7 +1045,7 @@ bool test_tms_oracle(const std::string& data_dir) {
             std::vector<std::vector<ulint>> len;
             assert(throws<std::invalid_argument>([&] { tms_query_batch(lf_only, pats, 8, len, TmsMode::ORACLE); },
                                                  "replay"));
-            TmsOracleView bad = TmsOracleView::of(read, 0, pats.size());
+            RepositionOracleView bad = RepositionOracleView::of(read, 0, pats.size());
             bad.move_runs += 1;
             assert(throws<std::invalid_argument>(
                 [&] { tms_query_batch(lf_only, pats, 8, len, TmsMode::ORACLE, nullptr, true, nullptr, &bad); }, "LF intervals"));
@@ -1055,13 +1055,13 @@ bool test_tms_oracle(const std::string& data_dir) {
                 // A pattern's outcomes without its last one, and with its
                 // last one twice.
                 const std::vector<std::string> one{pats[with_rep]};
-                TmsOracle fewer, more;
+                RepositionOracle fewer, more;
                 fewer.move_runs = more.move_runs = read.move_runs;
-                fewer.append({std::vector<TmsDecision>(first[with_rep].begin(), first[with_rep].end() - 1)});
+                fewer.append({std::vector<RepositionDecision>(first[with_rep].begin(), first[with_rep].end() - 1)});
                 auto extra = first[with_rep];
                 extra.push_back(extra.back());
                 more.append({extra});
-                const TmsOracleView fv = TmsOracleView::of(fewer, 0, 1), mv = TmsOracleView::of(more, 0, 1);
+                const RepositionOracleView fv = RepositionOracleView::of(fewer, 0, 1), mv = RepositionOracleView::of(more, 0, 1);
                 assert(throws<std::runtime_error>(
                     [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE, nullptr, true, nullptr, &fv); }, "fewer"));
                 assert(throws<std::runtime_error>(
@@ -1079,16 +1079,16 @@ bool test_tms_oracle(const std::string& data_dir) {
                     auto moved = first[with_rep];
                     if (delta < 0 && moved[0].interval == 0) continue;
                     moved[0].interval += delta;
-                    TmsOracle bad_one;
+                    RepositionOracle bad_one;
                     bad_one.move_runs = read.move_runs;
                     bad_one.append({moved});
-                    const TmsOracleView bv = TmsOracleView::of(bad_one, 0, 1);
+                    const RepositionOracleView bv = RepositionOracleView::of(bad_one, 0, 1);
                     assert(throws<std::runtime_error>(
                         [&] { tms_query_batch(lf_only, one, 1, len, TmsMode::ORACLE_SCAN, nullptr, true, nullptr, &bv); },
                         "oracle"));
                 }
             }
-            assert(throws<std::runtime_error>([&] { TmsOracleView::of(read, 1, pats.size()); }, "fewer patterns"));
+            assert(throws<std::runtime_error>([&] { RepositionOracleView::of(read, 1, pats.size()); }, "fewer patterns"));
         }
     }
     std::cout << "  " << decisions << " recorded repositions and " << replays << " replays PASSED" << std::endl;
@@ -1702,7 +1702,7 @@ size_t check_tms_with_ftab(TmsIndex& idx, const std::vector<std::string>& pats, 
     // Recording takes no table, which skips some of the repositions.
     if (idx.has_psi()) {
         std::vector<std::vector<ulint>> got;
-        std::vector<std::vector<TmsDecision>> rec;
+        std::vector<std::vector<RepositionDecision>> rec;
         assert(throws<std::invalid_argument>(
             [&] { tms_query_batch(idx, pats, 8, got, TmsMode::PSI, nullptr, true, &ft, nullptr, &rec); }, "ftab"));
     }

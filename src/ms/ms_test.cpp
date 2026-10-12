@@ -705,12 +705,29 @@ bool test_index_file_roundtrip(const std::string& data_dir) {
     return true;
 }
 
+// Whether f throws an E whose message contains what.
+template <typename E, typename F>
+static bool throws_msg(F f, const char* what) {
+    try {
+        f();
+    } catch (const E& e) {
+        return std::string(e.what()).find(what) != std::string::npos;
+    }
+    return false;
+}
+
 /**
  * Check that ms_query_batch gives exactly what ms_query gives on each
  * pattern, for several numbers of patterns in flight, with relative and
  * absolute positions.  The patterns vary in length (including empty and
  * single-character ones) and error rate, and some contain N, so they
  * exercise case 1 steps, repositions, restarts and slot refills.
+ *
+ * Reposition outcomes recorded with several numbers in flight are the same,
+ * and replaying them in the oracle and oracle-scan modes, through the file
+ * format, with packed and column access, several numbers in flight and a
+ * slice of the patterns, gives ms_query's output.  Replays that do not fit
+ * the query are refused, and so is recording with an ftab.
  */
 template <bool SP>
 static bool check_ms_query_batch(const std::string& path, const std::string& T, const ms_io::BuildOptions& o,
@@ -787,7 +804,94 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
             return false;
         }
     }
-    std::cout << "  " << name << (SP ? " (absolute)" : "") << " PASSED" << std::endl;
+    std::vector<std::vector<RepositionDecision>> first;
+    for (size_t k : {1, 3, 32}) {
+        std::vector<std::vector<ulint>> got;
+        std::vector<std::vector<RepositionDecision>> rec;
+        ms_query_batch(*idx, patterns, k, got, nullptr, MsMode::STANDARD, nullptr, &rec);
+        assert(got == want);
+        if (first.empty()) first = rec;
+        bool same = rec.size() == first.size();
+        for (size_t j = 0; same && j < rec.size(); ++j) {
+            same = rec[j].size() == first[j].size();
+            for (size_t i = 0; same && i < rec[j].size(); ++i)
+                same = rec[j][i].interval == first[j][i].interval && rec[j][i].len == first[j][i].len;
+        }
+        if (!same) {
+            std::cout << "  FAILED for " << name << ": recorded outcomes differ with " << k << " in flight" << std::endl;
+            assert(false && "recorded outcomes must not depend on k");
+            return false;
+        }
+    }
+    RepositionOracle oracle;
+    oracle.move_runs = idx->move_runs();
+    oracle.append(first);
+    std::stringstream file;
+    oracle.write(file);
+    RepositionOracle read;
+    read.read(file);
+    assert(read.move_runs == oracle.move_runs && read.offsets == oracle.offsets);
+    size_t replays = 0;
+    for (MsMode mode : {MsMode::ORACLE, MsMode::ORACLE_SCAN})
+        for (size_t k : {1, 2, 3, 32, 1000})
+            for (bool columns : {false, true}) {
+                // Replay a slice of the patterns too, as a block of reads does.
+                const size_t first_pat = k == 3 ? patterns.size() / 3 : 0;
+                const std::vector<std::string> sub(patterns.begin() + first_pat, patterns.end());
+                const RepositionOracleView view = RepositionOracleView::of(read, first_pat, sub.size());
+                std::vector<std::vector<ulint>> got;
+                if (!columns) ms_query_batch(*idx, sub, k, got, nullptr, mode, &view);
+                else if (mode == MsMode::ORACLE)
+                    ms_query_batch_impl<SP, MsMode::ORACLE>(*idx, idx->column_access(), sub, k, got, nullptr, &view);
+                else ms_query_batch_impl<SP, MsMode::ORACLE_SCAN>(*idx, idx->column_access(), sub, k, got, nullptr, &view);
+                const bool ok = std::equal(got.begin(), got.end(), want.begin() + first_pat, want.end());
+                if (!ok) {
+                    std::cout << "  FAILED for " << name << ": replay in mode " << int(mode) << " with " << k
+                              << " in flight, columns " << columns << std::endl;
+                    assert(false && "the oracle modes must give ms_query's output");
+                    return false;
+                }
+                ++replays;
+            }
+    // Refusals: no oracle, an oracle for other intervals, recording with an
+    // ftab, too few or too many outcomes for a pattern, and in oracle-scan
+    // an interval other than the one its scan finds.
+    std::vector<std::vector<ulint>> got;
+    for (MsMode mode : {MsMode::ORACLE, MsMode::ORACLE_SCAN})
+        assert(throws_msg<std::invalid_argument>([&] { ms_query_batch(*idx, patterns, 8, got, nullptr, mode); }, "replay"));
+    RepositionOracleView bad = RepositionOracleView::of(read, 0, patterns.size());
+    bad.move_runs += 1;
+    assert(throws_msg<std::invalid_argument>(
+        [&] { ms_query_batch(*idx, patterns, 8, got, nullptr, MsMode::ORACLE, &bad); }, "LF intervals"));
+    std::vector<std::vector<RepositionDecision>> rec;
+    assert(throws_msg<std::invalid_argument>(
+        [&] { ms_query_batch(*idx, patterns, 8, got, &tabs[0], MsMode::STANDARD, nullptr, &rec); }, "ftab"));
+    size_t with_rep = 0;
+    while (with_rep < patterns.size() && first[with_rep].empty()) ++with_rep;
+    assert(with_rep < patterns.size());
+    const std::vector<std::string> one{patterns[with_rep]};
+    auto replay_one = [&](std::vector<RepositionDecision> d, MsMode mode) {
+        RepositionOracle o;
+        o.move_runs = read.move_runs;
+        o.append({d});
+        const RepositionOracleView v = RepositionOracleView::of(o, 0, 1);
+        ms_query_batch(*idx, one, 1, got, nullptr, mode, &v);
+    };
+    auto fewer = first[with_rep], more = first[with_rep];
+    fewer.pop_back();
+    more.push_back(more.back());
+    for (MsMode mode : {MsMode::ORACLE, MsMode::ORACLE_SCAN}) {
+        assert(throws_msg<std::runtime_error>([&] { replay_one(fewer, mode); }, "fewer"));
+        assert(throws_msg<std::runtime_error>([&] { replay_one(more, mode); }, "more"));
+    }
+    for (int delta : {-1, 1}) {
+        auto moved = first[with_rep];
+        if (delta < 0 && moved[0].interval == 0) continue;
+        moved[0].interval += delta;
+        assert(throws_msg<std::runtime_error>([&] { replay_one(moved, MsMode::ORACLE_SCAN); }, "oracle"));
+    }
+    std::cout << "  " << name << (SP ? " (absolute)" : "") << " and " << oracle.decisions.size()
+              << " recorded repositions in " << replays << " replays PASSED" << std::endl;
     return true;
 }
 
