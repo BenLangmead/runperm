@@ -68,6 +68,8 @@ protected:
 public:
     using data_columns = data_columns_t;
     using data_tuple = columns_tuple<data_columns>;
+    // For each data column, whether it gets width 0 (see the constructors from an encoding)
+    using zero_width_columns = std::array<bool, num_run_cols>;
     using position = typename move_structure_perm::position;
     using interval_encoding_t = interval_encoding_impl<cols_traits::INVERTIBLE>;
 
@@ -125,10 +127,13 @@ public:
     permutation_impl(const container1_t& lengths, const container2_t& images, const split_params& sp = split_params())
     : permutation_impl(lengths, images, sp, std::vector<data_tuple>(lengths.size())) {}
 
-    // Intended constructor for manual splitting of run data
+    // Intended constructor for manual splitting of run data.  Data columns
+    // marked in zero_width get width 0: they take no bits and read as 0, so
+    // their run data must be 0.
     template<typename interval_encoding_impl_t>
-    permutation_impl(const interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data) {
-        build_from_interval_encoding(enc, run_data);
+    permutation_impl(const interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data,
+                     const zero_width_columns& zero_width = {}) {
+        build_from_interval_encoding(enc, run_data, zero_width);
     }
 
     // Both arguments are rvalues. See the one-argument overload above.
@@ -184,11 +189,13 @@ public:
      * Column-major run data. run_cols[c][i] is column c of interval i.
      * Each column container must support size() and operator[](i) -> ulint.
      * Packing is the caller's choice of container (int_vector, vector<ulint>, ...).
+     * Data columns marked in zero_width get width 0, as above.
      */
     template<typename interval_encoding_impl_t, typename ColContainer,
              std::enable_if_t<(num_run_cols > 0) && std::is_object_v<ColContainer>, int> = 0>
-    permutation_impl(const interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols) {
-        build_from_interval_encoding_columns(enc, run_cols);
+    permutation_impl(const interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols,
+                     const zero_width_columns& zero_width = {}) {
+        build_from_interval_encoding_columns(enc, run_cols, zero_width);
     }
 
     // Both arguments are rvalues. See the one-argument overload above.
@@ -630,8 +637,9 @@ protected:
     // Lvalues only. An rvalue encoding selects the by-value overload, which drops packed vectors.
     template<typename interval_encoding_impl_t,
              std::enable_if_t<std::is_lvalue_reference_v<interval_encoding_impl_t>, int> = 0>
-    void build_from_interval_encoding(interval_encoding_impl_t&& enc, const std::vector<data_tuple> &run_data) {
-        build_from_interval_encoding_impl(enc, run_data, static_cast<std::decay_t<interval_encoding_impl_t>*>(nullptr));
+    void build_from_interval_encoding(interval_encoding_impl_t&& enc, const std::vector<data_tuple> &run_data,
+                                      const zero_width_columns& zero_width = {}) {
+        build_from_interval_encoding_impl(enc, run_data, static_cast<std::decay_t<interval_encoding_impl_t>*>(nullptr), zero_width);
     }
 
     template<typename interval_encoding_impl_t,
@@ -645,8 +653,9 @@ protected:
 
     template<typename interval_encoding_impl_t, typename ColContainer,
              std::enable_if_t<std::is_lvalue_reference_v<interval_encoding_impl_t>, int> = 0>
-    void build_from_interval_encoding_columns(interval_encoding_impl_t&& enc, const std::array<ColContainer, num_run_cols>& run_cols) {
-        build_from_interval_encoding_columns_impl(enc, run_cols, static_cast<std::decay_t<interval_encoding_impl_t>*>(nullptr));
+    void build_from_interval_encoding_columns(interval_encoding_impl_t&& enc, const std::array<ColContainer, num_run_cols>& run_cols,
+                                              const zero_width_columns& zero_width = {}) {
+        build_from_interval_encoding_columns_impl(enc, run_cols, static_cast<std::decay_t<interval_encoding_impl_t>*>(nullptr), zero_width);
     }
 
     template<typename interval_encoding_impl_t, typename ColContainer,
@@ -659,7 +668,8 @@ protected:
     }
 
     template<typename interval_encoding_impl_t>
-    void build_from_interval_encoding_impl(const interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data, interval_encoding_impl_t* drop_enc) {
+    void build_from_interval_encoding_impl(const interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data, interval_encoding_impl_t* drop_enc,
+                                           const zero_width_columns& zero_width = {}) {
         // Plain permutations may take an invertible encoding (e.g. after
         // union splitting); invertible permutations still require one.
         static_assert(!cols_traits::INVERTIBLE ||
@@ -672,7 +682,7 @@ protected:
             drop_enc->drop_storage();
         }
         if (run_data.size() == enc.intervals()) {
-            populate_structure(std::move(built.rows), std::move(built.spill), run_data, enc.domain(), enc.runs());
+            populate_structure(std::move(built.rows), std::move(built.spill), run_data, enc.domain(), enc.runs(), zero_width);
         }
         else if (run_data.size() == enc.runs()) {
             throw std::invalid_argument("Run data size is same as number of runs, not intervals after splitting; avoid splitting, manually split run data, or use permutation copy split.");
@@ -682,7 +692,8 @@ protected:
     }
 
     template<typename interval_encoding_impl_t, typename ColContainer>
-    void build_from_interval_encoding_columns_impl(const interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols, interval_encoding_impl_t* drop_enc) {
+    void build_from_interval_encoding_columns_impl(const interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols, interval_encoding_impl_t* drop_enc,
+                                                   const zero_width_columns& zero_width = {}) {
         static_assert(!cols_traits::INVERTIBLE ||
                           interval_encoding_impl_t::invertible_tag,
                       "Invertible permutation requires an invertible "
@@ -694,7 +705,7 @@ protected:
         }
         const size_t n = run_columns_rows(run_cols);
         if (n == enc.intervals()) {
-            populate_structure(std::move(built.rows), std::move(built.spill), run_cols, enc.domain(), enc.runs());
+            populate_structure(std::move(built.rows), std::move(built.spill), run_cols, enc.domain(), enc.runs(), zero_width);
         }
         else if (n == enc.runs()) {
             throw std::invalid_argument("Run data size is same as number of runs, not intervals after splitting; avoid splitting, manually split run data, or use permutation copy split.");
@@ -785,7 +796,9 @@ protected:
         return final_run_data;
     }
 
-    std::array<uchar, num_run_cols> get_data_cols_widths(const std::vector<data_tuple> &run_data) {
+    // Data columns marked in zero_width get width 0 and must hold only zeros.
+    std::array<uchar, num_run_cols> get_data_cols_widths(const std::vector<data_tuple> &run_data,
+                                                         const zero_width_columns& zero_width = {}) {
         data_tuple max_value = {};
         std::array<uchar, num_run_cols> run_cols_widths = {};
         for (size_t i = 0; i < num_run_cols; ++i) {
@@ -794,13 +807,17 @@ protected:
             }
         }
         for (size_t i = 0; i < num_run_cols; ++i) {
-            run_cols_widths[i] = bit_width(max_value[i]);
+            if (zero_width[i] && max_value[i] != 0) {
+                throw std::invalid_argument("a zero-width data column must hold only zeros");
+            }
+            run_cols_widths[i] = zero_width[i] ? 0 : bit_width(max_value[i]);
         }
         return run_cols_widths;
     }
 
     template<typename ColContainer>
-    std::array<uchar, num_run_cols> get_data_cols_widths(const std::array<ColContainer, num_run_cols>& run_cols) {
+    std::array<uchar, num_run_cols> get_data_cols_widths(const std::array<ColContainer, num_run_cols>& run_cols,
+                                                         const zero_width_columns& zero_width = {}) {
         const size_t n = run_columns_rows(run_cols);
         std::array<ulint, num_run_cols> max_value{};
         std::array<uchar, num_run_cols> run_cols_widths{};
@@ -810,7 +827,10 @@ protected:
             }
         }
         for (size_t c = 0; c < num_run_cols; ++c) {
-            run_cols_widths[c] = bit_width(max_value[c]);
+            if (zero_width[c] && max_value[c] != 0) {
+                throw std::invalid_argument("a zero-width data column must hold only zeros");
+            }
+            run_cols_widths[c] = zero_width[c] ? 0 : bit_width(max_value[c]);
         }
         return run_cols_widths;
     }
@@ -857,9 +877,10 @@ protected:
     }
 
     // Sets move structure and run data from the base structure and run data
-    void populate_structure(packed_vector<base_columns>&& base_structure, pointer_spillover spill, const std::vector<data_tuple>& run_data, const size_t domain, const size_t runs) {
+    void populate_structure(packed_vector<base_columns>&& base_structure, pointer_spillover spill, const std::vector<data_tuple>& run_data, const size_t domain, const size_t runs,
+                            const zero_width_columns& zero_width = {}) {
         check_run_rows_match_structure(run_data.size(), base_structure.size());
-        auto run_cols_widths = this->get_data_cols_widths(run_data);
+        auto run_cols_widths = this->get_data_cols_widths(run_data, zero_width);
         if constexpr (integrated_move_structure) {
             auto base_widths = base_structure.get_widths();
             auto widths = get_widths(base_widths, run_cols_widths);
@@ -879,9 +900,10 @@ protected:
     }
 
     template<typename ColContainer>
-    void populate_structure(packed_vector<base_columns>&& base_structure, pointer_spillover spill, const std::array<ColContainer, num_run_cols>& run_cols, const size_t domain, const size_t runs) {
+    void populate_structure(packed_vector<base_columns>&& base_structure, pointer_spillover spill, const std::array<ColContainer, num_run_cols>& run_cols, const size_t domain, const size_t runs,
+                            const zero_width_columns& zero_width = {}) {
         check_run_rows_match_structure(run_columns_rows(run_cols), base_structure.size());
-        auto run_cols_widths = this->get_data_cols_widths(run_cols);
+        auto run_cols_widths = this->get_data_cols_widths(run_cols, zero_width);
         if constexpr (integrated_move_structure) {
             auto base_widths = base_structure.get_widths();
             auto widths = get_widths(base_widths, run_cols_widths);
