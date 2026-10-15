@@ -73,12 +73,17 @@ protected:
                   const split_params& sp = split_params()) 
     : rlbwt_permutation(rlbwt_heads, rlbwt_run_lengths, sp, std::vector<data_tuple>(rlbwt_heads.size())) {}
 
-    // Regular non-gated constructors for user defined data columns
+    using zero_width_columns = typename base::zero_width_columns;
+
+    // Regular non-gated constructors for user defined data columns.  Data
+    // columns marked in zero_width get width 0 and must hold only zeros (see
+    // permutation_impl).
     template<typename rlbwt_interval_encoding_impl_t>
-    rlbwt_permutation(const rlbwt_interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data) {
+    rlbwt_permutation(const rlbwt_interval_encoding_impl_t& enc, const std::vector<data_tuple> &run_data,
+                      const zero_width_columns& zero_width = {}) {
         static_assert(std::is_same_v<alphabet_t, typename rlbwt_interval_encoding_impl_t::alphabet_tag>, "alphabet_t must be the same as the alphabet type used to create the interval encoding");
         alphabet_ = enc.get_alphabet();
-        base::build_from_interval_encoding(enc, run_data);
+        base::build_from_interval_encoding(enc, run_data, zero_width);
     }
 
     // Both arguments are rvalues. Alphabet is copied before packed vectors are dropped.
@@ -116,10 +121,11 @@ protected:
     // Column-major run data: run_cols[c][i] is column c of interval i.
     template<typename rlbwt_interval_encoding_impl_t, typename ColContainer,
              std::enable_if_t<(num_run_cols > 0) && std::is_object_v<ColContainer>, int> = 0>
-    rlbwt_permutation(const rlbwt_interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols) {
+    rlbwt_permutation(const rlbwt_interval_encoding_impl_t& enc, const std::array<ColContainer, num_run_cols>& run_cols,
+                      const zero_width_columns& zero_width = {}) {
         static_assert(std::is_same_v<alphabet_t, typename rlbwt_interval_encoding_impl_t::alphabet_tag>, "alphabet_t must be the same as the alphabet type used to create the interval encoding");
         alphabet_ = enc.get_alphabet();
-        base::build_from_interval_encoding_columns(enc, run_cols);
+        base::build_from_interval_encoding_columns(enc, run_cols, zero_width);
     }
 
     // Both arguments are rvalues. Alphabet is copied before packed vectors are dropped.
