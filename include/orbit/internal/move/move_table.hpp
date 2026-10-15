@@ -266,6 +266,12 @@ struct move_table_impl : public interface<move_table_impl<columns_t, interface, 
         return table[i].get();
     }
 
+    /** Hint that row i will be read soon. */
+    void prefetch(size_t i) const {
+        ORBIT_PREFETCH(&table[i]);
+        ORBIT_PREFETCH(reinterpret_cast<const char*>(&table[i]) + sizeof(row) - 1);
+    }
+
     size_t serialize(std::ostream &out) {
         size_t written_bytes = 0;
 
@@ -360,6 +366,24 @@ struct move_vector_impl : public interface<move_vector_impl<columns_t, interface
     std::array<ulint, num_cols> get_row(size_t i) const {
         return vec.get_row(i);
     }
+
+    /** Hint that row i will be read soon. */
+    void prefetch(size_t i) const {
+        vec.prefetch(i);
+    }
+    /** Hint that rows lo to hi will be read soon. */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        vec.prefetch_rows(lo, hi);
+    }
+
+    // A reader of the packed rows; see packed_matrix::reader.
+    auto get_reader() const { return vec.get_reader(); }
+
+    // Whole-row reads; see packed_matrix::get_row_bits.
+    bool row_fits_word() const { return vec.row_fits_word(); }
+    ulint get_row_bits(size_t i) const { return vec.get_row_bits(i); }
+    template <columns col>
+    ulint extract(ulint row_bits) const { return vec.template extract<col>(row_bits); }
 
     const std::array<uchar, num_cols>& get_widths() const {
         return vec.get_widths();

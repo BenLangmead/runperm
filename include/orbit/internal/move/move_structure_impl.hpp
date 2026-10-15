@@ -135,6 +135,25 @@ public:
         }
     }
 
+    /** Hint that the row of interval i will be read soon. */
+    void prefetch(size_t i) const {
+        table.prefetch(i);
+    }
+    /** Hint that the rows of intervals lo to hi will be read soon (move_vector tables). */
+    void prefetch_rows(size_t lo, size_t hi) const {
+        table.prefetch_rows(lo, hi);
+    }
+
+    // A reader of the packed rows, for move_vector tables; see packed_matrix::reader.
+    auto get_reader() const { return table.get_reader(); }
+
+    // Whole-row reads, for tables that support them (move_vector); see
+    // packed_matrix::get_row_bits.
+    bool row_fits_word() const { return table.row_fits_word(); }
+    ulint get_row_bits(size_t i) const { return table.get_row_bits(i); }
+    template<columns col>
+    ulint extract(ulint row_bits) const { return table.template extract<col>(row_bits); }
+
     // === Utility Methods ===
     std::string get_file_extension() const
     {
@@ -289,6 +308,42 @@ public:
 
     position move_exponential(position pos) const {
         return move<false>(pos);
+    }
+
+    /**
+     * The first half of move(): follow the pointer of pos's interval.  Only
+     * pos's own row is read, so a caller can prefetch the returned interval's
+     * row and later call finish_move() to get the result of move(pos).  The
+     * returned position is unresolved: its offset may run past its
+     * interval's end, and with absolute positions its idx is not yet set.
+     */
+    position start_move(position pos) const {
+        assert(pos.interval < this->table.size());
+        if constexpr (cols_traits::RELATIVE) {
+            assert(pos.offset < this->get_length(pos));
+            return {get_pointer(pos), pos.offset + get_offset(pos)};
+        } else {
+            assert(pos.idx < this->get_start(pos.interval + 1));
+            return {get_pointer(pos), get_offset(pos) + pos.offset, 0};
+        }
+    }
+
+    /** The second half of move(): resolve a position from start_move(). */
+    template<bool linear=true>
+    position finish_move(position pos) const {
+        if constexpr (!cols_traits::RELATIVE) {
+            pos.idx = this->get_start(pos.interval) + pos.offset;
+        }
+        if constexpr (linear) {
+            return this->fast_forward(pos);
+        } else {
+            return this->fast_forward_exponential(pos);
+        }
+    }
+
+    /** The second half of move_exponential(). */
+    position finish_move_exponential(position pos) const {
+        return finish_move<false>(pos);
     }
 
     // === Required from Base Class ===

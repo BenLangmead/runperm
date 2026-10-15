@@ -275,6 +275,83 @@ public:
         return position;
     }
 
+    /**
+     * next() in two halves, so that several positions can be advanced with
+     * their memory accesses overlapped: start_next() reads only the row of
+     * pos's interval and returns an unresolved position, prefetch() on its
+     * interval requests the row finish_next() will read, and finish_next()
+     * on the unresolved position returns next(pos).
+     */
+    position start_next(position position) const {
+        return move_structure.start_move(position);
+    }
+
+    position finish_next(position position) const {
+        if constexpr (store_absolute_positions && exponential_search) {
+            return move_structure.finish_move_exponential(position);
+        } else {
+            return move_structure.finish_move(position);
+        }
+    }
+
+    /**
+     * A reader of the move structure's packed rows (move_vector tables; see
+     * packed_matrix::reader), and the reader's column indices for the base
+     * columns and, when integrated, the data columns.  The pointer, offset,
+     * length and start columns are those of forward permutations.
+     */
+    auto get_reader() const { return move_structure.get_reader(); }
+    static constexpr size_t pointer_column() { return static_cast<size_t>(to_cols(cols_traits::POINTER)); }
+    static constexpr size_t offset_column() { return static_cast<size_t>(to_cols(cols_traits::OFFSET)); }
+    static constexpr size_t length_column() {
+        static_assert(cols_traits::RELATIVE, "rows store lengths only with relative positions");
+        return static_cast<size_t>(to_cols(cols_traits::LENGTH));
+    }
+    static constexpr size_t start_column() {
+        static_assert(!cols_traits::RELATIVE, "rows store starts only with absolute positions");
+        return static_cast<size_t>(to_cols(cols_traits::START));
+    }
+    template<data_columns col>
+    static constexpr size_t data_column() {
+        static_assert(integrated_move_structure, "data columns are in the row only when integrated");
+        return static_cast<size_t>(cols_traits::template data_column<col>());
+    }
+
+    /**
+     * Whole-row reads, for a move_vector table whose rows fit in one word:
+     * row_bits(i) reads interval i's row with one load, and the accessors
+     * below take its columns out of the result.
+     */
+    bool row_fits_word() const { return move_structure.row_fits_word(); }
+    ulint row_bits(ulint interval) const { return move_structure.get_row_bits(interval); }
+    ulint length_of(ulint bits) const {
+        static_assert(cols_traits::RELATIVE, "rows store lengths only with relative positions");
+        return move_structure.template extract<to_cols(cols_traits::LENGTH)>(bits);
+    }
+    ulint pointer_of(ulint bits) const { return move_structure.template extract<to_cols(cols_traits::POINTER)>(bits); }
+    ulint offset_of(ulint bits) const { return move_structure.template extract<to_cols(cols_traits::OFFSET)>(bits); }
+
+    /** Hint that the row of the given interval will be read soon. */
+    void prefetch(ulint interval) const {
+        move_structure.prefetch(interval);
+        // Without data columns the separate table has no rows, and its
+        // prefetch addresses would be meaningless.
+        if constexpr (!integrated_move_structure && num_run_cols > 0) {
+            this->data_cols.prefetch(interval);
+        }
+    }
+
+    /**
+     * Hint that the rows of intervals lo to hi, lo <= hi, will be read soon;
+     * each cache line is prefetched once.
+     */
+    void prefetch_rows(ulint lo, ulint hi) const {
+        move_structure.prefetch_rows(lo, hi);
+        if constexpr (!integrated_move_structure && num_run_cols > 0) {
+            this->data_cols.prefetch_rows(lo, hi);
+        }
+    }
+
     // Non-exponential search version of next()
     position next_linear(position position) {
         return move_structure.move(position);
