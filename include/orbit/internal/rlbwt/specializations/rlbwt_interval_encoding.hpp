@@ -39,13 +39,35 @@ public:
         return enc;
     }
 
+    // As above, taking over img_rank_inv instead of copying it when it is
+    // already wide enough (see interval_encoding_impl::init_img_rank_inv).
+    template<typename container1_t, typename container2_t>
+    static rlbwt_interval_encoding_impl<invertible, int_vector_t, alphabet_t>
+    from_heads_lengths_and_img_rank_inv(const container1_t& heads,
+                                        const container2_t& lengths,
+                                        int_vector_t&& img_rank_inv,
+                                        alphabet_t alphabet,
+                                        const size_t domain,
+                                        const ulint max_length,
+                                        const split_params& sp = split_params()) {
+        assert(heads.size() == lengths.size());
+        assert(lengths.size() == img_rank_inv.size());
+
+        rlbwt_interval_encoding_impl<invertible, int_vector_t, alphabet_t> enc;
+        enc.set_initial_values(domain, lengths.size(), max_length, sp);
+        enc.init_img_rank_inv(lengths, std::move(img_rank_inv));
+        enc.alphabet_ = std::move(alphabet);
+        enc.init_heads(heads, lengths);
+        return enc;
+    }
+
     template<typename container1_t, typename container2_t>
     static rlbwt_interval_encoding_impl<invertible, int_vector_t, alphabet_t> lf_interval_encoding(const container1_t& rlbwt_heads, const container2_t& rlbwt_run_lengths, const split_params& sp = split_params()) {
         assert(rlbwt_heads.size() == rlbwt_run_lengths.size());
 
         auto [head_counts, n, max_length] = get_LF_head_counts(rlbwt_heads, rlbwt_run_lengths);
         int_vector_t img_rank_inv = get_LF_img_rank_inv(rlbwt_heads, head_counts);
-        return from_heads_lengths_and_img_rank_inv(rlbwt_heads, rlbwt_run_lengths, img_rank_inv,
+        return from_heads_lengths_and_img_rank_inv(rlbwt_heads, rlbwt_run_lengths, std::move(img_rank_inv),
                                                    alphabet_t(head_counts), n, max_length, sp);
     }
 

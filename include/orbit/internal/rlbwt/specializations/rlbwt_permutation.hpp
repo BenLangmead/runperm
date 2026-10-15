@@ -86,6 +86,18 @@ protected:
         base::build_from_interval_encoding(enc, run_data, zero_width);
     }
 
+    using in_place_data_t = typename base::in_place_data_t;
+    static constexpr in_place_data_t in_place_data{};
+
+    // From an encoding, with the data columns' widths given and their values
+    // left to be written in place (see permutation_impl).
+    template<typename rlbwt_interval_encoding_impl_t>
+    rlbwt_permutation(const rlbwt_interval_encoding_impl_t& enc, const std::array<uchar, num_run_cols>& data_widths, in_place_data_t tag)
+        : base(enc, data_widths, tag) {
+        static_assert(std::is_same_v<alphabet_t, typename rlbwt_interval_encoding_impl_t::alphabet_tag>, "alphabet_t must be the same as the alphabet type used to create the interval encoding");
+        alphabet_ = enc.get_alphabet();
+    }
+
     // Both arguments are rvalues. Alphabet is copied before packed vectors are dropped.
     template<typename rlbwt_interval_encoding_impl_t,
              std::enable_if_t<!std::is_lvalue_reference_v<rlbwt_interval_encoding_impl_t> &&

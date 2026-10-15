@@ -194,7 +194,7 @@ public:
         assert(lengths.size() == images.size());
 
         int_vector_t img_rank_inv = compute_img_rank_inv<int_vector_t>(images);
-        return from_lengths_and_img_rank_inv(lengths, img_rank_inv, domain, max_length, sp);
+        return from_lengths_and_img_rank_inv(lengths, std::move(img_rank_inv), domain, max_length, sp);
     }
 
     template<typename container1_t, typename container2_t>
