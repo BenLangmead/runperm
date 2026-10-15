@@ -84,6 +84,29 @@ public:
         return built;
     }
 
+    /**
+     * As find_structure(enc), for a table whose last columns (the data
+     * columns of an integrated permutation) take the given widths and hold
+     * 0, to be written in place with set.
+     */
+    template<typename rlbwt_interval_encoding_t, size_t num_data_cols>
+    static move_payload<columns> find_structure_with_data(const rlbwt_interval_encoding_t& enc,
+                                                          const std::array<uchar, num_data_cols>& data_widths) {
+        static_assert(!cols_traits::INVERTIBLE ||
+                          rlbwt_interval_encoding_t::invertible_tag,
+                      "Invertible RLBWT structure requires an invertible "
+                      "interval encoding");
+        assert(enc.get_heads().size() == enc.intervals());
+
+        auto widths = get_move_widths(enc.domain(), enc.intervals(), enc.max_length(), enc.sigma());
+        base::set_data_widths(widths, data_widths);
+        move_payload<columns> built;
+        built.rows = packed_vector<columns>(enc.intervals(), widths);
+        base::populate_structure(built.rows, enc, &built.spill);
+        set_characters(built.rows, enc.get_heads());
+        return built;
+    }
+
     uchar get_character(size_t i) const {
         return base::table.template get<cols_traits::CHARACTER>(i);
     }

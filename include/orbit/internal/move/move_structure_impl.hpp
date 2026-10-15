@@ -63,6 +63,32 @@ public:
         return built;
     }
 
+    /**
+     * As find_structure, for a table whose last columns, past the base ones
+     * (the data columns of an integrated permutation), take the given widths
+     * and hold 0, to be written in place with set.
+     */
+    template<typename interval_encoding_impl_t, size_t num_data_cols>
+    static move_payload<columns> find_structure_with_data(const interval_encoding_impl_t& enc,
+                                                          const std::array<uchar, num_data_cols>& data_widths) {
+        static_assert(!cols_traits::INVERTIBLE ||
+                          interval_encoding_impl_t::invertible_tag,
+                      "Invertible move structure requires an invertible "
+                      "interval encoding");
+        auto widths = derived::get_move_widths(enc.domain(), enc.intervals(), enc.max_length());
+        set_data_widths(widths, data_widths);
+        move_payload<columns> built;
+        built.rows = packed_vector<columns>(enc.intervals(), widths);
+        derived::populate_structure(built.rows, enc, &built.spill);
+        return built;
+    }
+
+    /** Write column col of row i. */
+    template<columns col>
+    void set(size_t i, ulint val) {
+        table.template set<col>(i, val);
+    }
+
     // === Interval Start/Length Accessors ===
     template <typename C = columns>
     std::enable_if_t<!cols_traits_for<C>::RELATIVE, ulint>
@@ -204,6 +230,15 @@ protected:
     table_t<columns_t> table;
     ulint n;
     ulint r;
+
+    // Give the last num_data_cols columns the widths data_widths.
+    template<size_t num_data_cols>
+    static void set_data_widths(std::array<uchar, num_cols>& widths, const std::array<uchar, num_data_cols>& data_widths) {
+        static_assert(num_data_cols <= num_cols, "more data columns than columns");
+        for (size_t j = 0; j < num_data_cols; ++j) {
+            widths[num_cols - num_data_cols + j] = data_widths[j];
+        }
+    }
 
     // === position Navigation ===
     inline position fast_forward(position pos) const {

@@ -359,6 +359,10 @@ public:
             idx = input_intervals.get_next(idx);
         }
         assert(idx == input_intervals.END_IDX);
+        // The rest reads only the output intervals, so the input intervals
+        // and their mapping are freed before the results are made.
+        input_intervals.clear();
+        img_rank.clear();
 
         result.lengths = int_vector_t(num_intervals_after_splitting, bit_width(result.max_length));
         result.img_rank_inv = int_vector_t(num_intervals_after_splitting, bit_width(num_intervals_after_splitting - 1));
@@ -416,6 +420,13 @@ private:
             uchar new_next_bits = bit_width(intervals_upper_bound); // next points to next interval, or END_IDX if at end, over full range of intervals
             new_intervals = packed_vector<interval_cols>(new_intervals_upper_bound, {start_bits, new_next_bits, pred_bits});
             // we set orig_mapping later, since we can reuse the passed input img_rank_inv
+        }
+
+        // Free the intervals.
+        void clear() {
+            orig_intervals.clear();
+            new_intervals.clear();
+            orig_mapping = nullptr;
         }
 
         inline void set_start(ulint idx, ulint start) {
