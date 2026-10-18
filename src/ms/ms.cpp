@@ -167,28 +167,42 @@ static void usage(const char* prog) {
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
               << "            [--mode psi|phi|phiskip|dual|oracle|oracle-scan] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
-              << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
+              << "            [--max-smem-positions N] [--seq-ids FILE] [--phi-starts]\n"
+              << "            [--orient fwd|rc|qual]\n"
               << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
               << "            [--oracle-write FILE | --oracle FILE]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
               << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
               << "              the others need phi).  Only the index's structures that the\n"
               << "              query reads are loaded, and a query the index's layout cannot\n"
-              << "              serve is refused.  --positions\n"
-              << "              adds a field with an occurrence position for each value (-1\n"
-              << "              where it is 0); it needs phi.  --report adds a field with the\n"
-              << "              read's SMEMs (super-maximal exact matches), space-separated:\n"
-              << "              ms (the default) adds none; smem-one gives each as i:L:p, with\n"
-              << "              start i in the read, length L and one text position p where it\n"
-              << "              occurs, and needs phi; smem-all gives each as i:L:c:p1,p2,...,\n"
-              << "              with all c text positions in BWT row order, and needs phi and\n"
-              << "              phi_inv.  --min-smem-len T keeps only SMEMs with L > T (default\n"
-              << "              0, all of them) in both SMEM reports.  --max-smem-positions N\n"
-              << "              makes smem-all list at most N positions per SMEM, the first N in\n"
-              << "              BWT row order, while c still counts all of them (default: list\n"
-              << "              all).  With smem-all, K also sets how many of its phi and\n"
-              << "              phi_inv walks list positions at once (K = 0: one SMEM at a\n"
-              << "              time).  Matching statistics without positions or SMEMs load\n"
+              << "              serve is refused.  Each read gets a line with its name and its\n"
+              << "              matching statistics, space-separated.  --positions adds a field\n"
+              << "              with an occurrence position for each value (-1 where it is 0);\n"
+              << "              it needs phi.  --report ms (the default) adds nothing more;\n"
+              << "              smem-one adds a field with the read's SMEMs (super-maximal exact\n"
+              << "              matches), space-separated, each as i:L:p, with start i in the\n"
+              << "              read, length L and one text position p where it occurs, and\n"
+              << "              needs phi.  smem-all writes SMEMs as ropebwt3 mem -p N does, in\n"
+              << "              place of the read's line, and needs phi and phi_inv: one line\n"
+              << "              per SMEM, tab-separated, with the read's name, start, end\n"
+              << "              (exclusive), the count c of its occurrences and, if N > 0,\n"
+              << "              min(N, c) and that many positions, the first in BWT row order.\n"
+              << "              With --seq-ids FILE each position is contig:strand:offset, where\n"
+              << "              a - offset is that of the reverse complement on the forward\n"
+              << "              strand; FILE is ropebwt3's sequence-ID table (the .len.gz of the\n"
+              << "              FMD the index was built from), whose contig k is the text's\n"
+              << "              strings 2k (+) and 2k + 1 (-), and the text length it implies\n"
+              << "              must equal the index's.  Without it, each position is a text\n"
+              << "              position.  With --min-smem-len 0, each read character that\n"
+              << "              occurs nowhere in the text, such as an N, also gets a line with\n"
+              << "              its start, end and a count of 0, as ropebwt3 gives with -l 1;\n"
+              << "              reads with neither add no line.  smem-all cannot be used with\n"
+              << "              --positions.  --min-smem-len T keeps only SMEMs with L > T\n"
+              << "              (default 0, all of them) in both SMEM reports, so ropebwt3's -l\n"
+              << "              X is --min-smem-len X-1.  --max-smem-positions N sets N\n"
+              << "              (default: list all).  With smem-all, K also sets how many of its\n"
+              << "              phi and phi_inv walks list positions at once (K = 0: one SMEM at\n"
+              << "              a time).  Matching statistics without positions or SMEMs load\n"
               << "              phi's lengths-based form, whose rows are narrower; --phi-starts\n"
               << "              loads its starts-based form instead, as positions and SMEM\n"
               << "              reports do.  Results do not depend on the mode, K or\n"
@@ -359,6 +373,9 @@ static bool g_tms_phi_starts = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
 static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
+// With --seq-ids, the contigs that smem-all's positions are mapped to;
+// without it, smem-all gives text positions.
+static std::optional<SeqIdTable> g_seq_ids;
 
 // With an SMEM report, the SMEMs are found as part of the query.  smem_k
 // walks are in flight when smem-all lists positions (0 lists them one SMEM
@@ -467,6 +484,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
     std::string oracle_path, oracle_write_path;
+    std::string seq_ids_path;  // with smem-all, the contig names and lengths
     int q = 0;
     unsigned ftab_k = 0;  // 0: no ftab built at load
     std::string ftab_path;  // a stored ftab to load
@@ -500,6 +518,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
             g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
+        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc)
+            seq_ids_path = argv[++i];
         else if (!std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const std::string m = argv[++i];
             if (m == "standard") g_ms_mode = MsMode::STANDARD;
@@ -519,6 +539,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     if (orient != ReadOrient::FWD && (g_tms_positions || g_tms_report != TmsReport::MS)) {
         std::cerr << "--orient rc and --orient qual give matching statistics only; they cannot be used with "
                      "--positions or an SMEM report\n";
+        return 1;
+    }
+    // smem-all writes one line per SMEM, so there is no line per read to
+    // hold the positions of --positions.
+    if (g_tms_report == TmsReport::SMEM_ALL && g_tms_positions) {
+        std::cerr << "--positions cannot be used with --report smem-all\n";
+        return 1;
+    }
+    if (g_tms_report != TmsReport::SMEM_ALL && !seq_ids_path.empty()) {
+        std::cerr << "--seq-ids is read only with --report smem-all\n";
         return 1;
     }
     if (ftab_k > 31) { std::cerr << "--ftab-k must be between 1 and 31\n"; return 1; }
@@ -586,6 +616,27 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         return 1;
     }
     Index& idx = *opt;
+    // The table must describe the index's text: both strands of each
+    // contig, each with its terminator.
+    if constexpr (std::is_same_v<Index, TmsIndex>) {
+        if (!seq_ids_path.empty()) {
+            const auto ts = clock::now();
+            try {
+                g_seq_ids = SeqIdTable::read(seq_ids_path);
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\n";
+                return 1;
+            }
+            if (g_seq_ids->text_length() != idx.domain()) {
+                std::cerr << seq_ids_path << " describes a text of length " << g_seq_ids->text_length() << " ("
+                          << g_seq_ids->names.size() << " sequences, both strands) but " << idx_path << " indexes "
+                          << idx.domain() << "\n";
+                return 1;
+            }
+            std::cerr << "seq-ids: sequences=" << g_seq_ids->names.size()
+                      << " load_s=" << std::chrono::duration<double>(clock::now() - ts).count() << "\n";
+        }
+    }
     if (oracle_mode) {
         std::ifstream oin(oracle_path, std::ios::binary);
         if (!oin.good()) { std::cerr << "Failed to open oracle: " << oracle_path << "\n"; return 1; }
@@ -691,8 +742,16 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     size_t reads_numbered = 0;
     double numbering_parse_s = 0.0;
     // With --positions, a tab-separated field holds the positions (-1 for
-    // none); with an SMEM report, a last one holds the SMEMs.
+    // none); with smem-one, a last one holds the SMEMs.  smem-all writes
+    // ropebwt3 mem's lines, one per SMEM, in place of the read's line.
     auto format = [&](std::string& text, const std::string& nm, const QueryResults& r, size_t j) {
+        if constexpr (std::is_same_v<Index, TmsIndex>) {
+            // ropebwt3 marks the read's unmatched characters only when its
+            // length cut keeps every SMEM.
+            if (g_tms_report == TmsReport::SMEM_ALL)
+                return tms_format_smems_rope(nm, r.hits[j], g_seq_ids ? &*g_seq_ids : nullptr, text,
+                                             g_tms_min_smem_len == 0 ? &r.ms[j] : nullptr);
+        }
         const auto& ms = r.ms[j];
         text += nm;
         text += '\t';

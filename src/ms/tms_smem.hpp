@@ -27,6 +27,7 @@
 #ifndef _TMS_SMEM_HPP
 #define _TMS_SMEM_HPP
 
+#include "seq_ids.hpp"
 #include "tms_index.hpp"
 #include "tms_query.hpp"
 #include "format_int.hpp"
@@ -318,8 +319,8 @@ inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<
 }
 
 /**
- * Append hits to line in tms-batch's format: space-separated i:L:p, or
- * i:L:c:p1,p2,... for SMEM_ALL, with count c and the listed positions.
+ * Append hits to line as space-separated i:L:p (tms-batch's smem-one field),
+ * or i:L:c:p1,p2,... for SMEM_ALL, with count c and the listed positions.
  */
 inline void tms_format_smems(const TmsSmemHits& hits, TmsReport report, std::string& line) {
     size_t at = 0;
@@ -339,6 +340,62 @@ inline void tms_format_smems(const TmsSmemHits& hits, TmsReport report, std::str
             append_uint(line, hits.pos[at++]);
         }
     }
+}
+
+/**
+ * Append the SMEM_ALL hits of the read named name to text in the format of
+ * ropebwt3 mem -p N: one line per SMEM, name, start, end (exclusive), the
+ * occurrence count and, if any positions are listed, their number and each
+ * as contig:strand:offset, all tab-separated.  A - strand offset is that of
+ * the match's reverse complement on the forward strand, so the match is
+ * the reverse complement of the contig's [offset, offset + L).  ids maps
+ * text positions to contigs, and a position whose match crosses a contig's
+ * end throws; if ids is null, each position is its text position, for an
+ * index whose text has no contig table.
+ *
+ * If ms (the read's matching statistics) is given, each position i with
+ * ms[i] = 0, a character that does not occur in the text such as an N, also
+ * gets a line "name i i+1 0", in start order with the SMEMs.  ropebwt3's
+ * default SMEM search writes these with -l 1, the length cut that keeps
+ * every SMEM, and the caller passes ms in that case alone.  A read with
+ * neither adds nothing, as in ropebwt3.
+ */
+inline void tms_format_smems_rope(const std::string& name, const TmsSmemHits& hits, const SeqIdTable* ids,
+                                  std::string& text, const std::vector<ulint>* ms = nullptr) {
+    size_t at = 0, i = 0;
+    auto unmatched_until = [&](ulint end) {
+        if (!ms) return;
+        for (; i < end; ++i) {
+            if ((*ms)[i] != 0) continue;
+            text += name;
+            text += '\t';
+            append_uint(text, i);
+            text += '\t';
+            append_uint(text, i + 1);
+            text += "\t0\n";
+        }
+    };
+    for (const auto& h : hits.smems) {
+        unmatched_until(h.start);
+        text += name;
+        text += '\t';
+        append_uint(text, h.start);
+        text += '\t';
+        append_uint(text, h.start + h.len);
+        text += '\t';
+        append_uint(text, h.count);
+        if (h.listed > 0) {
+            text += '\t';
+            append_uint(text, h.listed);
+            for (ulint c = 0; c < h.listed; ++c) {
+                text += '\t';
+                if (ids) ids->append_location(text, hits.pos[at++], h.len);
+                else append_uint(text, hits.pos[at++]);
+            }
+        }
+        text += '\n';
+    }
+    if (ms) unmatched_until(ms->size());
 }
 
 #endif /* _TMS_SMEM_HPP */
