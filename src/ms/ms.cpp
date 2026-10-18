@@ -140,7 +140,7 @@ static void usage(const char* prog) {
               << "              replays with an ftab, which skips some repositions.\n"
               << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--phi FILE]\n"
               << "            [--minima FILE] [--lcp-bin FILE] [--lf-split B] [--phi-split B]\n"
-              << "            [--no-phi-inv]\n"
+              << "            [--no-phi-inv] [--seq-ids FILE]\n"
               << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
               << "              input, and with LCP input also phi and phi_inv (phi_inv unless\n"
               << "              --no-phi-inv; it is needed only for tms-batch --report smem-all).\n"
@@ -160,15 +160,18 @@ static void usage(const char* prog) {
               << "              images.  --lf-split and --phi-split set Orbit's balancing factor\n"
               << "              for LF and phi, with its default length capping (default: Orbit's\n"
               << "              default balancing).  LF is always split, so --lf-split must be\n"
-              << "              positive; --phi-split 0 leaves phi unsplit.\n"
+              << "              positive; --phi-split 0 leaves phi unsplit.  --seq-ids FILE\n"
+              << "              stores ropebwt3's sequence-ID table (the .len.gz of the FMD the\n"
+              << "              RLBWT came from) in the index, for tms-batch --report smem-all;\n"
+              << "              its contig k must be the text's strings 2k and 2k + 1, and both\n"
+              << "              its text length and its string count must be the index's.\n"
               << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [--layout ...] [split options]\n"
               << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
               << "            [--mode psi|phi|phiskip|dual|oracle|oracle-scan] [--positions]\n"
               << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
-              << "            [--max-smem-positions N] [--seq-ids FILE] [--phi-starts]\n"
-              << "            [--orient fwd|rc|qual]\n"
+              << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
               << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
               << "            [--oracle-write FILE | --oracle FILE]\n"
               << "              As batch, with a tms index.  --mode sets how repositions\n"
@@ -187,19 +190,17 @@ static void usage(const char* prog) {
               << "              per SMEM, tab-separated, with the read's name, start, end\n"
               << "              (exclusive), the count c of its occurrences and, if N > 0,\n"
               << "              min(N, c) and that many positions, the first in BWT row order.\n"
-              << "              With --seq-ids FILE each position is contig:strand:offset, where\n"
+              << "              If the index holds a sequence-ID table (tms-build --seq-ids,\n"
+              << "              index-add-seq-ids), each position is contig:strand:offset, where\n"
               << "              a - offset is that of the reverse complement on the forward\n"
-              << "              strand; FILE is ropebwt3's sequence-ID table (the .len.gz of the\n"
-              << "              FMD the index was built from), whose contig k is the text's\n"
-              << "              strings 2k (+) and 2k + 1 (-), and the text length it implies\n"
-              << "              must equal the index's.  Without it, each position is a text\n"
-              << "              position.  With --min-smem-len 0, each read character that\n"
-              << "              occurs nowhere in the text, such as an N, also gets a line with\n"
-              << "              its start, end and a count of 0, as ropebwt3 gives with -l 1;\n"
-              << "              reads with neither add no line.  smem-all cannot be used with\n"
-              << "              --positions.  --min-smem-len T keeps only SMEMs with L > T\n"
-              << "              (default 0, all of them) in both SMEM reports, so ropebwt3's -l\n"
-              << "              X is --min-smem-len X-1.  --max-smem-positions N sets N\n"
+              << "              strand; otherwise each is a text position.  With --min-smem-len\n"
+              << "              0, each read character that occurs nowhere in the text, such as\n"
+              << "              an N, also gets a line with its start, end and a count of 0, as\n"
+              << "              ropebwt3 gives with -l 1; reads with neither add no line.\n"
+              << "              smem-all cannot be used with --positions.  --min-smem-len T\n"
+              << "              keeps only SMEMs with L > T (default 0, all of them) in both\n"
+              << "              SMEM reports, so ropebwt3's -l X is --min-smem-len X-1.\n"
+              << "              --max-smem-positions N sets N\n"
               << "              (default: list all).  With smem-all, K also sets how many of its\n"
               << "              phi and phi_inv walks list positions at once (K = 0: one SMEM at\n"
               << "              a time).  Matching statistics without positions or SMEMs load\n"
@@ -272,6 +273,11 @@ static void usage(const char* prog) {
               << "              Rewrite an index of the earlier formats (MSIX v4 from build or\n"
               << "              build-rlbwt, TMSX v8 from tms-build) in the current format,\n"
               << "              copying its structures' bytes without loading them.\n"
+              << "  index-add-seq-ids INDEX_PATH SEQ_IDS OUT_PATH\n"
+              << "              Write the tms index at INDEX_PATH to OUT_PATH with the\n"
+              << "              sequence-ID table SEQ_IDS (see tms-build --seq-ids) in it, in\n"
+              << "              place of any it holds, copying its structures' bytes without\n"
+              << "              loading them.  The table's text length must be the index's.\n"
               << "  tms-inspect INDEX_PATH [--phi-lengths]\n"
               << "              Print the structures' sizes and column widths.  --phi-lengths\n"
               << "              loads only LF and phi's lengths-based form.\n"
@@ -373,9 +379,6 @@ static bool g_tms_phi_starts = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
 static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
-// With --seq-ids, the contigs that smem-all's positions are mapped to;
-// without it, smem-all gives text positions.
-static std::optional<SeqIdTable> g_seq_ids;
 
 // With an SMEM report, the SMEMs are found as part of the query.  smem_k
 // walks are in flight when smem-all lists positions (0 lists them one SMEM
@@ -484,7 +487,6 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
     std::string oracle_path, oracle_write_path;
-    std::string seq_ids_path;  // with smem-all, the contig names and lengths
     int q = 0;
     unsigned ftab_k = 0;  // 0: no ftab built at load
     std::string ftab_path;  // a stored ftab to load
@@ -518,8 +520,6 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
         else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
             g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc)
-            seq_ids_path = argv[++i];
         else if (!std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const std::string m = argv[++i];
             if (m == "standard") g_ms_mode = MsMode::STANDARD;
@@ -545,10 +545,6 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     // hold the positions of --positions.
     if (g_tms_report == TmsReport::SMEM_ALL && g_tms_positions) {
         std::cerr << "--positions cannot be used with --report smem-all\n";
-        return 1;
-    }
-    if (g_tms_report != TmsReport::SMEM_ALL && !seq_ids_path.empty()) {
-        std::cerr << "--seq-ids is read only with --report smem-all\n";
         return 1;
     }
     if (ftab_k > 31) { std::cerr << "--ftab-k must be between 1 and 31\n"; return 1; }
@@ -616,25 +612,13 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         return 1;
     }
     Index& idx = *opt;
-    // The table must describe the index's text: both strands of each
-    // contig, each with its terminator.
+    // smem-all names contigs with the index's sequence-ID table, if it has one.
     if constexpr (std::is_same_v<Index, TmsIndex>) {
-        if (!seq_ids_path.empty()) {
-            const auto ts = clock::now();
-            try {
-                g_seq_ids = SeqIdTable::read(seq_ids_path);
-            } catch (const std::exception& e) {
-                std::cerr << e.what() << "\n";
-                return 1;
-            }
-            if (g_seq_ids->text_length() != idx.domain()) {
-                std::cerr << seq_ids_path << " describes a text of length " << g_seq_ids->text_length() << " ("
-                          << g_seq_ids->names.size() << " sequences, both strands) but " << idx_path << " indexes "
-                          << idx.domain() << "\n";
-                return 1;
-            }
-            std::cerr << "seq-ids: sequences=" << g_seq_ids->names.size()
-                      << " load_s=" << std::chrono::duration<double>(clock::now() - ts).count() << "\n";
+        if (g_tms_report == TmsReport::SMEM_ALL) {
+            if (const SeqIdTable* t = idx.seq_ids())
+                std::cerr << "smem-all: positions as contig:strand:offset, " << t->names.size() << " sequences\n";
+            else
+                std::cerr << "smem-all: positions as text positions; the index holds no sequence-ID table\n";
         }
     }
     if (oracle_mode) {
@@ -749,7 +733,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             // ropebwt3 marks the read's unmatched characters only when its
             // length cut keeps every SMEM.
             if (g_tms_report == TmsReport::SMEM_ALL)
-                return tms_format_smems_rope(nm, r.hits[j], g_seq_ids ? &*g_seq_ids : nullptr, text,
+                return tms_format_smems_rope(nm, r.hits[j], idx.seq_ids(), text,
                                              g_tms_min_smem_len == 0 ? &r.ms[j] : nullptr);
         }
         const auto& ms = r.ms[j];
@@ -1240,7 +1224,7 @@ int main(int argc, char** argv) {
         TmsBuildOptions opts;
         opts.report = true;
         bool with_phi = false;
-        std::string minima_path, lcp_bin_path, phi_path;
+        std::string minima_path, lcp_bin_path, phi_path, seq_ids_path;
         for (int i = npos; i < argc; ++i) {
             if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
                 if (!lf_split_arg(argv[++i], opts.lf_split)) return 1;
@@ -1258,6 +1242,7 @@ int main(int argc, char** argv) {
             else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
             else if (!from_tsv && strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
             else if (!from_tsv && strcmp(argv[i], "--phi") == 0 && i + 1 < argc) { phi_path = argv[++i]; with_phi = true; }
+            else if (!from_tsv && strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc) seq_ids_path = argv[++i];
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
         if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
@@ -1271,6 +1256,17 @@ int main(int argc, char** argv) {
         if (opts.layout == TmsLayout::PHI && !with_phi) {
             std::cerr << "--layout phi needs LCP input (" << (from_tsv ? "--phi" : "--phi, --minima or --lcp-bin") << ")\n";
             return 1;
+        }
+        // The sequence-ID table is read first, so that a bad one fails
+        // before the build.
+        std::optional<SeqIdTable> seq_ids;
+        if (!seq_ids_path.empty()) {
+            try {
+                seq_ids = SeqIdTable::read(seq_ids_path);
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\n";
+                return 1;
+            }
         }
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
@@ -1371,6 +1367,14 @@ int main(int argc, char** argv) {
                                         : TmsIndex(heads, run_lens, opts, std::move(samples));
         const double build_s = std::chrono::duration<double>(clock::now() - t1).count();
         const std::string idx_path = argv[npos - 1];
+        if (seq_ids) {
+            try {
+                idx.set_seq_ids(std::move(*seq_ids));
+            } catch (const std::exception& e) {
+                std::cerr << seq_ids_path << " does not describe the indexed text: " << e.what() << "\n";
+                return 1;
+            }
+        }
         idx.set_info(build_info());
         std::ofstream out(idx_path, std::ios::binary);
         size_t bytes = 0;
@@ -1652,6 +1656,32 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (cmd == "index-add-seq-ids") {
+        if (argc < 3) { std::cerr << "index-add-seq-ids requires INDEX_PATH, SEQ_IDS and OUT_PATH\n"; return 1; }
+        try {
+            const orbit_idx::Header h = orbit_idx::read_header_file(argv[0]);
+            if (h.tool != orbit_idx::Tool::TMS) throw std::runtime_error(std::string(argv[0]) + " is not a tms index");
+            const SeqIdTable t = SeqIdTable::read(argv[1]);
+            // The header gives the text length but not the string count,
+            // which would take loading LF.
+            const std::string bad = TmsIndex::seq_ids_mismatch(t, h.n);
+            if (!bad.empty()) throw std::runtime_error(std::string(argv[1]) + " does not describe the indexed text: " + bad);
+            std::string info = "seq_ids_from=" + std::string(argv[1]) + "\n" + build_info();
+            info.replace(info.find("built_by="), 9, "seq_ids_added_by=");
+            info.replace(info.find("built_at="), 9, "seq_ids_added_at=");
+            // Earlier provenance of a table this replaces stays, above it.
+            const auto t0 = std::chrono::steady_clock::now();
+            orbit_idx::SectionSource src = TmsIndex::seq_ids_source(t);
+            orbit_idx::add_section(argv[0], argv[2], src, info);
+            std::cout << "Wrote " << argv[2] << ": " << argv[0] << " with " << t.names.size() << " sequences from "
+                      << argv[1] << " (s=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                      << ")\n";
+        } catch (const std::exception& e) {
+            std::cerr << "index-add-seq-ids: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
     if (cmd == "index-rewrap") {
         if (argc < 2) { std::cerr << "index-rewrap requires LEGACY_PATH and INDEX_PATH\n"; return 1; }
         std::string info = "rewrapped_from=" + std::string(argv[0]) + "\n" + build_info();

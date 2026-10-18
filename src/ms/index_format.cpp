@@ -34,6 +34,7 @@ const char* kind_name(Kind k) {
         case Kind::MOVE_TABLE: return "move_table";
         case Kind::U64_ARRAY: return "u64_array";
         case Kind::SPILL_ARRAYS: return "spill_arrays";
+        case Kind::SEQ_TABLE: return "seq_table";
     }
     return "?";
 }
@@ -56,7 +57,8 @@ void describe_header(const Header& h, std::ostream& os) {
             for (size_t c = 0; c < e.cols.size(); ++c)
                 os << (c ? "," : "") << col_name(e.cols[c].first) << ":" << int(e.cols[c].second);
         } else {
-            os << " " << (e.kind == Kind::U64_ARRAY ? "values=" : "arrays=") << e.rows;
+            os << " " << (e.kind == Kind::U64_ARRAY ? "values=" : e.kind == Kind::SEQ_TABLE ? "sequences=" : "arrays=")
+               << e.rows;
         }
         os << "\n";
     }
@@ -334,6 +336,71 @@ std::string rewrap_legacy(const std::string& from, const std::string& to, const 
     } catch (const std::exception& e) {
         return e.what();
     }
+}
+
+void add_section(const std::string& from, const std::string& to, SectionSource& s, const std::string& info) {
+    if (std::filesystem::exists(to) && std::filesystem::equivalent(from, to))
+        throw std::runtime_error("the output must be another file than the input");
+    std::ifstream in(from, std::ios::binary);
+    if (!in.good()) throw std::runtime_error("cannot open " + from);
+    Header h = read_header_file(from);
+    std::vector<SectionEntry> kept;
+    for (const auto& e : h.sections)
+        if (e.id != s.entry.id) kept.push_back(e);
+    // Size and checksum the new payload, then lay out every section.
+    detail::CrcCountBuf sink;
+    {
+        std::ostream os(&sink);
+        s.write(os);
+    }
+    std::vector<uint64_t> from_offsets;
+    uint64_t at = HEADER_BYTES;
+    for (auto& e : kept) {
+        from_offsets.push_back(e.offset);
+        e.offset = align_up(at);
+        at = e.offset + e.bytes;
+    }
+    SectionEntry added = s.entry;
+    added.offset = align_up(at);
+    added.bytes = sink.count;
+    added.crc = sink.crc;
+    Header out_h = h;
+    out_h.sections = kept;
+    out_h.sections.push_back(added);
+    out_h.info += info;
+    const std::vector<char> hb = encode_header(out_h);
+    std::ofstream out(to, std::ios::binary | std::ios::trunc);
+    if (!out.good()) throw std::runtime_error("cannot open " + to + " for writing");
+    out.write(hb.data(), static_cast<std::streamsize>(hb.size()));
+    uint64_t pos = HEADER_BYTES;
+    std::vector<char> buf(size_t(1) << 22);
+    for (size_t i = 0; i < kept.size(); ++i) {
+        const SectionEntry& e = kept[i];
+        detail::write_zeros(out, e.offset - pos);
+        in.seekg(static_cast<std::streamoff>(from_offsets[i]));
+        uint32_t crc = 0;
+        for (uint64_t left = e.bytes; left > 0;) {
+            const size_t k = static_cast<size_t>(std::min<uint64_t>(left, buf.size()));
+            in.read(buf.data(), static_cast<std::streamsize>(k));
+            if (!in.good()) throw std::runtime_error(from + ": section " + section_name(e.id) + " is truncated");
+            crc = crc32(crc, buf.data(), k);
+            out.write(buf.data(), static_cast<std::streamsize>(k));
+            left -= k;
+        }
+        if (crc != e.crc) throw std::runtime_error(from + ": section " + section_name(e.id) + " fails its CRC-32");
+        pos = e.offset + e.bytes;
+    }
+    detail::write_zeros(out, added.offset - pos);
+    detail::CrcCountBuf tee(out.rdbuf());
+    {
+        std::ostream os(&tee);
+        s.write(os);
+        os.flush();
+    }
+    if (tee.count != added.bytes || tee.crc != added.crc)
+        throw std::logic_error(std::string("section ") + section_name(added.id) + " serialized differently twice");
+    out.flush();
+    if (!out.good()) throw std::runtime_error("failed writing " + to);
 }
 
 }  // namespace orbit_idx

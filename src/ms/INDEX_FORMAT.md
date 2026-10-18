@@ -35,13 +35,13 @@ The file ends where the last section ends; `ms index-verify` checks this along w
 
 | offset | type | field |
 |---|---|---|
-| 0 | u16 | id: 1 LF, 2 F_STARTS, 3 PHI_LEN, 4 PHI_START, 5 PHI_INV, 6 MS_SPILL |
-| 2 | u16 | kind: 1 move table, 2 u64 array, 3 spill arrays |
+| 0 | u16 | id: 1 LF, 2 F_STARTS, 3 PHI_LEN, 4 PHI_START, 5 PHI_INV, 6 MS_SPILL, 7 SEQ_IDS |
+| 2 | u16 | kind: 1 move table, 2 u64 array, 3 spill arrays, 4 sequence table |
 | 4 | u8 | columns (move table; at most 12) |
 | 6 | u16 | row bits: the sum of the widths |
 | 8 | u64 | offset of the payload, a multiple of 4096 |
 | 16 | u64 | payload bytes |
-| 24 | u64 | rows (move table), values (u64 array) or arrays (spill arrays) |
+| 24 | u64 | rows (move table), values (u64 array), arrays (spill arrays) or sequences (sequence table) |
 | 32 | u64 | domain (move table) |
 | 40 | u32 | CRC-32 (IEEE) of the payload |
 | 48 | (u8, u8)[12] | (column code, width) per column, in row order |
@@ -53,6 +53,13 @@ Payloads:
 - **Move table**: the structure's Orbit `serialize()` bytes. These are its own preamble (magics, versions, split parameters, n, r, rows, widths), then the packed rows, `ceil(rows * row_bits / 8) + 8` bytes. The loader checks the loaded rows, domain and widths against the entry, and the entry's column codes against the ones the code reads.
 - **u64 array**: the values. F_STARTS has 7, the first row of each F block after the first.
 - **Spill arrays**: per array, a u64 byte count and the bytes.
+- **Sequence table**: per sequence, in order, its length as a u64, its name's byte count as a u32, and the name.
+
+## The sequence-ID table
+
+A tms index built from a ropebwt3 FMD may hold the FMD's sequence-ID table, ropebwt3's `.len.gz`, as the SEQ_IDS section, last in the file. Sequence k is the FMD's strings 2k (its forward strand) and 2k + 1 (its reverse complement), so the text is `C_0 $ rc(C_0) $ C_1 $ rc(C_1) $ ...`, and the lengths must give the header's n as 2 * sum(len_k + 1). `tms-batch --report smem-all` uses the table to write positions as contig, strand and forward-strand offset, as ropebwt3 does. It is added at build time by `ms tms-build --seq-ids FILE`, which also checks that the BWT has two terminators per sequence. `ms index-add-seq-ids INDEX FILE OUT` adds it to an index already built. It copies the other sections byte for byte, at the same offsets, and checks only n, since counting the terminators would mean loading LF. A table that fits both checks but splits the text elsewhere makes a query fail when a match crosses a sequence's end.
+
+Neither changes the sections an ftab links to, so an ftab built from the index without the table serves it with the table. Earlier `ms` binaries load such an index and ignore the section.
 
 ## What this software loads (informative)
 
@@ -62,7 +69,7 @@ This section describes the current `ms` binary, not the format.
 - **Orbit-tms:** a query always loads LF, whole, with every column the layout keeps (`TmsIndex::sections_for`). It then adds:
   - **F_STARTS** if the query walks psi (not in the oracle mode, which computes no LCE);
   - **PHI_START** if it needs text positions (`--positions`, an SMEM report, or `--phi-starts`), or else **PHI_LEN** if it walks phi;
-  - **PHI_INV** for `--report smem-all`. In that case it also builds a start table for PHI_START and for PHI_INV. Each has `((domain - 1) >> shift) + 2` entries of `max(1, bit_width(rows - 1))` bits, where `shift` is the smallest with `2^shift * rows >= 4 * domain`, computed from the section's entry.
+  - **PHI_INV** for `--report smem-all`, and **SEQ_IDS** if the index holds it. In that case it also builds a start table for PHI_START and for PHI_INV. Each has `((domain - 1) >> shift) + 2` entries of `max(1, bit_width(rows - 1))` bits, where `shift` is the smallest with `2^shift * rows >= 4 * domain`, computed from the section's entry.
 
 | query | sections loaded |
 |---|---|
@@ -73,7 +80,7 @@ This section describes the current `ms` binary, not the format.
 | psi with `--positions` or `--report smem-one`; phiskip or dual with those or `--phi-starts` | LF, F_STARTS, PHI_START |
 | `--mode oracle` or `oracle-scan` (replaying recorded repositions) | LF |
 | `--mode oracle` or `oracle-scan` with `--positions` or `--report smem-one` | LF, PHI_START |
-| `--report smem-all` | LF, PHI_START, PHI_INV, plus F_STARTS outside phi and oracle modes |
+| `--report smem-all` | LF, PHI_START, PHI_INV, SEQ_IDS if held, plus F_STARTS outside phi and oracle modes |
 
 `ms index-plan INDEX` prints, for the index at hand, the sections and start tables each `tms-batch` command line loads and the RAM they take.
 

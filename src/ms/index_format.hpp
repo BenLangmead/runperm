@@ -55,12 +55,13 @@ enum class Tool : uint16_t { MS = 1, TMS = 2 };
 enum class Layout : uint16_t { NONE = 0, FULL = 1, PSI = 2, PHI = 3 };
 
 /** Section ids.  A set of sections is a mask with bit id set for each (see section_bit). */
-enum class Section : uint16_t { LF = 1, F_STARTS = 2, PHI_LEN = 3, PHI_START = 4, PHI_INV = 5, MS_SPILL = 6 };
+enum class Section : uint16_t { LF = 1, F_STARTS = 2, PHI_LEN = 3, PHI_START = 4, PHI_INV = 5, MS_SPILL = 6, SEQ_IDS = 7 };
 
 enum class Kind : uint16_t {
     MOVE_TABLE = 1,    // an Orbit permutation's serialization
     U64_ARRAY = 2,     // rows little-endian uint64_t values
     SPILL_ARRAYS = 3,  // rows byte arrays, each a uint64_t size and its bytes
+    SEQ_TABLE = 4,     // rows sequences, each a uint64_t length, a uint32_t name size and the name
 };
 
 /** Column codes, one registry for every move table. */
@@ -78,6 +79,7 @@ inline const char* section_name(Section s) {
         case Section::PHI_START: return "PHI_START";
         case Section::PHI_INV: return "PHI_INV";
         case Section::MS_SPILL: return "MS_SPILL";
+        case Section::SEQ_IDS: return "SEQ_IDS";
     }
     return "?";
 }
@@ -494,6 +496,16 @@ public:
         return v;
     }
 
+    /** The payload of section id, which must be present and of kind k, as bytes. */
+    std::string load_bytes(Section id, Kind k) {
+        const SectionEntry& e = entry(id, k);
+        seek(e.offset);
+        std::string v(e.bytes, '\0');
+        in_.read(v.data(), static_cast<std::streamsize>(e.bytes));
+        check_end(e);
+        if (crc32(0, v.data(), v.size()) != e.crc) fail(e, "fails its CRC-32");
+        return v;
+    }
     /** The entry of section id, which must be present and of kind k. */
     const SectionEntry& entry(Section id, Kind k) const {
         const SectionEntry* e = header_.find(id);
@@ -591,6 +603,14 @@ std::string verify_file(const std::string& path);
  * the provenance.  Returns an empty string on success, else the error.
  */
 std::string rewrap_legacy(const std::string& from, const std::string& to, const std::string& info);
+/**
+ * Copy the index at from to to with section s added last, or put in place
+ * of a section with the same id, and info appended to the provenance.  The
+ * other sections' bytes are copied once each, checked against their CRC-32s,
+ * and keep their offsets if s replaces none of them or the last.  Throws on
+ * failure.
+ */
+void add_section(const std::string& from, const std::string& to, SectionSource& s, const std::string& info);
 
 }  // namespace orbit_idx
 

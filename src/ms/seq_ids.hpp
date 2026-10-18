@@ -15,6 +15,10 @@
  * and strand s of contig k starts at text position 2 * sum_{j<k} (len_j + 1)
  * + s * (len_k + 1).  The text length is 2 * sum_k (len_k + 1), which is
  * checked against the index.
+ *
+ * In a tms index the table is the SEQ_IDS section (see INDEX_FORMAT.md): per
+ * contig, in order, its length as a uint64_t, its name's byte count as a
+ * uint32_t and the name, all little-endian.
  */
 
 #ifndef _MS_SEQ_IDS_HPP
@@ -23,6 +27,8 @@
 #include "format_int.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -38,6 +44,45 @@ struct SeqIdTable {
     /** The text length the table describes: both strands of every contig, each with its terminator. */
     uint64_t text_length() const { return starts.empty() ? 0 : starts.back() + lens.back() + 1; }
 
+    /** Append a contig of length len named name. */
+    void add(const std::string& name, uint64_t len) {
+        const uint64_t at = text_length();
+        names.push_back(name);
+        lens.push_back(len);
+        starts.push_back(at);
+        starts.push_back(at + len + 1);
+    }
+
+    /** Write the table as a SEQ_IDS section payload. */
+    void serialize(std::ostream& out) const {
+        for (size_t k = 0; k < names.size(); ++k) {
+            const uint64_t len = lens[k];
+            const uint32_t nb = static_cast<uint32_t>(names[k].size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            out.write(reinterpret_cast<const char*>(&nb), sizeof(nb));
+            out.write(names[k].data(), nb);
+        }
+    }
+
+    /** The table of n contigs in the SEQ_IDS payload b; throws if it is malformed. */
+    static SeqIdTable from_payload(const std::string& b, uint64_t n) {
+        SeqIdTable t;
+        size_t at = 0;
+        for (uint64_t k = 0; k < n; ++k) {
+            uint64_t len;
+            uint32_t nb;
+            if (b.size() - at < sizeof(len) + sizeof(nb)) throw std::runtime_error("malformed SEQ_IDS section");
+            std::memcpy(&len, b.data() + at, sizeof(len));
+            std::memcpy(&nb, b.data() + at + sizeof(len), sizeof(nb));
+            at += sizeof(len) + sizeof(nb);
+            if (b.size() - at < nb || len == 0) throw std::runtime_error("malformed SEQ_IDS section");
+            t.add(b.substr(at, nb), len);
+            at += nb;
+        }
+        if (at != b.size()) throw std::runtime_error("malformed SEQ_IDS section");
+        return t;
+    }
+
     /** Read path, plain or gzipped; throws std::runtime_error on failure or an empty table. */
     static SeqIdTable read(const std::string& path) {
         gzFile f = gzopen(path.c_str(), "rb");
@@ -45,7 +90,6 @@ struct SeqIdTable {
         SeqIdTable t;
         std::string line;
         char buf[1 << 16];
-        uint64_t at = 0;
         auto take = [&] {
             std::istringstream in(line);
             std::string name, len;
@@ -60,11 +104,7 @@ struct SeqIdTable {
                 return;
             }
             if (v == 0) return;
-            t.names.push_back(name);
-            t.lens.push_back(v);
-            t.starts.push_back(at);
-            t.starts.push_back(at + v + 1);
-            at += 2 * (v + 1);
+            t.add(name, v);
         };
         while (gzgets(f, buf, sizeof(buf))) {
             line += buf;

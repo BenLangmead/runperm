@@ -86,6 +86,11 @@
  * sections holding the parts a query needs (TmsParts, see sections_for),
  * seeking past the rest.  LF is loaded whole, with every column the layout
  * keeps, whichever parts a query needs.
+ *
+ * An index built from a ropebwt3 FMD may also hold the FMD's sequence-ID
+ * table (SeqIdTable, the SEQ_IDS section), which names the contigs its
+ * text's strings come from.  It is not a part a query needs: a query that
+ * asks for it gets it if the index holds it.
  */
 
 #ifndef _TMS_INDEX_HPP
@@ -97,6 +102,7 @@
 #include "mem_report.hpp"
 #include "step_stats.hpp"
 #include "index_format.hpp"
+#include "seq_ids.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -143,6 +149,8 @@ struct TmsParts {
     // With phi, phi's starts-based form rather than its lengths-based form.
     // An index that holds phi holds both forms.
     bool phi_starts = false;
+    // The sequence-ID table, if the index holds one.
+    bool seq_ids = false;
 };
 
 /**
@@ -383,8 +391,53 @@ public:
             srcs.push_back(move_table_source(Section::PHI_START, phi_, PHI_COLS));
         }
         if (has_phi_inv_) srcs.push_back(move_table_source(Section::PHI_INV, phi_inv_, PHI_INV_COLS));
+        if (seq_ids_) srcs.push_back(seq_ids_source(*seq_ids_));
         return write_file(out, h, srcs);
     }
+
+    /** A SEQ_IDS section source for t, which must outlive the write. */
+    static orbit_idx::SectionSource seq_ids_source(const SeqIdTable& t) {
+        orbit_idx::SectionEntry e;
+        e.id = orbit_idx::Section::SEQ_IDS;
+        e.kind = orbit_idx::Kind::SEQ_TABLE;
+        e.rows = t.names.size();
+        return {e, [&t](std::ostream& o) { t.serialize(o); }};
+    }
+
+    /**
+     * An empty string if t can describe a text of length n with the given
+     * number of terminators, both strands of each contig, each ending in a
+     * terminator; else what differs.  Without the count, terminators is 0
+     * and only the length is checked.
+     */
+    static std::string seq_ids_mismatch(const SeqIdTable& t, ulint n, ulint terminators = 0) {
+        if (t.text_length() != n)
+            return "the table describes a text of length " + std::to_string(t.text_length()) + " (" +
+                   std::to_string(t.names.size()) + " sequences, both strands) but the index's has length " +
+                   std::to_string(n);
+        if (terminators != 0 && terminators != 2 * t.names.size())
+            return "the table lists " + std::to_string(t.names.size()) + " sequences, but the index's text has " +
+                   std::to_string(terminators) + " strings rather than two per sequence";
+        return "";
+    }
+
+    /** The terminators in the BWT, one per string of the text, counted from LF. */
+    ulint terminators() {
+        ulint t = 0;
+        for (ulint i = 0; i < lf_.intervals(); ++i)
+            if (lf_.get_character(i) == orbit::TERMINATOR) t += lf_.get_length(i);
+        return t;
+    }
+
+    /** Hold t as the index's sequence-ID table; throws if it does not describe the text. */
+    void set_seq_ids(SeqIdTable t) {
+        const std::string bad = seq_ids_mismatch(t, lf_.domain(), terminators());
+        if (!bad.empty()) throw std::invalid_argument(bad);
+        seq_ids_ = std::move(t);
+    }
+
+    /** The sequence-ID table, or null if the index holds none or it was not loaded. */
+    const SeqIdTable* seq_ids() const { return seq_ids_ ? &*seq_ids_ : nullptr; }
 
     /** Read an index written by serialize(), with every part it holds.  Throws on malformed input. */
     void load(std::istream& in) { load(in, nullptr); }
@@ -410,6 +463,7 @@ public:
         if (need.psi) m |= section_bit(Section::F_STARTS);
         if (need.phi) m |= section_bit(need.phi_starts ? Section::PHI_START : Section::PHI_LEN);
         if (need.phi && need.phi_inv) m |= section_bit(Section::PHI_INV);
+        if (need.seq_ids) m |= section_bit(Section::SEQ_IDS);
         return m;
     }
 
@@ -420,6 +474,7 @@ public:
         if (need.psi) add("psi");
         if (need.phi) add(need.phi_starts ? "phi-starts" : "phi-len");
         if (need.phi && need.phi_inv) add("phi-inv");
+        if (need.seq_ids) add("seq-ids");
         return s.empty() ? "lf" : s;
     }
 
@@ -996,6 +1051,7 @@ private:
     bool has_psi_ = false, has_phi_ = false, has_phi_inv_ = false, has_phi_starts_ = false, has_phi_len_ = false;
     // Every part the index holds is present: built, or loaded whole.
     bool complete_ = true;
+    std::optional<SeqIdTable> seq_ids_;
     std::string info_;
     // Start tables of phi and phi_inv, built when phi_inv is present.
     StartTable phi_table_, phi_inv_table_;
@@ -1038,8 +1094,15 @@ private:
         if (has_phi_len_) rd.load_move_table(Section::PHI_LEN, phi_len_, PHI_LEN_COLS);
         if (has_phi_starts_) rd.load_move_table(Section::PHI_START, phi_, PHI_COLS);
         if (has_phi_inv_) rd.load_move_table(Section::PHI_INV, phi_inv_, PHI_INV_COLS);
+        seq_ids_.reset();
+        if (const SectionEntry* e = h.find(Section::SEQ_IDS); e && wants(Section::SEQ_IDS)) {
+            seq_ids_ = SeqIdTable::from_payload(rd.load_bytes(Section::SEQ_IDS, Kind::SEQ_TABLE), e->rows);
+            const std::string bad = seq_ids_mismatch(*seq_ids_, h.n);
+            if (!bad.empty()) throw std::runtime_error("tms index's SEQ_IDS section does not fit it: " + bad);
+        }
         complete_ = !need || (want.psi == held.psi && want.phi == held.phi && has_phi_inv_ == held.phi_inv &&
-                              (!held.phi || (has_phi_len_ && has_phi_starts_)));
+                              (!held.phi || (has_phi_len_ && has_phi_starts_)) &&
+                              (seq_ids_.has_value() || !h.find(Section::SEQ_IDS)));
         info_ = h.info;
         compute_occurs();
         if (h.bwt_runs != bwt_runs_) throw std::runtime_error("tms index's BWT runs disagree with its header");

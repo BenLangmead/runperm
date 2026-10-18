@@ -3,18 +3,24 @@
 #
 # A multi-contig reference with repeats (some reverse-complemented) is
 # indexed by ropebwt3, converted with fmd2rlbwt and TeraLCP -ophi and built
-# into a tms index.  For each cap N and minimum length, ropebwt3 mem -l X
-# -p N and tms-batch --report smem-all --max-smem-positions N --min-smem-len
-# X-1 --seq-ids FILE must give the same lines in the same order apart from
+# into a tms index twice: with tms-build --seq-ids and its .len.gz, and
+# without, the table then added by index-add-seq-ids.  The two must be equal
+# apart from their provenance, and the second must keep the first index's
+# sections byte for byte.  For each cap N and minimum length, ropebwt3 mem
+# -l X -p N and tms-batch --report smem-all --max-smem-positions N
+# --min-smem-len X-1 must give the same lines in the same order apart from
 # the positions: the same read, start, end, count and n_pos.  For an SMEM
 # with count <= N the positions must be the same set; above the cap each
 # position tms-batch lists must be distinct and hold the SMEM's sequence
-# (reverse-complemented on the - strand).  Without --seq-ids, the output must
-# be the same but for text positions in place of the contig positions, and
-# those must give the contig positions when mapped by hand.  A table that
-# does not describe the index, or that splits it at other points so that a
-# match crosses a contig's end, must make tms-batch fail, as must --seq-ids
-# without smem-all and smem-all with --positions.
+# (reverse-complemented on the - strand).  On the index without a table, the
+# output must be the same but for text positions in place of the contig
+# positions, and those must give the contig positions when mapped by hand.
+# A table whose text length is not the index's must be refused by both
+# tms-build and index-add-seq-ids, and one whose string count is not the
+# text's by tms-build, which counts the strings; one that fits both but
+# splits the text at other points must make tms-batch fail when a match
+# crosses a contig's end.
+# smem-all with --positions must be refused.
 #
 # Usage: test_rope.sh MS FMD2RLBWT TERALCP [ROPEBWT3] [WORK_DIR]
 # TERALCP must support -ophi.
@@ -51,6 +57,11 @@ with gzip.open(f'{w}/shifted.len.gz', 'wt') as f:
     for k, s in enumerate(cs): f.write(f'chr{k + 1}\t{len(s) + (7 if k == 0 else -7 if k == 1 else 0)}\n')
 with gzip.open(f'{w}/short.len.gz', 'wt') as f:
     for k, s in enumerate(cs[:-1]): f.write(f'chr{k + 1}\t{len(s)}\n')
+# The first two contigs as one, with the same text length but a string fewer
+# on each strand.
+with gzip.open(f'{w}/merged.len.gz', 'wt') as f:
+    f.write(f'chr1\t{len(cs[0]) + len(cs[1]) + 1}\n')
+    for k, s in enumerate(cs[2:]): f.write(f'chr{k + 3}\t{len(s)}\n')
 random.seed(11)
 with open(f'{w}/reads.fa', 'w') as f:
     for i in range(400):
@@ -71,15 +82,39 @@ EOF
 "$RB3" ssa -o "$W/ref.fmd.ssa" "$W/ref.fmd" 2>/dev/null
 "$FMD2RLBWT" "$W/ref.fmd" "$W/ref" >/dev/null
 "$TERALCP" -f fmd -i "$W/ref.fmd" -ophi "$W/ref.phi" -t "$W/teralcp.tmp" -v quiet
-"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/ref.idx" --phi "$W/ref.phi" >/dev/null 2>&1
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/plain.idx" --phi "$W/ref.phi" >/dev/null 2>&1
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/ref.idx" --phi "$W/ref.phi" \
+    --seq-ids "$W/ref.fmd.len.gz" >/dev/null 2>&1
+"$MS" index-add-seq-ids "$W/plain.idx" "$W/ref.fmd.len.gz" "$W/added.idx" >/dev/null
+"$MS" index-verify "$W/added.idx" >/dev/null
+python3 - "$W" <<'PYEOF'
+import struct, sys
+w = sys.argv[1]
+def parse(p):
+    b = open(p, 'rb').read()
+    ns, ni = struct.unpack_from('<H', b, 40)[0], struct.unpack_from('<H', b, 44)[0]
+    secs = [b[128 + 80 * i:128 + 80 * (i + 1)] for i in range(ns)]
+    return b, b[:44] + b[46:128], secs, b[128 + 80 * ns:128 + 80 * ns + ni].decode()
+plain, built, added = (parse(f'{w}/{x}.idx') for x in ('plain', 'ref', 'added'))
+# Equal but for the info text and its size.
+assert built[1] == added[1] and built[2] == added[2] and built[0][4096:] == added[0][4096:], \
+    'tms-build --seq-ids and index-add-seq-ids differ'
+# The copy keeps the sections of the index it was given, at their offsets.
+assert added[2][:-1] == plain[2] and added[0][4096:len(plain[0])] == plain[0][4096:], \
+    'index-add-seq-ids changed a section'
+assert added[3].startswith(plain[3]) and 'seq_ids_from=' in added[3]
+print('tms-build --seq-ids and index-add-seq-ids agree; the copied sections are unchanged')
+PYEOF
 
 for cap in 1 3 100 0; do
     for minlen in 1 20; do
         "$RB3" mem -l "$minlen" -p "$cap" "$W/ref.fmd" "$W/reads.fa" 2>/dev/null > "$W/rope.$cap.$minlen"
         "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
-            --min-smem-len $((minlen - 1)) --seq-ids "$W/ref.fmd.len.gz" \
-            -o "$W/orbit.$cap.$minlen" 2>/dev/null
-        "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+            --min-smem-len $((minlen - 1)) -o "$W/orbit.$cap.$minlen" 2>/dev/null
+        "$MS" tms-batch "$W/added.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+            --min-smem-len $((minlen - 1)) -o "$W/added.$cap.$minlen" 2>/dev/null
+        cmp -s "$W/orbit.$cap.$minlen" "$W/added.$cap.$minlen" || { echo "the two indexes' outputs differ"; exit 1; }
+        "$MS" tms-batch "$W/plain.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
             --min-smem-len $((minlen - 1)) -o "$W/raw.$cap.$minlen" 2>/dev/null
         python3 - "$W" "$cap" "$minlen" <<'EOF'
 import gzip, sys
@@ -147,20 +182,34 @@ EOF
     done
 done
 
-# A table for another text, and one that crosses contig ends, are refused.
-for bad in short shifted; do
-    if "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions 3 \
-        --seq-ids "$W/$bad.len.gz" -o "$W/bad.out" 2> "$W/bad.err"; then
-        echo "tms-batch accepted $bad.len.gz"; exit 1
+# A table for another text is refused when it is stored.
+for cmd in build add; do
+    if [ $cmd = build ]; then
+        run=("$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" --seq-ids "$W/short.len.gz")
+    else
+        run=("$MS" index-add-seq-ids "$W/plain.idx" "$W/short.len.gz" "$W/bad.idx")
     fi
-    echo "$bad.len.gz refused: $(tail -1 "$W/bad.err")"
+    if "${run[@]}" > "$W/bad.err" 2>&1; then echo "$cmd accepted short.len.gz"; exit 1; fi
+    echo "$cmd refused short.len.gz: $(tail -1 "$W/bad.err" | sed "s|$W/||g")"
 done
-grep -q crosses "$W/bad.err" || { echo "the shifted table was not refused for crossing a contig end"; exit 1; }
-for args in "--report smem-one --seq-ids $W/ref.fmd.len.gz" "--seq-ids $W/ref.fmd.len.gz" \
-    "--report smem-all --positions"; do
-    # shellcheck disable=SC2086
-    if "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" $args -o "$W/bad.out" 2>/dev/null; then
-        echo "tms-batch accepted '$args'"; exit 1
-    fi
-done
+# tms-build counts the text's strings, which the header does not give.
+if "$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" \
+    --seq-ids "$W/merged.len.gz" > "$W/bad.err" 2>&1; then
+    echo "tms-build accepted a table with a string count other than the text's"; exit 1
+fi
+grep -q strings "$W/bad.err" || { echo "the merged table was not refused for its string count"; exit 1; }
+echo "build refused merged.len.gz: $(tail -1 "$W/bad.err" | sed "s|$W/||g")"
+# A table that fits the text's length and string count but splits it
+# elsewhere is stored, and tms-batch fails when a match crosses an end.
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/shifted.idx" --phi "$W/ref.phi" \
+    --seq-ids "$W/shifted.len.gz" >/dev/null 2>&1
+if "$MS" tms-batch "$W/shifted.idx" "$W/reads.fa" --report smem-all --max-smem-positions 3 \
+    -o "$W/bad.out" 2> "$W/bad.err"; then
+    echo "tms-batch accepted a table that splits the text elsewhere"; exit 1
+fi
+grep -q crosses "$W/bad.err" || { echo "the shifted table did not fail for crossing a contig end"; exit 1; }
+echo "shifted table: $(tail -1 "$W/bad.err")"
+if "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --positions -o "$W/bad.out" 2>/dev/null; then
+    echo "tms-batch accepted smem-all with --positions"; exit 1
+fi
 echo "test_rope: all passed"
