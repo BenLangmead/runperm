@@ -13,13 +13,16 @@
 namespace ms_test {
 
 /**
- * Run all MS tests. Returns true if all pass.
+ * Run all MS tests. Returns true if all pass.  The minishred fixture is
+ * three files in data_dir: minishred1_20_002.bwt.heads and .bwt.len, an
+ * RLBWT, and minishred1_20_002.lcp, one 64-bit LCP per row (the inputs of
+ * build-rlbwt --lcp-bin).
  */
 bool run_all_tests(const std::string& data_dir);
 
 /**
  * Trace ms_query step-by-step for a pattern (no assertions). For debugging.
- * Uses minishred1_20_002_lcp.tsv from data_dir.
+ * Uses the minishred fixture in data_dir (see run_all_tests).
  * index_type: "base" (default), "coal_split", "multispill2".."multispill10".
  * trace_reposition_at: if >= 0, when we hit that backward step index, print
  *   detailed reposition path (min_up, min_down, LCP values per run).

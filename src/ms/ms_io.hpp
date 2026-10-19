@@ -1,6 +1,6 @@
 /**
- * Build MSIndexSpillLCP from TSV and related I/O.
- * TSV parsing is in tsv.hpp; this bridges parsed data to the index.
+ * Build MSIndexSpillLCP from an RLBWT and its per-row LCPs held in memory, or
+ * from the files build-rlbwt --lcp-bin reads (see rlbwt_io.hpp).
  *
  * Author: Ben Langmead (ben.langmead@gmail.com)
  * Date: Feb 17, 2026
@@ -11,13 +11,14 @@
 
 #include "ms_rlbwt.hpp"
 #include "ms_build.hpp"
-#include "tsv.hpp"
+#include "rlbwt_io.hpp"
+#include <iostream>
 #include <optional>
 #include <string>
 
 namespace ms_io {
 
-/** Options for building an MS index from TSV. */
+/** Options for building an MS index. */
 struct BuildOptions {
     double percentile_k = 0.98;
     ulint split_threshold = SPLIT_THRESHOLD_NEVER;
@@ -57,17 +58,39 @@ build_ms_index_spill(std::vector<uchar> bwt_heads, std::vector<ulint> bwt_run_le
 }
 
 /**
- * Build MSIndexSpillLCP from a movify TSV path with given options.
- * Uses spillover storage: no truncation, arbitrary run lengths.
+ * Load an RLBWT and the LCP of each of its rows from PREFIX.bwt.heads,
+ * PREFIX.bwt.len and PREFIX.lcp, the files build-rlbwt --lcp-bin reads.  Each
+ * run's LCP vector holds its rows' LCPs in order, its top first.  Returns
+ * false, after printing why to stderr, if a file is missing or malformed.
+ */
+inline bool load_rlbwt_lcps(const std::string& prefix, std::vector<uchar>& bwt_heads,
+                            std::vector<ulint>& bwt_run_lengths, std::vector<std::vector<ulint>>& lcps_per_run) {
+    std::string err;
+    if (!rlbwt_io::load_rlbwt(prefix + ".bwt.heads", prefix + ".bwt.len", bwt_heads, bwt_run_lengths, err)) {
+        std::cerr << prefix << ": " << err << "\n";
+        return false;
+    }
+    lcps_per_run.assign(bwt_heads.size(), {});
+    if (!rlbwt_io::for_each_run_lcps(prefix + ".lcp", bwt_run_lengths,
+                                     [&](size_t i, const std::vector<ulint>& v) { lcps_per_run[i] = v; }, err)) {
+        std::cerr << prefix << ".lcp: " << err << "\n";
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Build MSIndexSpillLCP from the files load_rlbwt_lcps reads, with given
+ * options.  Uses spillover storage: no truncation, arbitrary run lengths.
  */
 template <bool StoreAbsolutePositions = false>
 inline std::optional<MSIndexSpillLCP<StoreAbsolutePositions>>
-build_ms_index_spill_from_tsv(const std::string& path, const BuildOptions& opts) {
+build_ms_index_spill_from_rlbwt(const std::string& prefix, const BuildOptions& opts = BuildOptions{}) {
     std::vector<uchar> bwt_heads;
     std::vector<ulint> bwt_run_lengths;
     std::vector<std::vector<ulint>> lcps_per_run;
 
-    if (!tsv::load_tsv(path, bwt_heads, bwt_run_lengths, lcps_per_run))
+    if (!load_rlbwt_lcps(prefix, bwt_heads, bwt_run_lengths, lcps_per_run))
         return std::nullopt;
 
     try {
@@ -76,15 +99,6 @@ build_ms_index_spill_from_tsv(const std::string& path, const BuildOptions& opts)
     } catch (...) {
         return std::nullopt;
     }
-}
-
-/**
- * Build MSIndexSpillLCP from a movify TSV path (default options).
- */
-template <bool StoreAbsolutePositions = false>
-inline std::optional<MSIndexSpillLCP<StoreAbsolutePositions>>
-build_ms_index_spill_from_tsv(const std::string& path) {
-    return build_ms_index_spill_from_tsv<StoreAbsolutePositions>(path, BuildOptions{});
 }
 
 }  // namespace ms_io

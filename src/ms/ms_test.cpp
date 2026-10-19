@@ -10,7 +10,6 @@
 #include "ms_rlbwt.hpp"
 #include "ms_io.hpp"
 #include "serialize.hpp"
-#include "tsv.hpp"
 #include "rlbwt_io.hpp"
 #include "tms_test.hpp"
 #include "fmd_test.hpp"
@@ -37,7 +36,7 @@ namespace {
  */
 /**
  * A reference index whose rows are the runs, after any LCP splitting, with
- * no LF splitting: the LCP probes relate its rows to the TSV's runs, and
+ * no LF splitting: the LCP probes relate its rows to the fixture's runs, and
  * test_lf_split compares split indexes with it.  Builds for users always
  * split LF.
  */
@@ -200,17 +199,17 @@ void test_ms_query_consistency() {
 }
 
 /**
- * Test coalesce-spillover build from TSV.
+ * Test coalesce-spillover build from the minishred fixture.
  * TODO: This current just checks that there's no assert!  We should also check
  * that the coalescing is correct.
  */
-bool test_coalesce_spillover_from_tsv(const std::string& data_dir) {
-    std::cout << "Testing coalesce-spillover build from TSV" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+bool test_coalesce_spillover_minishred(const std::string& data_dir) {
+    std::cout << "Testing coalesce-spillover build from minishred" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002";
     std::vector<uchar> bwt_heads;
     std::vector<ulint> bwt_run_lengths;
     std::vector<std::vector<ulint>> lcps_per_run;
-    if (!tsv::load_tsv(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
+    if (!ms_io::load_rlbwt_lcps(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
     }
@@ -432,12 +431,12 @@ static void trace_ms_query_steps(MSIndexSpillLCP<false>& idx, const std::string&
 
 /**
  * Single-string example where ms_query and naive_matching_statistics differ
- * due to LCP compression: the index under-reports. Uses minishred1_20_002_lcp.tsv.
+ * due to LCP compression: the index under-reports. Uses the minishred fixture.
  */
 bool test_ms_query_vs_naive_single_example(const std::string& data_dir) {
-    std::cout << "Testing ms_query vs naive (single example from TSV)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path);
+    std::cout << "Testing ms_query vs naive (single example from minishred)" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path);
     if (!idx) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -456,10 +455,10 @@ bool test_ms_query_vs_naive_single_example(const std::string& data_dir) {
  * Test ms_query vs naive matching statistics on a 100 randomly extracted
  * patterns that match exactly.
  */
- bool test_ms_query_vs_naive_tsv(const std::string& data_dir) {
-    std::cout << "Testing ms_query vs naive (TSV, extract_errory_string, no reposition)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path);
+ bool test_ms_query_vs_naive_minishred(const std::string& data_dir) {
+    std::cout << "Testing ms_query vs naive (minishred, extract_errory_string, no reposition)" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path);
     if (!idx) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -485,10 +484,10 @@ bool test_ms_query_vs_naive_single_example(const std::string& data_dir) {
  * Test ms_query vs naive matching statistics on a 100 randomly extracted
  * "errory" patterns, with 30% "error" rate.
  */
-bool test_ms_query_vs_naive_tsv_reposition(const std::string& data_dir) {
+bool test_ms_query_vs_naive_minishred_reposition(const std::string& data_dir) {
     std::cout << "Testing ms_query vs naive (extract_errory_string, with reposition)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path);
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path);
     if (!idx) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -539,8 +538,8 @@ static std::vector<ulint> naive_matching_statistics_bsearch(const std::string& T
  */
 bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
     std::cout << "Testing ms_query vs naive (mutated patterns, several build options)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto base = ms_io::build_ms_index_spill_from_tsv<false>(path);
+    std::string path = data_dir + "/minishred1_20_002";
+    auto base = ms_io::build_ms_index_spill_from_rlbwt<false>(path);
     if (!base) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -592,7 +591,7 @@ bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
     add("minima+coalesce+split1+align8+splitbits2", true, 8, 2, 1, true);
 
     for (const auto& cfg : configs) {
-        auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, cfg.opts);
+        auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, cfg.opts);
         assert(idx && "index build must succeed");
         for (size_t k = 0; k < patterns.size(); ++k) {
             auto ms_idx = ms_query(*idx, patterns[k]);
@@ -608,36 +607,33 @@ bool test_ms_query_vs_naive_mutated(const std::string& data_dir) {
 
 /**
  * Build the same index two ways and check that they answer identically: from
- * the TSV, and from RLBWT heads/lens files (sentinel written as 0x00, so it
- * maps to orbit::TERMINATOR rather than the TSV path's separator code) plus
- * retained LCP pairs.  This is the path used when LCP minima come from
- * TeraLCP instead of a per-row LCP TSV.
+ * each run's full LCP vector, and from the retained LCP pairs round-tripped
+ * through a TLMSM minima file, the form TeraLCP -ominima writes and
+ * build-rlbwt --minima reads.  Also checks that write_rlbwt and load_rlbwt
+ * round-trip the RLBWT.
  */
 bool test_rlbwt_input_path(const std::string& data_dir) {
-    std::cout << "Testing RLBWT heads/lens input path against the TSV path" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    std::vector<uchar> tsv_heads;
-    std::vector<ulint> tsv_lens;
+    std::cout << "Testing the minima input path against full LCP vectors" << std::endl;
+    std::string path = data_dir + "/minishred1_20_002";
+    std::vector<uchar> heads;
+    std::vector<ulint> lens;
     std::vector<std::vector<ulint>> lcps_per_run;
-    if (!tsv::load_tsv(path, tsv_heads, tsv_lens, lcps_per_run)) {
+    if (!ms_io::load_rlbwt_lcps(path, heads, lens, lcps_per_run)) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
     }
-    std::vector<uchar> raw_heads(tsv_heads);
-    for (auto& h : raw_heads) if (h == 1) h = 0x00;  // TSV maps its # terminator to 1
+    std::vector<uchar> raw_heads(heads);
+    for (auto& h : raw_heads) if (h == orbit::TERMINATOR) h = 0x00;
     const std::string hp = data_dir + "/.ms_test_rlbwt.heads", lp = data_dir + "/.ms_test_rlbwt.len";
-    assert(rlbwt_io::write_rlbwt(hp, lp, raw_heads, tsv_lens));
-    std::vector<uchar> heads;
-    std::vector<ulint> lens;
+    assert(rlbwt_io::write_rlbwt(hp, lp, raw_heads, lens));
+    std::vector<uchar> heads2;
+    std::vector<ulint> lens2;
     std::string err;
-    bool ok = rlbwt_io::load_rlbwt(hp, lp, heads, lens, err);
+    bool ok = rlbwt_io::load_rlbwt(hp, lp, heads2, lens2, err);
     std::remove(hp.c_str());
     std::remove(lp.c_str());
-    assert(ok && "load_rlbwt must succeed");
-    assert(lens == tsv_lens);
+    assert(ok && heads2 == heads && lens2 == lens && "RLBWT files must round-trip");
 
-    // Round-trip the retained pairs through a TLMSM minima file, the form
-    // TeraLCP -ominima writes.
     ulint n = 0;
     for (ulint l : lens) n += l;
     auto pairs = retained_lcp_pairs(lcps_per_run, true);
@@ -650,19 +646,19 @@ bool test_rlbwt_input_path(const std::string& data_dir) {
 
     ms_io::BuildOptions o;
     o.minima_only = true; o.percentile_k = 0.9; o.coalesce = true; o.spill_split_bits = 6;
-    auto from_tsv = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+    auto from_lcps = ms_io::build_ms_index_spill<false>(heads, lens, lcps_per_run, o);
     auto [run_data, spill_vectors, max_top, max_sub, skinny, jumbo] = build_spill_data_from_pairs(
         std::move(read_back), o.percentile_k, o.coalesce, false, o.spill_align, o.spill_split_bits);
-    MSIndexSpillLCP<false> from_rlbwt(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub,
-                                      o.spill_align, o.spill_split_bits);
-    const std::string T = reconstruct_text(*from_tsv);
+    MSIndexSpillLCP<false> from_minima(heads, lens, run_data, std::move(spill_vectors), max_top, max_sub,
+                                       o.spill_align, o.spill_split_bits);
+    const std::string T = reconstruct_text(from_lcps);
     std::mt19937 rng(7);
     std::uniform_int_distribution<size_t> start_dist(0, T.size() - 100);
     for (int k = 0; k < 100; ++k) {
         std::string P = T.substr(start_dist(rng), 100);
         for (size_t j = 0; j < P.size(); j += 17) P[j] = "ACGT"[(j + k) % 4];
         if (k % 4 == 0) P[50] = 'N';
-        assert(ms_query(*from_tsv, P) == ms_query(from_rlbwt, P) && "RLBWT and TSV paths must agree");
+        assert(ms_query(from_lcps, P) == ms_query(from_minima, P) && "minima and full LCP paths must agree");
     }
     std::cout << "  PASSED" << std::endl;
     return true;
@@ -674,10 +670,10 @@ bool test_rlbwt_input_path(const std::string& data_dir) {
  */
 bool test_index_file_roundtrip(const std::string& data_dir) {
     std::cout << "Testing index file save/load" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     ms_io::BuildOptions o;
     o.minima_only = true; o.percentile_k = 0.9; o.coalesce = true; o.spill_split_bits = 6;
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     if (!idx) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -732,7 +728,7 @@ static bool throws_msg(F f, const char* what) {
 template <bool SP>
 static bool check_ms_query_batch(const std::string& path, const std::string& T, const ms_io::BuildOptions& o,
                                  const char* name) {
-    auto idx = ms_io::build_ms_index_spill_from_tsv<SP>(path, o);
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<SP>(path, o);
     if (!idx) return false;
     using Index = MSIndexSpillLCP<SP>;
     // Every column read through the packed row access, when the index has
@@ -897,11 +893,11 @@ static bool check_ms_query_batch(const std::string& path, const std::string& T, 
 
 bool test_ms_query_batch(const std::string& data_dir) {
     std::cout << "Testing ms_query_batch against ms_query" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     ms_io::BuildOptions base;
     ms_io::BuildOptions rec;
     rec.minima_only = true; rec.percentile_k = 0.9; rec.coalesce = true; rec.spill_split_bits = 6;
-    auto text_idx = ms_io::build_ms_index_spill_from_tsv<false>(path, base);
+    auto text_idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, base);
     if (!text_idx) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
@@ -966,12 +962,12 @@ static const char* PATTERN_MULTISPILL2 = "CACAAAGTACATTCTCAAGAGTGGGGAGAATTACAAAG
 /** Assert coal_split index matches naive on a specific pattern. */
 bool test_coal_split_vs_naive_discrepant(const std::string& data_dir) {
     std::cout << "Testing coal_split vs naive (discrepant pattern)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx_base = ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{});
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx_base = ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{});
     if (!idx_base) { std::cout << "  DID NOT RUN" << std::endl; return false; }
     std::string T = reconstruct_text(*idx_base);
     ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1;
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     if (!idx) { std::cout << "  DID NOT RUN" << std::endl; return false; }
     std::string P(PATTERN_COAL_SPLIT);
     auto ms_idx = ms_query(*idx, P);
@@ -984,12 +980,12 @@ bool test_coal_split_vs_naive_discrepant(const std::string& data_dir) {
 /** Assert multispill index matches naive on a specific pattern. */
 bool test_multispill_vs_naive_discrepant(const std::string& data_dir, uchar spill_bits) {
     std::cout << "Testing multispill" << static_cast<unsigned>(spill_bits) << " vs naive (discrepant pattern)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx_base = ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{});
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx_base = ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{});
     if (!idx_base) { std::cout << "  DID NOT RUN" << std::endl; return false; }
     std::string T = reconstruct_text(*idx_base);
     ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; o.spill_split_bits = spill_bits;
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     if (!idx) { std::cout << "  DID NOT RUN" << std::endl; return false; }
     std::string P(PATTERN_MULTISPILL2);
     auto ms_idx = ms_query(*idx, P);
@@ -1005,11 +1001,11 @@ bool test_multispill_vs_naive_discrepant(const std::string& data_dir, uchar spil
  */
 bool test_index_types_consistency(const std::string& data_dir) {
     std::cout << "Testing index type consistency (all must match base)" << std::endl;
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     std::vector<uchar> bwt_heads;
     std::vector<ulint> bwt_run_lengths;
     std::vector<std::vector<ulint>> lcps_per_run;
-    if (!tsv::load_tsv(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
+    if (!ms_io::load_rlbwt_lcps(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
     }
@@ -1019,13 +1015,13 @@ bool test_index_types_consistency(const std::string& data_dir) {
     const float reposition_rate = 0.0f;
     std::mt19937 rng(456);
 
-    auto build_base = [&]() { return ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{}); };
-    auto build_split = [&]() { ms_io::BuildOptions o; o.split_threshold = 1; return ms_io::build_ms_index_spill_from_tsv<false>(path, o); };
-    auto build_coal = [&]() { ms_io::BuildOptions o; o.coalesce = true; return ms_io::build_ms_index_spill_from_tsv<false>(path, o); };
-    auto build_coal_split = [&]() { ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; return ms_io::build_ms_index_spill_from_tsv<false>(path, o); };
+    auto build_base = [&]() { return ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{}); };
+    auto build_split = [&]() { ms_io::BuildOptions o; o.split_threshold = 1; return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o); };
+    auto build_coal = [&]() { ms_io::BuildOptions o; o.coalesce = true; return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o); };
+    auto build_coal_split = [&]() { ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o); };
     auto build_multispill = [&](uchar bits) {
         ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; o.spill_split_bits = bits;
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     };
 
     auto idx_base = build_base();
@@ -1040,7 +1036,7 @@ bool test_index_types_consistency(const std::string& data_dir) {
         compare_index_pair(ms_base, ms_other, *idx_base, T, num_patterns, reposition_rate, pattern_len, rng);
     };
 
-    auto idx_starts = ms_io::build_ms_index_spill_from_tsv<true>(path, ms_io::BuildOptions{});
+    auto idx_starts = ms_io::build_ms_index_spill_from_rlbwt<true>(path, ms_io::BuildOptions{});
     if (idx_starts) {
         auto ms_len = [&](const std::string& P) { return ms_query(*idx_base, P); };
         auto ms_starts = [&](const std::string& P) { return ms_query(*idx_starts, P); };
@@ -1130,7 +1126,7 @@ bool test_lf_split(const std::string& data_dir) {
     }
     {
         LfSplitInput in{"minishred", {}, {}, {}};
-        if (!tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", in.heads, in.lens, in.lcps)) {
+        if (!ms_io::load_rlbwt_lcps(data_dir + "/minishred1_20_002", in.heads, in.lens, in.lcps)) {
             std::cout << "  DID NOT RUN" << std::endl;
             return false;
         }
@@ -1251,7 +1247,7 @@ bool test_streaming_build(const std::string& data_dir) {
     }
     {
         LfSplitInput in{"minishred", {}, {}, {}};
-        if (!tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", in.heads, in.lens, in.lcps)) {
+        if (!ms_io::load_rlbwt_lcps(data_dir + "/minishred1_20_002", in.heads, in.lens, in.lcps)) {
             std::cout << "  DID NOT RUN" << std::endl;
             return false;
         }
@@ -1361,9 +1357,9 @@ bool run_all_tests(const std::string& data_dir) {
     std::cout << std::endl;
     if (!test_ms_query_vs_naive_single_example(data_dir)) all_ran = false;
     std::cout << std::endl;
-    if (!test_ms_query_vs_naive_tsv(data_dir)) all_ran = false;
+    if (!test_ms_query_vs_naive_minishred(data_dir)) all_ran = false;
     std::cout << std::endl;
-    if (!test_ms_query_vs_naive_tsv_reposition(data_dir)) all_ran = false;
+    if (!test_ms_query_vs_naive_minishred_reposition(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_index_types_consistency(data_dir)) all_ran = false;
     std::cout << std::endl;
@@ -1371,7 +1367,7 @@ bool run_all_tests(const std::string& data_dir) {
     std::cout << std::endl;
     if (!test_multispill_vs_naive_discrepant(data_dir, 2)) all_ran = false;
     std::cout << std::endl;
-    if (!test_coalesce_spillover_from_tsv(data_dir)) all_ran = false;
+    if (!test_coalesce_spillover_minishred(data_dir)) all_ran = false;
     std::cout << std::endl;
     if (!test_ms_query_vs_naive_mutated(data_dir)) all_ran = false;
     std::cout << std::endl;
@@ -1397,23 +1393,23 @@ bool run_all_tests(const std::string& data_dir) {
 
 static std::optional<MSIndexSpillLCP<false>> build_index_by_type(const std::string& path, const std::string& index_type) {
     if (index_type == "base") {
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{});
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{});
     }
     if (index_type == "coal_split") {
         ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1;
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     }
     if (index_type.compare(0, 10, "multispill") == 0 && index_type.size() >= 11) {
         uchar bits = static_cast<uchar>(std::stoul(index_type.substr(10)));
         ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; o.spill_split_bits = bits;
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     }
     return std::nullopt;
 }
 
 bool run_investigate(const std::string& data_dir, const std::string& pattern,
                     const std::string& index_type, int trace_reposition_at) {
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     auto idx = build_index_by_type(path, index_type);
     if (!idx) {
         std::cerr << "Failed to load index (type=" << index_type << ")" << std::endl;
@@ -1434,7 +1430,7 @@ bool run_investigate(const std::string& data_dir, const std::string& pattern,
     return match;
 }
 
-/** Compute expected LCP values from raw TSV lcp array (before compression). */
+/** Compute expected LCP values from the raw per-row LCPs (before compression). */
 static void expected_from_raw(const std::vector<ulint>& lcp, ulint offset,
                               ulint& boundary, ulint& row_min,
                               ulint& range_min_to_top, ulint& range_min_to_bottom) {
@@ -1528,8 +1524,8 @@ static void expected_range_min_from_pairs(const std::vector<std::pair<ulint, uli
 }
 
 bool run_probe_base_internal(const std::string& data_dir, size_t first_row, size_t last_row) {
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
-    auto idx = ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{});
+    std::string path = data_dir + "/minishred1_20_002";
+    auto idx = ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{});
     if (!idx) {
         std::cerr << "Failed to build base index" << std::endl;
         return false;
@@ -1584,12 +1580,12 @@ bool run_probe_base_internal(const std::string& data_dir, size_t first_row, size
 }
 
 bool run_probe_lcp_queries(const std::string& data_dir, size_t first_row, size_t last_row) {
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     std::vector<uchar> bwt_heads;
     std::vector<ulint> bwt_run_lengths;
     std::vector<std::vector<ulint>> lcps_per_run;
-    if (!tsv::load_tsv(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
-        std::cerr << "Failed to load TSV" << std::endl;
+    if (!ms_io::load_rlbwt_lcps(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
+        std::cerr << "Failed to load the minishred fixture" << std::endl;
         return false;
     }
     auto idx = std::optional<MSIndexSpillLCP<false>>(
@@ -1597,8 +1593,8 @@ bool run_probe_lcp_queries(const std::string& data_dir, size_t first_row, size_t
     const size_t offset = 2;  /* the offset from the trace */
     std::cout << "LCP probe: base index, rows " << first_row << "-" << last_row
               << ", offset=" << offset << std::endl;
-    std::cout << "  TSV runs=" << lcps_per_run.size() << " index runs=" << idx->move_runs() << std::endl;
-    std::cout << "  (raw=from TSV before compress, compressed=after compress_lcps, index=actual query)"
+    std::cout << "  fixture runs=" << lcps_per_run.size() << " index runs=" << idx->move_runs() << std::endl;
+    std::cout << "  (raw=from the fixture before compress, compressed=after compress_lcps, index=actual query)"
               << std::endl;
     std::cout << std::endl;
 
@@ -1648,12 +1644,12 @@ bool run_probe_lcp_queries(const std::string& data_dir, size_t first_row, size_t
 }
 
 bool run_discover_failing_patterns(const std::string& data_dir) {
-    std::string path = data_dir + "/minishred1_20_002_lcp.tsv";
+    std::string path = data_dir + "/minishred1_20_002";
     std::vector<uchar> bwt_heads;
     std::vector<ulint> bwt_run_lengths;
     std::vector<std::vector<ulint>> lcps_per_run;
-    if (!tsv::load_tsv(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
-        std::cerr << "Failed to load TSV" << std::endl;
+    if (!ms_io::load_rlbwt_lcps(path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
+        std::cerr << "Failed to load the minishred fixture" << std::endl;
         return false;
     }
     const int num_patterns = 500;
@@ -1661,14 +1657,14 @@ bool run_discover_failing_patterns(const std::string& data_dir) {
     const float reposition_rate = 0.0f;
     std::mt19937 rng(456);
 
-    auto build_base = [&]() { return ms_io::build_ms_index_spill_from_tsv<false>(path, ms_io::BuildOptions{}); };
+    auto build_base = [&]() { return ms_io::build_ms_index_spill_from_rlbwt<false>(path, ms_io::BuildOptions{}); };
     auto build_coal_split = [&]() {
         ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1;
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     };
     auto build_multispill = [&](uchar bits) {
         ms_io::BuildOptions o; o.coalesce = true; o.split_threshold = 1; o.spill_split_bits = bits;
-        return ms_io::build_ms_index_spill_from_tsv<false>(path, o);
+        return ms_io::build_ms_index_spill_from_rlbwt<false>(path, o);
     };
 
     auto idx_base = build_base();

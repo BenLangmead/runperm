@@ -2,3 +2,6 @@ minishred*.txt
 minishred*.idx
 minishred*.tsv
 yeast*.tsv
+minishred*.bwt.heads
+minishred*.bwt.len
+minishred*.lcp

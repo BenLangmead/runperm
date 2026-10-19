@@ -16,7 +16,9 @@ OLD=$1
 NEW=$2
 DATA=$3
 W=${4:-$(mktemp -d)}
-TSV="$DATA/minishred1_20_002_lcp.tsv"
+H="$DATA/minishred1_20_002.bwt.heads"
+L="$DATA/minishred1_20_002.bwt.len"
+LCP="$DATA/minishred1_20_002.lcp"
 mkdir -p "$W"
 
 # Compare a new ORBITIDX file ($1) with a rewrapped one ($2): equal fixed
@@ -52,7 +54,7 @@ PYEOF
 }
 
 reads="$W/reads.txt"
-python3 - "$TSV" > "$reads" <<'EOF'
+python3 - > "$reads" <<'EOF'
 import random, sys
 random.seed(7)
 for _ in range(200):
@@ -62,8 +64,8 @@ EOF
 check() {  # name, build command, options...
     local name=$1 cmd=$2
     shift 2
-    "$OLD" "$cmd" "$TSV" "$W/$name.legacy" "$@" > /dev/null 2>&1
-    "$NEW" "$cmd" "$TSV" "$W/$name.new" "$@" > /dev/null 2>&1
+    "$OLD" "$cmd" "$H" "$L" "$W/$name.legacy" "$@" > /dev/null 2>&1
+    "$NEW" "$cmd" "$H" "$L" "$W/$name.new" "$@" > /dev/null 2>&1
     "$NEW" index-rewrap "$W/$name.legacy" "$W/$name.rewrapped" > /dev/null
     same "$W/$name.new" "$W/$name.rewrapped" || { echo "$name: rewrapped index differs from a new build"; exit 1; }
     "$NEW" index-verify "$W/$name.rewrapped" > /dev/null || { echo "$name: index-verify failed"; exit 1; }
@@ -84,15 +86,15 @@ check() {  # name, build command, options...
     echo "$name: rewrap equals a new build"
 }
 
-check ms build
-check ms_split_bits build --spill-split-bits 2
-check ms_coalesce build --coalesce-spillover --spill-align 4
-check ms_minima build --minima-only --lf-split 4
-check tms_full tms-build-tsv --phi
-check tms_full_noinv tms-build-tsv --phi --no-phi-inv
-check tms_psi tms-build-tsv --layout psi
-check tms_phi tms-build-tsv --phi --layout phi
-check tms_phi_unsplit tms-build-tsv --phi --layout phi --phi-split 0 --lf-split 4
+check ms build-rlbwt --lcp-bin "$LCP"
+check ms_split_bits build-rlbwt --lcp-bin "$LCP" --spill-split-bits 2
+check ms_coalesce build-rlbwt --lcp-bin "$LCP" --coalesce-spillover --spill-align 4
+check ms_minima build-rlbwt --lcp-bin "$LCP" --minima-only --lf-split 4
+check tms_full tms-build --lcp-bin "$LCP"
+check tms_full_noinv tms-build --lcp-bin "$LCP" --no-phi-inv
+check tms_psi tms-build --layout psi
+check tms_phi tms-build --lcp-bin "$LCP" --layout phi
+check tms_phi_unsplit tms-build --lcp-bin "$LCP" --layout phi --phi-split 0 --lf-split 4
 
 # Queries on rewrapped indexes print what they print on new builds.
 "$NEW" batch "$W/ms.new" "$reads" -o "$W/q.new" > /dev/null 2>&1

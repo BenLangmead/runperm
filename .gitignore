@@ -73,7 +73,6 @@ example
 
 # App / local (ms branch)
 ms_test
-tsv_load_test
 .cursor
 .vscode
 *.dSYM

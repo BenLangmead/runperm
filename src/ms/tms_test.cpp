@@ -9,7 +9,7 @@
 #include "tms_query.hpp"
 #include "tms_smem.hpp"
 #include "ms_rlbwt.hpp"
-#include "tsv.hpp"
+#include "ms_io.hpp"
 #include "orient.hpp"
 #include "ftab_build.hpp"
 #include "ftab_file.hpp"
@@ -249,7 +249,7 @@ std::vector<Input> batch_inputs(const std::string& data_dir, std::mt19937& rng) 
         std::vector<uchar> heads;
         std::vector<ulint> lens;
         std::vector<std::vector<ulint>> lcps;
-        if (tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", heads, lens, lcps)) {
+        if (ms_io::load_rlbwt_lcps(data_dir + "/minishred1_20_002", heads, lens, lcps)) {
             Input in{heads, lens, {}, {}};
             for (const auto& l : lcps) in.tops.push_back(l[0]);
             try {
@@ -327,7 +327,7 @@ bool test_tms_vs_ms_minishred(const std::string& data_dir) {
     std::vector<uchar> heads;
     std::vector<ulint> lens;
     std::vector<std::vector<ulint>> lcps;
-    if (!tsv::load_tsv(data_dir + "/minishred1_20_002_lcp.tsv", heads, lens, lcps)) {
+    if (!ms_io::load_rlbwt_lcps(data_dir + "/minishred1_20_002", heads, lens, lcps)) {
         std::cout << "  DID NOT RUN" << std::endl;
         return false;
     }

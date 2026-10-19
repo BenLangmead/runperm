@@ -1,16 +1,17 @@
 #!/bin/bash
 # Checks that batch and tms-batch output is byte-identical for every
 # combination of interleave K, thread count and block size, on indexes built
-# from DATA_DIR/minishred1_20_002_lcp.tsv and reads drawn from its text with
-# substitutions, plus random reads, empty reads and reads with N.
+# from the minishred RLBWT and LCP files in DATA_DIR and reads drawn from its
+# text with substitutions, plus random reads, empty reads and reads with N.
 # Usage: test_threads.sh MS_BINARY DATA_DIR [WORK_DIR]
 set -u
 M=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 DATA=$2
 W=${3:-$(mktemp -d)}
 mkdir -p "$W"
-$M build "$DATA/minishred1_20_002_lcp.tsv" "$W/mini.idx" > /dev/null 2>&1 || { echo "build failed"; exit 1; }
-$M tms-build-tsv "$DATA/minishred1_20_002_lcp.tsv" "$W/mini.tms" --phi > /dev/null 2>&1 || { echo "tms-build failed"; exit 1; }
+P="$DATA/minishred1_20_002"
+$M build-rlbwt "$P.bwt.heads" "$P.bwt.len" "$W/mini.idx" --lcp-bin "$P.lcp" > /dev/null 2>&1 || { echo "build failed"; exit 1; }
+$M tms-build "$P.bwt.heads" "$P.bwt.len" "$W/mini.tms" --lcp-bin "$P.lcp" > /dev/null 2>&1 || { echo "tms-build failed"; exit 1; }
 $M tms-text "$W/mini.tms" 2> /dev/null > "$W/text.txt"
 python3 - "$W" <<'PY'
 import random, sys

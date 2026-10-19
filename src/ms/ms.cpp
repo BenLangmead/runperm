@@ -8,7 +8,6 @@
 
 #include "ms_rlbwt.hpp"
 #include "ms_build.hpp"
-#include "tsv.hpp"
 #include "serialize.hpp"
 #include "inspect.hpp"
 #include "ms_test.hpp"
@@ -59,15 +58,6 @@ static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <cmd> [args...]\n"
               << "\n"
               << "Main commands:\n"
-              << "  build      TSV_PATH INDEX_PATH [--percentile K] [--split-threshold N]\n"
-              << "            [--coalesce-spillover] [--spill-align N] [--spill-split-bits X]\n"
-              << "            [--minima-only] [--lf-split B]\n"
-              << "              Build index from TSV.  LF is always split: the rows (runs, or\n"
-              << "              their pieces after --split-threshold) are cut into LF intervals\n"
-              << "              with Orbit's default length capping and balancing, each with\n"
-              << "              its own LCP data.  --lf-split B sets the balancing factor\n"
-              << "              (default: Orbit's default balancing); it must be positive.\n"
-              << "              Results do not depend on B.\n"
               << "  build-rlbwt HEADS LENS INDEX_PATH (--minima FILE | --lcp-bin FILE)\n"
               << "            [--minima-only] [--percentile K] [--coalesce-spillover]\n"
               << "            [--spill-align N] [--spill-split-bits X] [--lf-split B]\n"
@@ -75,8 +65,12 @@ static void usage(const char* prog) {
               << "              fixed-width little-endian lengths) and either a TeraLCP\n"
               << "              -ominima file, which keeps only the LCP minima that queries\n"
               << "              need, or --lcp-bin, one 64-bit LCP per row, optionally after a\n"
-              << "              64-bit row count.  --minima-only applies to --lcp-bin as to\n"
-              << "              build.  --lf-split as for build.\n"
+              << "              64-bit row count; --minima-only keeps only the minima of\n"
+              << "              --lcp-bin's LCPs too.  LF is always split: the runs are cut\n"
+              << "              into LF intervals with Orbit's default length capping and\n"
+              << "              balancing, each with its own LCP data.  --lf-split B sets the\n"
+              << "              balancing factor (default: Orbit's default balancing); it must\n"
+              << "              be positive.  Results do not depend on B.\n"
               << "  ms         INDEX_PATH PATTERN\n"
               << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
               << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
@@ -165,8 +159,6 @@ static void usage(const char* prog) {
               << "              RLBWT came from) in the index, for tms-batch --report smem-all;\n"
               << "              its contig k must be the text's strings 2k and 2k + 1, and both\n"
               << "              its text length and its string count must be the index's.\n"
-              << "  tms-build-tsv TSV_PATH INDEX_PATH [--phi] [--layout ...] [split options]\n"
-              << "              Same, taking the runs and their top LCPs from a TSV.\n"
               << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
               << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
               << "            [--mode psi|phi|phiskip|dual|oracle|oracle-scan] [--positions]\n"
@@ -270,9 +262,9 @@ static void usage(const char* prog) {
               << "  index-verify INDEX_PATH\n"
               << "              Check every section's CRC-32 and that the file is whole.\n"
               << "  index-rewrap LEGACY_PATH INDEX_PATH\n"
-              << "              Rewrite an index of the earlier formats (MSIX v4 from build or\n"
-              << "              build-rlbwt, TMSX v8 from tms-build) in the current format,\n"
-              << "              copying its structures' bytes without loading them.\n"
+              << "              Rewrite an index of the earlier formats (MSIX v4 for ms, TMSX\n"
+              << "              v8 for tms) in the current format, copying its structures'\n"
+              << "              bytes without loading them.\n"
               << "  index-add-seq-ids INDEX_PATH SEQ_IDS OUT_PATH\n"
               << "              Write the tms index at INDEX_PATH to OUT_PATH with the\n"
               << "              sequence-ID table SEQ_IDS (see tms-build --seq-ids) in it, in\n"
@@ -283,8 +275,6 @@ static void usage(const char* prog) {
               << "              loads only LF and phi's lengths-based form.\n"
               << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
               << "              Inspect index and optionally output spillover TSV.\n"
-              << "  lcp-list   TSV_PATH\n"
-              << "              Print LCP columns per run from TSV.\n"
               << "\n"
               << "Diagnostics and debugging:\n"
               << "  test           [DATA_DIR]\n"
@@ -1033,68 +1023,6 @@ int main(int argc, char** argv) {
         return ms_test::run_investigate(data_dir, pattern, index_type, trace_step) ? 0 : 1;
     }
 
-    if (cmd == "build") {
-        if (argc < 2) {
-            std::cerr << "build requires TSV_PATH and INDEX_PATH\n";
-            return 1;
-        }
-        std::string tsv_path = argv[0], idx_path = argv[1];
-        double percentile_k = 0.98;
-        ulint split_threshold = SPLIT_THRESHOLD_NEVER;
-        bool coalesce = false;
-        ulint spill_align = 0;
-        uchar spill_split_bits = 0;
-        bool minima_only = false;
-        orbit::split_params lf_split;
-        for (int i = 2; i < argc; ++i) {
-            if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) {
-                percentile_k = std::stod(argv[++i]);
-            } else if (strcmp(argv[i], "--split-threshold") == 0 && i + 1 < argc) {
-                split_threshold = std::stoull(argv[++i]);
-            } else if (strcmp(argv[i], "--coalesce-spillover") == 0) {
-                coalesce = true;
-            } else if (strcmp(argv[i], "--spill-align") == 0 && i + 1 < argc) {
-                spill_align = std::stoull(argv[++i]);
-            } else if (strcmp(argv[i], "--spill-split-bits") == 0 && i + 1 < argc) {
-                spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
-            } else if (strcmp(argv[i], "--minima-only") == 0) {
-                minima_only = true;
-            } else if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
-                if (!lf_split_arg(argv[++i], lf_split)) return 1;
-            } else {
-                std::cerr << "Unknown build option: " << argv[i] << "\n";
-                return 1;
-            }
-        }
-        std::vector<uchar> bwt_heads;
-        std::vector<ulint> bwt_run_lengths;
-        std::vector<std::vector<ulint>> lcps_per_run;
-        if (!tsv::load_tsv(tsv_path, bwt_heads, bwt_run_lengths, lcps_per_run)) {
-            std::cerr << "Failed to load TSV: " << tsv_path << "\n";
-            return 1;
-        }
-        const size_t runs = bwt_heads.size();
-        apply_lcp_splitting(bwt_heads, bwt_run_lengths, lcps_per_run, split_threshold, minima_only);
-        ms_build::Options bo;
-        bo.percentile_k = percentile_k;
-        bo.coalesce = coalesce;
-        bo.spill_align = spill_align;
-        bo.spill_split_bits = spill_split_bits;
-        bo.minima_only = minima_only;
-        bo.lf_split = lf_split;
-        ms_build::Stats st;
-        auto idx = ms_build::build(std::move(bwt_heads), std::move(bwt_run_lengths),
-                                   ms_build::lcp_vectors_source(lcps_per_run, minima_only), bo, &st);
-        idx.set_info(build_info());
-        if (!ms_serialize::write_index(idx_path, idx)) {
-            std::cerr << "Failed to write index: " << idx_path << "\n";
-            return 1;
-        }
-        std::cout << "Built index: " << idx_path << " (runs=" << runs << ", rows=" << idx.move_runs()
-                  << ", skinny=" << st.skinny << ", jumbo=" << st.jumbo << ")\n";
-        return 0;
-    }
-
     if (cmd == "ms") {
         if (argc < 2) {
             std::cerr << "ms requires INDEX_PATH and PATTERN\n";
@@ -1214,11 +1142,10 @@ int main(int argc, char** argv) {
         });
     }
 
-    if (cmd == "tms-build" || cmd == "tms-build-tsv") {
-        const bool from_tsv = cmd == "tms-build-tsv";
-        const int npos = from_tsv ? 2 : 3;
+    if (cmd == "tms-build") {
+        const int npos = 3;
         if (argc < npos) {
-            std::cerr << cmd << (from_tsv ? " requires TSV_PATH and INDEX_PATH\n" : " requires HEADS, LENS and INDEX_PATH\n");
+            std::cerr << "tms-build requires HEADS, LENS and INDEX_PATH\n";
             return 1;
         }
         TmsBuildOptions opts;
@@ -1238,11 +1165,10 @@ int main(int argc, char** argv) {
                 else if (l == "phi") opts.layout = TmsLayout::PHI;
                 else { std::cerr << "Unknown layout: " << l << "\n"; return 1; }
             }
-            else if (from_tsv && strcmp(argv[i], "--phi") == 0) with_phi = true;
-            else if (!from_tsv && strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
-            else if (!from_tsv && strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
-            else if (!from_tsv && strcmp(argv[i], "--phi") == 0 && i + 1 < argc) { phi_path = argv[++i]; with_phi = true; }
-            else if (!from_tsv && strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc) seq_ids_path = argv[++i];
+            else if (strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
+            else if (strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
+            else if (strcmp(argv[i], "--phi") == 0 && i + 1 < argc) { phi_path = argv[++i]; with_phi = true; }
+            else if (strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc) seq_ids_path = argv[++i];
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
         if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
@@ -1250,11 +1176,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (opts.layout == TmsLayout::PSI && with_phi) {
-            std::cerr << "--layout psi takes no LCP input (" << (from_tsv ? "--phi" : "--phi, --minima or --lcp-bin") << ")\n";
+            std::cerr << "--layout psi takes no LCP input (--phi, --minima or --lcp-bin)\n";
             return 1;
         }
         if (opts.layout == TmsLayout::PHI && !with_phi) {
-            std::cerr << "--layout phi needs LCP input (" << (from_tsv ? "--phi" : "--phi, --minima or --lcp-bin") << ")\n";
+            std::cerr << "--layout phi needs LCP input (--phi, --minima or --lcp-bin)\n";
             return 1;
         }
         // The sequence-ID table is read first, so that a bad one fails
@@ -1273,75 +1199,65 @@ int main(int argc, char** argv) {
         std::vector<uchar> heads;
         std::vector<ulint> lens, tops;
         TmsPhiSamples samples;
-        if (from_tsv) {
-            std::vector<std::vector<ulint>> lcps;
-            if (!tsv::load_tsv(argv[0], heads, lens, lcps)) {
-                std::cerr << "Failed to load TSV: " << argv[0] << "\n";
+        std::string err;
+        if (!rlbwt_io::load_rlbwt(argv[0], argv[1], heads, lens, err)) {
+            std::cerr << "Failed to load RLBWT: " << err << "\n";
+            return 1;
+        }
+        if (!phi_path.empty()) {
+            ulint n = 0;
+            for (ulint l : lens) n += l;
+            if (!phi_samples_io::read_phi_samples(phi_path, n, TmsPhiSamples::records_for(heads, lens), samples, err)) {
+                std::cerr << "Failed to load phi samples: " << err << "\n";
                 return 1;
             }
-            if (with_phi)
-                for (const auto& l : lcps) tops.push_back(l[0]);
-        } else {
-            std::string err;
-            if (!rlbwt_io::load_rlbwt(argv[0], argv[1], heads, lens, err)) {
-                std::cerr << "Failed to load RLBWT: " << err << "\n";
+        } else if (with_phi && !lcp_bin_path.empty()) {
+            // One little-endian 64-bit LCP per row, optionally after a
+            // 64-bit row count (msbench prep's form); keep each run head's.
+            std::ifstream lin(lcp_bin_path, std::ios::binary | std::ios::ate);
+            if (!lin.good()) { std::cerr << "cannot open " << lcp_bin_path << "\n"; return 1; }
+            ulint n = 0;
+            for (ulint l : lens) n += l;
+            const ulint bytes = static_cast<ulint>(lin.tellg());
+            lin.seekg(0);
+            if (bytes == 8 * (n + 1)) {
+                uint64_t count = 0;
+                lin.read(reinterpret_cast<char*>(&count), 8);
+                if (count != n) { std::cerr << "lcp file count " << count << " is not n = " << n << "\n"; return 1; }
+            } else if (bytes != 8 * n) {
+                std::cerr << "lcp file has " << bytes << " bytes; expected 8 per row for n = " << n << "\n";
                 return 1;
             }
-            if (!phi_path.empty()) {
-                ulint n = 0;
-                for (ulint l : lens) n += l;
-                if (!phi_samples_io::read_phi_samples(phi_path, n, TmsPhiSamples::records_for(heads, lens), samples, err)) {
-                    std::cerr << "Failed to load phi samples: " << err << "\n";
-                    return 1;
-                }
-            } else if (with_phi && !lcp_bin_path.empty()) {
-                // One little-endian 64-bit LCP per row, optionally after a
-                // 64-bit row count (msbench prep's form); keep each run head's.
-                std::ifstream lin(lcp_bin_path, std::ios::binary | std::ios::ate);
-                if (!lin.good()) { std::cerr << "cannot open " << lcp_bin_path << "\n"; return 1; }
-                ulint n = 0;
-                for (ulint l : lens) n += l;
-                const ulint bytes = static_cast<ulint>(lin.tellg());
-                lin.seekg(0);
-                if (bytes == 8 * (n + 1)) {
-                    uint64_t count = 0;
-                    lin.read(reinterpret_cast<char*>(&count), 8);
-                    if (count != n) { std::cerr << "lcp file count " << count << " is not n = " << n << "\n"; return 1; }
-                } else if (bytes != 8 * n) {
-                    std::cerr << "lcp file has " << bytes << " bytes; expected 8 per row for n = " << n << "\n";
-                    return 1;
-                }
-                std::vector<uint64_t> buf(1 << 20);
-                size_t have = 0, at = 0;
-                tops.reserve(heads.size());
-                for (ulint len : lens) {
-                    for (ulint j = 0; j < len; ++j) {
-                        if (at == have) {
-                            lin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 8));
-                            have = static_cast<size_t>(lin.gcount()) / 8;
-                            at = 0;
-                            if (have == 0) { std::cerr << "lcp file is shorter than the RLBWT\n"; return 1; }
-                        }
-                        if (j == 0) tops.push_back(buf[at]);
-                        ++at;
+            std::vector<uint64_t> buf(1 << 20);
+            size_t have = 0, at = 0;
+            tops.reserve(heads.size());
+            for (ulint len : lens) {
+                for (ulint j = 0; j < len; ++j) {
+                    if (at == have) {
+                        lin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 8));
+                        have = static_cast<size_t>(lin.gcount()) / 8;
+                        at = 0;
+                        if (have == 0) { std::cerr << "lcp file is shorter than the RLBWT\n"; return 1; }
                     }
+                    if (j == 0) tops.push_back(buf[at]);
+                    ++at;
                 }
-            } else if (with_phi) {
-                // Only each run's top is kept, so the file is read a run at a time.
-                ulint n = 0;
-                for (ulint l : lens) n += l;
-                rlbwt_io::MinimaReader rd;
-                RunLcpPairs p;
-                bool ok = rd.open(minima_path, heads.size(), n, err);
-                tops.reserve(heads.size());
-                for (size_t i = 0; ok && i < heads.size(); ++i) {
-                    ok = rd.next(p, err);
-                    if (ok) tops.push_back(p[0].second);
-                }
-                if (!ok || !rd.finish(err)) {
-                    std::cerr << "Failed to load minima: " << err << "\n";
-                    return 1;
-                }
+            }
+        } else if (with_phi) {
+            // Only each run's top is kept, so the file is read a run at a time.
+            ulint n = 0;
+            for (ulint l : lens) n += l;
+            rlbwt_io::MinimaReader rd;
+            RunLcpPairs p;
+            bool ok = rd.open(minima_path, heads.size(), n, err);
+            tops.reserve(heads.size());
+            for (size_t i = 0; ok && i < heads.size(); ++i) {
+                ok = rd.next(p, err);
+                if (ok) tops.push_back(p[0].second);
+            }
+            if (!ok || !rd.finish(err)) {
+                std::cerr << "Failed to load minima: " << err << "\n";
+                return 1;
             }
         }
         // The run lengths and tops, packed.
@@ -1796,30 +1712,6 @@ int main(int argc, char** argv) {
                 if (ms_inspect::run_spillover_tsv(*opt, path))
                     std::cout << "Spillover TSV written to " << path << "\n";
             }
-        }
-        return 0;
-    }
-
-    if (cmd == "lcp-list") {
-        if (argc < 1) {
-            std::cerr << "lcp-list requires TSV_PATH\n";
-            return 1;
-        }
-        std::vector<uchar> bwt_heads;
-        std::vector<ulint> bwt_run_lengths;
-        std::vector<std::vector<ulint>> lcps_per_run;
-        if (!tsv::load_tsv(argv[0], bwt_heads, bwt_run_lengths, lcps_per_run)) {
-            std::cerr << "Failed to load TSV: " << argv[0] << "\n";
-            return 1;
-        }
-        for (size_t i = 0; i < lcps_per_run.size(); ++i) {
-            std::cout << i << ": ";
-            for (size_t j = 0; j < lcps_per_run[i].size(); ++j) {
-                if (j > 0) std::cout << ",";
-                ulint lcp = lcps_per_run[i][j];
-                std::cout << (lcp == LCP_GAP ? "-" : std::to_string(lcp));
-            }
-            std::cout << "\n";
         }
         return 0;
     }

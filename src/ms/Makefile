@@ -7,7 +7,7 @@ CXXFLAGS = -std=c++17 -I../../include -I. -O3 -pthread
 MS_COMMIT ?= $(shell c=$$(git rev-parse --short=12 HEAD 2>/dev/null) && { git diff --quiet HEAD -- . 2>/dev/null || c=$$c-dirty; echo $$c; } || echo unknown)
 CXXFLAGS += -DMS_COMMIT='"$(MS_COMMIT)"'
 
-MS_SRCS = ms.cpp tsv.cpp ms_io.cpp index_format.cpp ms_test.cpp inspect.cpp tms_test.cpp fmd_test.cpp
+MS_SRCS = ms.cpp ms_io.cpp index_format.cpp ms_test.cpp inspect.cpp tms_test.cpp fmd_test.cpp
 
 MS_HDRS = $(wildcard *.hpp) $(shell find ../../include -name '*.hpp')
 

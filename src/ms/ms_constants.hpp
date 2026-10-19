@@ -1,5 +1,5 @@
 /**
- * Shared constants for MS index and TSV parsing.
+ * Shared constants for the MS index.
  *
  * Author: Ben Langmead (ben.langmead@gmail.com)
  * Date: Feb 17, 2026
@@ -12,7 +12,7 @@
 
 using ulint = orbit::ulint;
 
-/** Sentinel for LCP values that are gaps (e.g. "-" in TSV, compressed-out values). */
+/** Sentinel for LCP values that are gaps (compressed-out values). */
 constexpr ulint LCP_GAP = (1ULL << 57) - 1;
 
 #endif /* _MS_CONSTANTS_HPP */
