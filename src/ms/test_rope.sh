@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check tms-batch --report smem-all against ropebwt3 mem on a small FMD.
+# Check query --report smem-all against ropebwt3 mem on a small FMD.
 #
 # A multi-contig reference with repeats (some reverse-complemented) is
 # indexed by ropebwt3, converted with fmd2rlbwt and TeraLCP -ophi and built
@@ -7,18 +7,18 @@
 # without, the table then added by index-add-seq-ids.  The two must be equal
 # apart from their provenance, and the second must keep the first index's
 # sections byte for byte.  For each cap N and minimum length, ropebwt3 mem
-# -l X -p N and tms-batch --report smem-all --max-smem-positions N
-# --min-smem-len X-1 must give the same lines in the same order apart from
+# -l X -p N and query --report smem-all --max-smem-positions N
+# --min-smem-len X must give the same lines in the same order apart from
 # the positions: the same read, start, end, count and n_pos.  For an SMEM
 # with count <= N the positions must be the same set; above the cap each
-# position tms-batch lists must be distinct and hold the SMEM's sequence
+# position query lists must be distinct and hold the SMEM's sequence
 # (reverse-complemented on the - strand).  On the index without a table, the
 # output must be the same but for text positions in place of the contig
 # positions, and those must give the contig positions when mapped by hand.
 # A table whose text length is not the index's must be refused by both
 # tms-build and index-add-seq-ids, and one whose string count is not the
 # text's by tms-build, which counts the strings; one that fits both but
-# splits the text at other points must make tms-batch fail when a match
+# splits the text at other points must make query fail when a match
 # crosses a contig's end.
 # smem-all with --positions must be refused.
 #
@@ -109,13 +109,13 @@ PYEOF
 for cap in 1 3 100 0; do
     for minlen in 1 20; do
         "$RB3" mem -l "$minlen" -p "$cap" "$W/ref.fmd" "$W/reads.fa" 2>/dev/null > "$W/rope.$cap.$minlen"
-        "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
-            --min-smem-len $((minlen - 1)) -o "$W/orbit.$cap.$minlen" 2>/dev/null
-        "$MS" tms-batch "$W/added.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
-            --min-smem-len $((minlen - 1)) -o "$W/added.$cap.$minlen" 2>/dev/null
+        "$MS" query "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+            --min-smem-len "$minlen" -o "$W/orbit.$cap.$minlen" 2>/dev/null
+        "$MS" query "$W/added.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+            --min-smem-len "$minlen" -o "$W/added.$cap.$minlen" 2>/dev/null
         cmp -s "$W/orbit.$cap.$minlen" "$W/added.$cap.$minlen" || { echo "the two indexes' outputs differ"; exit 1; }
-        "$MS" tms-batch "$W/plain.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
-            --min-smem-len $((minlen - 1)) -o "$W/raw.$cap.$minlen" 2>/dev/null
+        "$MS" query "$W/plain.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+            --min-smem-len "$minlen" -o "$W/raw.$cap.$minlen" 2>/dev/null
         python3 - "$W" "$cap" "$minlen" <<'EOF'
 import gzip, sys
 w, cap, minlen = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -200,16 +200,16 @@ fi
 grep -q strings "$W/bad.err" || { echo "the merged table was not refused for its string count"; exit 1; }
 echo "build refused merged.len.gz: $(tail -1 "$W/bad.err" | sed "s|$W/||g")"
 # A table that fits the text's length and string count but splits it
-# elsewhere is stored, and tms-batch fails when a match crosses an end.
+# elsewhere is stored, and query fails when a match crosses an end.
 "$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/shifted.idx" --phi "$W/ref.phi" \
     --seq-ids "$W/shifted.len.gz" >/dev/null 2>&1
-if "$MS" tms-batch "$W/shifted.idx" "$W/reads.fa" --report smem-all --max-smem-positions 3 \
+if "$MS" query "$W/shifted.idx" "$W/reads.fa" --report smem-all --max-smem-positions 3 \
     -o "$W/bad.out" 2> "$W/bad.err"; then
-    echo "tms-batch accepted a table that splits the text elsewhere"; exit 1
+    echo "query accepted a table that splits the text elsewhere"; exit 1
 fi
 grep -q crosses "$W/bad.err" || { echo "the shifted table did not fail for crossing a contig end"; exit 1; }
 echo "shifted table: $(tail -1 "$W/bad.err")"
-if "$MS" tms-batch "$W/ref.idx" "$W/reads.fa" --report smem-all --positions -o "$W/bad.out" 2>/dev/null; then
-    echo "tms-batch accepted smem-all with --positions"; exit 1
+if "$MS" query "$W/ref.idx" "$W/reads.fa" --report smem-all --positions -o "$W/bad.out" 2>/dev/null; then
+    echo "query accepted smem-all with --positions"; exit 1
 fi
 echo "test_rope: all passed"

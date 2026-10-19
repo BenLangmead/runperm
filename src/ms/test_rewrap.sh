@@ -72,8 +72,8 @@ check() {  # name, build command, options...
     # ftabs of the new build and of the rewrap hold the same table.  The
     # new build's links to the rewrap, whose info text differs, unless the
     # rewrap's LF keeps a phi_off column, which makes its LF another section.
-    "$NEW" ftab-build "$W/$name.new" "$W/$name.ftab" --k 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
-    "$NEW" ftab-build "$W/$name.rewrapped" "$W/$name.rw.ftab" --k 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
+    "$NEW" ftab-build "$W/$name.new" "$W/$name.ftab" --kmer-len 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
+    "$NEW" ftab-build "$W/$name.rewrapped" "$W/$name.rw.ftab" --kmer-len 4 > /dev/null || { echo "$name: ftab-build failed"; exit 1; }
     cmp -s -i 4096 "$W/$name.ftab" "$W/$name.rw.ftab" || { echo "$name: the rewrap's ftab holds another table"; exit 1; }
     case "$name" in
         tms_full* | tms_phi*)
@@ -97,9 +97,9 @@ check tms_phi tms-build --lcp-bin "$LCP" --layout phi
 check tms_phi_unsplit tms-build --lcp-bin "$LCP" --layout phi --phi-split 0 --lf-split 4
 
 # Queries on rewrapped indexes print what they print on new builds.
-"$NEW" batch "$W/ms.new" "$reads" -o "$W/q.new" > /dev/null 2>&1
-"$NEW" batch "$W/ms.rewrapped" "$reads" -o "$W/q.rw" > /dev/null 2>&1
-cmp -s "$W/q.new" "$W/q.rw" || { echo "ms batch output differs"; exit 1; }
+"$NEW" query "$W/ms.new" "$reads" -o "$W/q.new" > /dev/null 2>&1
+"$NEW" query "$W/ms.rewrapped" "$reads" -o "$W/q.rw" > /dev/null 2>&1
+cmp -s "$W/q.new" "$W/q.rw" || { echo "ms query output differs"; exit 1; }
 for name in tms_full tms_full_noinv tms_phi tms_phi_unsplit; do
     for q in "--mode psi" "--mode phi" "--mode dual --positions" "--mode phi --report smem-all"; do
         # The phi layout serves phi mode alone, and smem-all needs phi_inv.
@@ -107,10 +107,10 @@ for name in tms_full tms_full_noinv tms_phi tms_phi_unsplit; do
             tms_phi*:"--mode psi" | tms_phi*:"--mode dual --positions" | tms_full_noinv:*smem-all) continue ;;
         esac
         # shellcheck disable=SC2086
-        "$NEW" tms-batch "$W/$name.new" "$reads" -o "$W/q.new" $q > /dev/null 2>&1
+        "$NEW" query "$W/$name.new" "$reads" -o "$W/q.new" $q > /dev/null 2>&1
         # shellcheck disable=SC2086
-        "$NEW" tms-batch "$W/$name.rewrapped" "$reads" -o "$W/q.rw" $q > /dev/null 2>&1
-        cmp -s "$W/q.new" "$W/q.rw" || { echo "$name: tms-batch $q output differs"; exit 1; }
+        "$NEW" query "$W/$name.rewrapped" "$reads" -o "$W/q.rw" $q > /dev/null 2>&1
+        cmp -s "$W/q.new" "$W/q.rw" || { echo "$name: tms query $q output differs"; exit 1; }
     done
 done
 echo "queries agree"

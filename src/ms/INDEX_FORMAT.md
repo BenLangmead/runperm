@@ -57,7 +57,7 @@ Payloads:
 
 ## The sequence-ID table
 
-A tms index built from a ropebwt3 FMD may hold the FMD's sequence-ID table, ropebwt3's `.len.gz`, as the SEQ_IDS section, last in the file. Sequence k is the FMD's strings 2k (its forward strand) and 2k + 1 (its reverse complement), so the text is `C_0 $ rc(C_0) $ C_1 $ rc(C_1) $ ...`, and the lengths must give the header's n as 2 * sum(len_k + 1). `tms-batch --report smem-all` uses the table to write positions as contig, strand and forward-strand offset, as ropebwt3 does. It is added at build time by `ms tms-build --seq-ids FILE`, which also checks that the BWT has two terminators per sequence. `ms index-add-seq-ids INDEX FILE OUT` adds it to an index already built. It copies the other sections byte for byte, at the same offsets, and checks only n, since counting the terminators would mean loading LF. A table that fits both checks but splits the text elsewhere makes a query fail when a match crosses a sequence's end.
+A tms index built from a ropebwt3 FMD may hold the FMD's sequence-ID table, ropebwt3's `.len.gz`, as the SEQ_IDS section, last in the file. Sequence k is the FMD's strings 2k (its forward strand) and 2k + 1 (its reverse complement), so the text is `C_0 $ rc(C_0) $ C_1 $ rc(C_1) $ ...`, and the lengths must give the header's n as 2 * sum(len_k + 1). `query --report smem-all` uses the table to write positions as contig, strand and forward-strand offset, as ropebwt3 does. It is added at build time by `ms tms-build --seq-ids FILE`, which also checks that the BWT has two terminators per sequence. `ms index-add-seq-ids INDEX FILE OUT` adds it to an index already built. It copies the other sections byte for byte, at the same offsets, and checks only n, since counting the terminators would mean loading LF. A table that fits both checks but splits the text elsewhere makes a query fail when a match crosses a sequence's end.
 
 Neither changes the sections an ftab links to, so an ftab built from the index without the table serves it with the table. Earlier `ms` binaries load such an index and ignore the section.
 
@@ -82,13 +82,13 @@ This section describes the current `ms` binary, not the format.
 | `--mode oracle` or `oracle-scan` with `--positions` or `--report smem-one` | LF, PHI_START |
 | `--report smem-all` | LF, PHI_START, PHI_INV, SEQ_IDS if held, plus F_STARTS outside phi and oracle modes |
 
-`ms index-plan INDEX` prints, for the index at hand, the sections and start tables each `tms-batch` command line loads and the RAM they take.
+`ms index-plan INDEX` prints, for the index at hand, the sections and start tables each tms `query` command line loads and the RAM they take.
 
 Because LF is loaded whole, a phi-mode query on a full-layout index also loads the PSI columns and the union rows it does not read. Build `--layout phi` for phi-only work.
 
 ## Companion files
 
-An ftab (FTAB_FORMAT.md), a table of query states by k-mer that `batch` and `tms-batch` take with `--ftab-file`, is stored as a file of its own next to its index. Its header links it to the index through copies of the fixed fields and of the section entries its walk read.
+An ftab (FTAB_FORMAT.md), a table of query states by k-mer that `query` takes with `--ftab`, is stored as a file of its own next to its index. Its header links it to the index through copies of the fixed fields and of the section entries its walk read.
 
 ## Info text
 

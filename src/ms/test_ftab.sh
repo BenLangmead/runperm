@@ -3,10 +3,10 @@
 # psi and phi layout) indexes from the minishred RLBWT and LCP files in DATA_DIR and
 # reads drawn from its text; with --indexes, takes existing ORBITIDX
 # indexes and a reads file instead.  For each index it runs ftab-build
-# (--auto and a given k), ftab-info and ftab-verify, and checks that batch
-# or tms-batch output with --ftab-file is byte-identical to the output
+# (--auto and a given k), ftab-info and ftab-verify, and checks that query
+# output with --ftab is byte-identical to the output
 # without it, in every mode the layout serves, with and without --positions
-# and with each SMEM report the layout serves.  ftab-verify and --ftab-file
+# and with each SMEM report the layout serves.  ftab-verify and --ftab
 # must refuse a table built from another index.
 # Usage: test_ftab.sh MS_BINARY DATA_DIR [WORK_DIR]
 #        test_ftab.sh MS_BINARY --indexes READS WORK_DIR INDEX...
@@ -61,8 +61,8 @@ PY
     INDEXES=("$W/mini.idx" "$W/mini-full.tms" "$W/mini-psi.tms" "$W/mini-phi.tms")
     THREADS=${THREADS:-3}
     # Tables of other indexes are refused, naming the field.
-    $M ftab-build "$W/mini-split.idx" "$W/mini-split.ftab" --k 6 > /dev/null || fail "ftab-build mini-split.idx"
-    $M ftab-build "$W/mini-full-split.tms" "$W/mini-full-split.ftab" --k 6 > /dev/null || fail "ftab-build mini-full-split.tms"
+    $M ftab-build "$W/mini-split.idx" "$W/mini-split.ftab" --kmer-len 6 > /dev/null || fail "ftab-build mini-split.idx"
+    $M ftab-build "$W/mini-full-split.tms" "$W/mini-full-split.ftab" --kmer-len 6 > /dev/null || fail "ftab-build mini-full-split.tms"
 fi
 
 tool_of() { "$M" index-plan "$1" 2> /dev/null | grep -q 'tool: tms' && echo tms || echo ms; }
@@ -71,14 +71,14 @@ cd "$W"
 for idx in "${INDEXES[@]}"; do
     base=$(basename "$idx")
     tool=$(tool_of "$idx")
-    for kopt in "--auto" "--k 8"; do
+    for kopt in "--auto" "--kmer-len 8"; do
         ft="$W/$base.$(echo $kopt | tr -d ' -').ftab"
         $M ftab-build "$idx" "$ft" $kopt --threads $THREADS > build.txt 2>&1 || { fail "ftab-build $base $kopt"; cat build.txt; continue; }
         echo "$base $kopt: $(grep -o 'k=[0-9]*, entry_bits=[0-9]*, bytes=[0-9]*, occupancy=[0-9.e-]*' build.txt)"
         $M ftab-info "$ft" > info.txt || fail "ftab-info $base"
         $M ftab-verify "$idx" "$ft" --crc > /dev/null || fail "ftab-verify $base $kopt"
         if [ "$tool" = ms ]; then
-            cmds=("batch|")
+            cmds=("query|")
             [ -f "$W/mini-split.ftab" ] && { $M ftab-verify "$idx" "$W/mini-split.ftab" 2> /dev/null && fail "ftab-verify accepted another index's table"; }
         else
             layout=$(grep -o 'layout=[a-z]*' info.txt | cut -d= -f2)
@@ -90,16 +90,16 @@ for idx in "${INDEXES[@]}"; do
                 phi) modes=(phi) ;;
             esac
             for m in "${modes[@]}"; do
-                cmds+=("tms-batch|--mode $m")
+                cmds+=("query|--mode $m")
                 if [ "$layout" != psi ]; then
-                    cmds+=("tms-batch|--mode $m --positions" "tms-batch|--mode $m --report smem-one" "tms-batch|--mode $m --report smem-all --max-smem-positions 20 --min-smem-len 12")
-                    cmds+=("tms-batch|--mode $m --phi-starts")
+                    cmds+=("query|--mode $m --positions" "query|--mode $m --report smem-one" "query|--mode $m --report smem-all --max-smem-positions 20 --min-smem-len 13")
+                    cmds+=("query|--mode $m --phi-starts")
                 fi
             done
             for other in "$W/mini-full-split.ftab" "$W/mini.idx.auto.ftab"; do
                 [ -f "$other" ] || continue
                 $M ftab-verify "$idx" "$other" 2> err.txt && fail "ftab-verify accepted $(basename $other) for $base"
-                $M tms-batch "$idx" "$READS" --ftab-file "$other" --no-output 2> /dev/null && fail "tms-batch accepted $(basename $other) for $base"
+                $M query "$idx" "$READS" --ftab "$other" --no-output 2> /dev/null && fail "query accepted $(basename $other) for $base"
             done
         fi
         for c in "${cmds[@]}"; do
@@ -108,9 +108,9 @@ for idx in "${INDEXES[@]}"; do
             [ -f "ref.$base.$cmd.$(echo $opts | tr -d ' -')" ] || $M $cmd "$idx" "$READS" $opts --threads $THREADS -o "ref.$base.$cmd.$(echo $opts | tr -d ' -')" 2> err.txt \
                 || { fail "$cmd $base $opts"; cat err.txt; continue; }
             for k in 0 32; do
-                $M $cmd "$idx" "$READS" $opts --threads $THREADS --interleave $k --ftab-file "$ft" -o o.out 2> err.txt \
-                    || { fail "$cmd $base $opts --ftab-file $kopt k=$k"; cat err.txt; continue; }
-                cmp -s "ref.$base.$cmd.$(echo $opts | tr -d ' -')" o.out || fail "differs: $cmd $base $opts --ftab-file ($kopt) k=$k"
+                $M $cmd "$idx" "$READS" $opts --threads $THREADS --interleave $k --ftab "$ft" -o o.out 2> err.txt \
+                    || { fail "$cmd $base $opts --ftab $kopt k=$k"; cat err.txt; continue; }
+                cmp -s "ref.$base.$cmd.$(echo $opts | tr -d ' -')" o.out || fail "differs: $cmd $base $opts --ftab ($kopt) k=$k"
             done
             echo "  checked $cmd $opts"
         done

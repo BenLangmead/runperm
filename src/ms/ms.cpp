@@ -1,6 +1,7 @@
 /**
  * Command line interface that displays usage and dispatches to the various
- * subcommands.  TODO: slicker command-line parsing.
+ * subcommands.  `ms --help` lists the user commands and options, and
+ * `ms --help-advanced` adds the development and advanced ones.
  *
  * Author: Ben Langmead (ben.langmead@gmail.com)
  * Date: Feb 17, 2026
@@ -53,250 +54,216 @@
 #define MS_COMMIT "unknown"
 #endif
 
-/** Print usage message. */
-static void usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " <cmd> [args...]\n"
-              << "\n"
-              << "Main commands:\n"
-              << "  build-rlbwt HEADS LENS INDEX_PATH (--minima FILE | --lcp-bin FILE)\n"
-              << "            [--minima-only] [--percentile K] [--coalesce-spillover]\n"
-              << "            [--spill-align N] [--spill-split-bits X] [--lf-split B]\n"
-              << "              Build index from an RLBWT (HEADS: one byte per run; LENS:\n"
-              << "              fixed-width little-endian lengths) and either a TeraLCP\n"
-              << "              -ominima file, which keeps only the LCP minima that queries\n"
-              << "              need, or --lcp-bin, one 64-bit LCP per row, optionally after a\n"
-              << "              64-bit row count; --minima-only keeps only the minima of\n"
-              << "              --lcp-bin's LCPs too.  LF is always split: the runs are cut\n"
-              << "              into LF intervals with Orbit's default length capping and\n"
-              << "              balancing, each with its own LCP data.  --lf-split B sets the\n"
-              << "              balancing factor (default: Orbit's default balancing); it must\n"
-              << "              be positive.  Results do not depend on B.\n"
-              << "  ms         INDEX_PATH PATTERN\n"
-              << "              Compute matching statistics for PATTERN using INDEX_PATH.\n"
-              << "  batch      INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
-              << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
-              << "            [--orient fwd|rc|qual] [--ftab-file FILE | --ftab | --ftab-k K]\n"
-              << "            [--mode standard|oracle|oracle-scan] [--oracle-write FILE | --oracle FILE]\n"
-              << "              Load the index once and compute matching statistics for every\n"
-              << "              read in READS (FASTA, FASTQ, or one sequence per line, in\n"
-              << "              which blank lines are skipped; - for stdin; LF or CRLF line\n"
-              << "              endings).  Reads are processed in blocks, so input size is not\n"
-              << "              limited by memory.  Writes one line per read: name, tab, space-separated\n"
-              << "              values.  --no-output skips writing (for timing).  --interleave K\n"
-              << "              keeps K reads in flight, prefetching each one's next row\n"
-              << "              (default 32); K = 0 queries one read at a time without\n"
-              << "              prefetching (ms_query for batch, the batched engine with one\n"
-              << "              read for tms-batch).  --threads T (or -p T) queries on T\n"
-              << "              threads, each with its own K reads in flight (default 1; 0 uses\n"
-              << "              every CPU the process may run on).  Each thread takes a block\n"
-              << "              of about B reads at a time (--block-reads, default\n"
-              << "              max(512, 16K)), sized in bytes from the reads seen so far,\n"
-              << "              or of N bytes (--block-bytes).  Output named *.gz is written\n"
-              << "              gzip-compressed, by all threads (--gzip-level, default 1).\n"
-              << "              Results and their order do not depend on K, T or B.  On a\n"
-              << "              machine with several memory nodes (sockets), the index's\n"
-              << "              memory is interleaved over the nodes (Linux), unless numactl\n"
-              << "              sets a memory policy, as when running one process per node on\n"
-              << "              part of the reads (numactl -N i -m i).  A summary goes to stderr:\n"
-              << "              query_ns_per_base is the threads' summed query time per base,\n"
-              << "              and wall_ns_per_base the elapsed time per base.\n"
-              << "              --orient sets which strand of each read is matched: fwd (the\n"
-              << "              default) matches the read as given; rc matches its reverse\n"
-              << "              complement, starting from the read's 5' end, and converts the\n"
-              << "              result back to the read's matching statistics; qual does so\n"
-              << "              only for reads whose last min(20, len) bases have a higher\n"
-              << "              mean base quality than their first, and needs FASTQ input.\n"
-              << "              rc and qual give the same output as fwd only for an index that\n"
-              << "              holds both strands of every sequence (as an FMD or a ropebwt3\n"
-              << "              index does); this cannot be detected from the index, so the\n"
-              << "              user must know it.  They refuse tms-batch's --positions and\n"
-              << "              SMEM reports.  The summary's flipped field counts the reads\n"
-              << "              matched on the other strand, and orient_s is the threads'\n"
-              << "              summed time flipping reads and converting their results.\n"
-              << "              --ftab-file FILE loads a table (from ftab-build) of the query\n"
-              << "              state after each K-mer over ACGT; a read whose last K bases\n"
-              << "              occur in the text starts K steps in.  Results are unchanged.\n"
-              << "              The table must have been built from this index: its link to\n"
-              << "              the index is checked against the index's header, and a table\n"
-              << "              of another index is refused.  --ftab instead builds the table\n"
-              << "              after loading the index, on every CPU (K = 14, or --ftab-k K,\n"
-              << "              which implies --ftab).  tms-batch takes a table in every mode,\n"
-              << "              with or without positions; a table built from a psi layout\n"
-              << "              serves --mode psi without positions or SMEM reports only.\n"
-              << "              --oracle-write FILE (in the standard mode) records every\n"
-              << "              reposition's outcome in the format tms-batch's describes, and\n"
-              << "              --mode oracle or oracle-scan with --oracle FILE replays them.\n"
-              << "              oracle moves to the recorded run with the recorded length,\n"
-              << "              without walking for the run or reading LCP bounds; oracle-scan\n"
-              << "              walks only the side the recorded run is on, reading each run's\n"
-              << "              character but no LCP bounds, and takes the recorded length.\n"
-              << "              Their output is the standard mode's.  Neither records nor\n"
-              << "              replays with an ftab, which skips some repositions.\n"
-              << "  tms-build  HEADS LENS INDEX_PATH [--layout full|psi|phi] [--phi FILE]\n"
-              << "            [--minima FILE] [--lcp-bin FILE] [--lf-split B] [--phi-split B]\n"
-              << "            [--no-phi-inv] [--seq-ids FILE]\n"
-              << "              Build a tms index from an RLBWT: LF and psi, which need no LCP\n"
-              << "              input, and with LCP input also phi and phi_inv (phi_inv unless\n"
-              << "              --no-phi-inv; it is needed only for tms-batch --report smem-all).\n"
-              << "              --phi takes a TeraLCP -ophi file, the suffix array and LCP samples\n"
-              << "              of every run, and builds phi from them in O(r) space; the RLBWT\n"
-              << "              may then have one terminator per string, as an FMD's runs do.\n"
-              << "              --minima (a TeraLCP -ominima file, of which only each run's top\n"
-              << "              LCP is used) or --lcp-bin (one 64-bit LCP per row) instead walk LF\n"
-              << "              over all n rows to find the suffix array samples, which needs a\n"
-              << "              BWT with one terminator.  --layout keeps only what\n"
-              << "              some queries read: full (the default) keeps everything; psi keeps\n"
-              << "              LF and psi, takes no LCP input, and serves only --mode psi without\n"
-              << "              --positions or an SMEM report; phi keeps LF, phi and phi_inv,\n"
-              << "              needs LCP input, and serves every query but --mode psi, phiskip\n"
-              << "              and dual.  In the psi and full layouts, LF and psi share one\n"
-              << "              table of rows, the union of LF's split intervals and their\n"
-              << "              images.  --lf-split and --phi-split set Orbit's balancing factor\n"
-              << "              for LF and phi, with its default length capping (default: Orbit's\n"
-              << "              default balancing).  LF is always split, so --lf-split must be\n"
-              << "              positive; --phi-split 0 leaves phi unsplit.  --seq-ids FILE\n"
-              << "              stores ropebwt3's sequence-ID table (the .len.gz of the FMD the\n"
-              << "              RLBWT came from) in the index, for tms-batch --report smem-all;\n"
-              << "              its contig k must be the text's strings 2k and 2k + 1, and both\n"
-              << "              its text length and its string count must be the index's.\n"
-              << "  tms-batch  INDEX_PATH READS [-o OUT] [--no-output] [--interleave K]\n"
-              << "            [--threads T] [--block-reads B] [--block-bytes N]\n"
-              << "            [--mode psi|phi|phiskip|dual|oracle|oracle-scan] [--positions]\n"
-              << "            [--report ms|smem-one|smem-all] [--min-smem-len T]\n"
-              << "            [--max-smem-positions N] [--phi-starts] [--orient fwd|rc|qual]\n"
-              << "            [--ftab-file FILE | --ftab | --ftab-k K]\n"
-              << "            [--oracle-write FILE | --oracle FILE]\n"
-              << "              As batch, with a tms index.  --mode sets how repositions\n"
-              << "              compute LCEs (default psi; psi, phiskip and dual need psi, and\n"
-              << "              the others need phi).  Only the index's structures that the\n"
-              << "              query reads are loaded, and a query the index's layout cannot\n"
-              << "              serve is refused.  Each read gets a line with its name and its\n"
-              << "              matching statistics, space-separated.  --positions adds a field\n"
-              << "              with an occurrence position for each value (-1 where it is 0);\n"
-              << "              it needs phi.  --report ms (the default) adds nothing more;\n"
-              << "              smem-one adds a field with the read's SMEMs (super-maximal exact\n"
-              << "              matches), space-separated, each as i:L:p, with start i in the\n"
-              << "              read, length L and one text position p where it occurs, and\n"
-              << "              needs phi.  smem-all writes SMEMs as ropebwt3 mem -p N does, in\n"
-              << "              place of the read's line, and needs phi and phi_inv: one line\n"
-              << "              per SMEM, tab-separated, with the read's name, start, end\n"
-              << "              (exclusive), the count c of its occurrences and, if N > 0,\n"
-              << "              min(N, c) and that many positions, the first in BWT row order.\n"
-              << "              If the index holds a sequence-ID table (tms-build --seq-ids,\n"
-              << "              index-add-seq-ids), each position is contig:strand:offset, where\n"
-              << "              a - offset is that of the reverse complement on the forward\n"
-              << "              strand; otherwise each is a text position.  With --min-smem-len\n"
-              << "              0, each read character that occurs nowhere in the text, such as\n"
-              << "              an N, also gets a line with its start, end and a count of 0, as\n"
-              << "              ropebwt3 gives with -l 1; reads with neither add no line.\n"
-              << "              smem-all cannot be used with --positions.  --min-smem-len T\n"
-              << "              keeps only SMEMs with L > T (default 0, all of them) in both\n"
-              << "              SMEM reports, so ropebwt3's -l X is --min-smem-len X-1.\n"
-              << "              --max-smem-positions N sets N\n"
-              << "              (default: list all).  With smem-all, K also sets how many of its\n"
-              << "              phi and phi_inv walks list positions at once (K = 0: one SMEM at\n"
-              << "              a time).  Matching statistics without positions or SMEMs load\n"
-              << "              phi's lengths-based form, whose rows are narrower; --phi-starts\n"
-              << "              loads its starts-based form instead, as positions and SMEM\n"
-              << "              reports do.  Results do not depend on the mode, K or\n"
-              << "              --phi-starts.\n"
-              << "              --oracle-write FILE (in a mode other than oracle and\n"
-              << "              oracle-scan) records every\n"
-              << "              reposition's outcome, and --mode oracle --oracle FILE replays\n"
-              << "              them: on a mismatch it moves to the recorded row and length\n"
-              << "              without scanning for the candidates or computing an LCE, so it\n"
-              << "              reads only LF (and phi with --positions or an SMEM report).  It\n"
-              << "              is a lower bound on the time of the other modes, and its output\n"
-              << "              is theirs.  --mode oracle-scan replays the same file with less\n"
-              << "              given: the recorded interval says only which side (pred above\n"
-              << "              or succ below) to scan, and that side is scanned for the\n"
-              << "              candidate as the other modes do; the recorded length still\n"
-              << "              stands in for the LCE.  Replay needs the same reads, in the\n"
-              << "              same order, and an index with the same LF intervals (the same\n"
-              << "              build and layout);\n"
-              << "              it does not depend on K, T or B.  FILE holds u64s, little-endian:\n"
-              << "              the magic \"TMSORC01\" (8 bytes), the index's LF interval count,\n"
-              << "              the read count R, the reposition count D, R per-read reposition\n"
-              << "              counts in input order, then D (interval, length) pairs: the LF\n"
-              << "              interval moved to (its tail row if above the current interval,\n"
-              << "              else its head row) and the match length before the LF step.\n"
-              << "  tms-text   INDEX_PATH\n"
-              << "              Print the indexed text, read back with LF.  For a string\n"
-              << "              collection (one terminator per string, as in an FMD), print\n"
-              << "              each string and its $, one per line, in the BWT order of\n"
-              << "              their terminators.  An FMD's N prints as N.\n"
-              << "  ftab-build INDEX_PATH FTAB_PATH [--k K | --auto] [--threads T]\n"
-              << "              Build the ftab of an index (see batch --ftab-file) and write it\n"
-              << "              to its own file.  --k K sets K; --auto (the default) takes the\n"
-              << "              largest K whose table fits in 5% of the index file's bytes, then\n"
-              << "              steps K down by one while fewer than 80% of its K-mers occur.\n"
-              << "              --threads T builds on T threads (default 0, every CPU).  A tms\n"
-              << "              index with phi gets a table with a toehold and window\n"
-              << "              positions, which serves every mode, positions and SMEM reports.\n"
-              << "  ftab-verify INDEX_PATH FTAB_PATH [--crc]\n"
-              << "              Check, from the two headers alone, that the ftab was built from\n"
-              << "              this index; on a mismatch, name the field that differs and exit\n"
-              << "              nonzero.  --crc also checks the ftab's payload CRC-32s.\n"
-              << "  ftab-info  FTAB_PATH\n"
-              << "              Print an ftab's header: k, fields, occupancy, link, provenance.\n"
-              << "  ftab-survey INDEX_PATH [--kmin K] [--kmax K] [--threads T] [--verify K]\n"
-              << "              Development: count the k-mers over ACGT that occur in the\n"
-              << "              text, for each k from --kmin (default 6) to --kmax (default\n"
-              << "              15), and the size of a dense table holding each k-mer's\n"
-              << "              row after its cold-start walk.  --verify K checks the counts\n"
-              << "              for k up to K against ms on every k-mer.\n"
-              << "  split-report INDEX_PATH [--threads T]\n"
-              << "              Development: for each move structure of an ms or tms index,\n"
-              << "              print the split parameters stored with it, its\n"
-              << "              intervals, longest interval and the length cap Orbit's length\n"
-              << "              capping implies, and its balance: how many input interval\n"
-              << "              starts lie inside each output interval, against the bound\n"
-              << "              2b - 1 that balancing factor b guarantees.  tms parts are\n"
-              << "              loaded a group at a time.\n"
-              << "  index-plan INDEX_PATH [--mode M] [--positions] [--report R] [--phi-starts]\n"
-              << "              Print an index's header, read from the file's first 4 KiB\n"
-              << "              alone: its sections with their columns and widths.  Then print\n"
-              << "              what this build loads for each query, and the RAM it takes: for\n"
-              << "              a tms index, for each tms-batch command line, or with query\n"
-              << "              options for that one alone.\n"
-              << "  index-verify INDEX_PATH\n"
-              << "              Check every section's CRC-32 and that the file is whole.\n"
-              << "  index-rewrap LEGACY_PATH INDEX_PATH\n"
-              << "              Rewrite an index of the earlier formats (MSIX v4 for ms, TMSX\n"
-              << "              v8 for tms) in the current format, copying its structures'\n"
-              << "              bytes without loading them.\n"
-              << "  index-add-seq-ids INDEX_PATH SEQ_IDS OUT_PATH\n"
-              << "              Write the tms index at INDEX_PATH to OUT_PATH with the\n"
-              << "              sequence-ID table SEQ_IDS (see tms-build --seq-ids) in it, in\n"
-              << "              place of any it holds, copying its structures' bytes without\n"
-              << "              loading them.  The table's text length must be the index's.\n"
-              << "  tms-inspect INDEX_PATH [--phi-lengths]\n"
-              << "              Print the structures' sizes and column widths.  --phi-lengths\n"
-              << "              loads only LF and phi's lengths-based form.\n"
-              << "  inspect    INDEX_PATH [--spillover-tsv FILE]\n"
-              << "              Inspect index and optionally output spillover TSV.\n"
-              << "\n"
-              << "Diagnostics and debugging:\n"
-              << "  test           [DATA_DIR]\n"
-              << "                  Run built-in tests (default DATA_DIR is ./data).\n"
-              << "  fmd-test       [DATA_DIR]\n"
-              << "                  Run only the string-collection (FMD) and large-n tests.\n"
-              << "  discover       [DATA_DIR]\n"
-              << "                  Find patterns where index types disagree with base.\n"
-              << "  investigate    DATA_DIR PATTERN [INDEX_TYPE] [TRACE_STEP]\n"
-              << "                  Step-through trace (INDEX_TYPE: base|coal_split|multispill2..10).\n"
-              << "  probe          DATA_DIR FIRST_ROW LAST_ROW\n"
-              << "                  Compare boundary/row_min/range_min for raw vs compressed vs index.\n"
-              << "  probe-internal DATA_DIR FIRST_ROW LAST_ROW\n"
-              << "                  Base index: decode spillover, verify 3 query types consistent.\n";
+/**
+ * The overview printed by `ms`, `ms --help` and `ms help`: user commands
+ * and user options.  With advanced, it leaves off its last line, which
+ * points to --help-advanced.
+ */
+static void usage(std::ostream& os, bool advanced = false) {
+    os << "ms: matching statistics over Orbit move structures (commit " << MS_COMMIT << ")\n"
+       << "\n"
+       << "Usage: ms <command> [args...]\n"
+       << "Options take their value as --name VALUE or --name=VALUE.\n"
+       << "\n"
+       << "Build an index:\n"
+       << "  build-rlbwt HEADS LENS INDEX (--minima FILE | --lcp-bin FILE) [--lf-split FACTOR]\n"
+       << "      Build an ms index from an RLBWT (HEADS: one byte per run; LENS:\n"
+       << "      fixed-width little-endian run lengths) and LCP input: a TeraLCP\n"
+       << "      -ominima file, or --lcp-bin, one 64-bit LCP per row, optionally after\n"
+       << "      a 64-bit row count.  --lf-split sets Orbit's balancing factor for LF\n"
+       << "      (positive; default: Orbit's default).  Results do not depend on it.\n"
+       << "  tms-build HEADS LENS INDEX [--phi FILE | --minima FILE | --lcp-bin FILE]\n"
+       << "            [--layout full|psi|phi] [--seq-ids FILE] [--no-phi-inv]\n"
+       << "            [--lf-split FACTOR] [--phi-split FACTOR]\n"
+       << "      Build a tms index.  LF and psi need no LCP input; phi and phi_inv\n"
+       << "      need one of --phi (a TeraLCP -ophi file, which allows one terminator\n"
+       << "      per string, as in an FMD), --minima or --lcp-bin (which need one\n"
+       << "      terminator).  --layout keeps what some queries read: full (default)\n"
+       << "      keeps everything; psi keeps LF and psi and serves only --mode psi\n"
+       << "      without positions or SMEMs; phi keeps LF, phi and phi_inv and serves\n"
+       << "      every query but --mode psi, phiskip and dual.  --no-phi-inv drops\n"
+       << "      phi_inv, which only --report smem-all reads.  --seq-ids stores\n"
+       << "      ropebwt3's sequence-ID table (the FMD's .len.gz) for smem-all.\n"
+       << "      --phi-split 0 leaves phi unsplit.\n"
+       << "\n"
+       << "Query:\n"
+       << "  query INDEX READS [options]\n"
+       << "      Compute matching statistics for every read in READS (FASTA, FASTQ,\n"
+       << "      or one sequence per line; - for stdin) with an ms or tms index; its\n"
+       << "      header says which.  Writes one line per read: its name, a tab, and\n"
+       << "      its values, space-separated (QUERY_OUTPUT.md).  A summary goes to\n"
+       << "      stderr.  Results and their order do not depend on the thread count.\n"
+       << "    -o FILE                  write to FILE (default stdout); FILE.gz is gzipped\n"
+       << "    -p N, --threads N        query on N threads (default 0: every CPU)\n"
+       << "    --gzip-level LEVEL       gzip level for .gz output, 0 to 9 (default 1)\n"
+       << "    --orient fwd|rc|qual     which strand of each read to match: fwd (default)\n"
+       << "                             as given; rc its reverse complement; qual rc only\n"
+       << "                             for reads whose last bases have higher quality\n"
+       << "                             (FASTQ).  rc and qual equal fwd only on an index\n"
+       << "                             holding both strands, as an FMD does.\n"
+       << "    --ftab FILE              start reads KLEN steps in from a stored ftab\n"
+       << "                             (ftab-build); it must be built from INDEX\n"
+       << "    --build-ftab[=KLEN]      build an ftab of KLEN-mers after loading\n"
+       << "                             (default KLEN 14)\n"
+       << "  tms index only:\n"
+       << "    --mode psi|phi|phiskip|dual\n"
+       << "                             how repositions compute LCEs (default psi; psi,\n"
+       << "                             phiskip and dual need psi, phi needs phi)\n"
+       << "    --positions              add a field with an occurrence position for each\n"
+       << "                             value (-1 where it is 0); needs phi\n"
+       << "    --report ms|smem-one|smem-all\n"
+       << "                             ms (default) adds nothing; smem-one adds the\n"
+       << "                             read's SMEMs as i:L:p; smem-all writes SMEMs as\n"
+       << "                             ropebwt3 mem -p does, one line each\n"
+       << "    --min-smem-len L         report SMEMs of length L or more, as ropebwt3's\n"
+       << "                             -l L (default 1: all)\n"
+       << "    --max-smem-positions MAXPOS\n"
+       << "                             smem-all lists at most MAXPOS positions per SMEM\n"
+       << "                             (default: all), as ropebwt3's -p\n"
+       << "      --orient rc and qual cannot be used with --positions or an SMEM report.\n"
+       << "\n"
+       << "Ftabs (FTAB_FORMAT.md):\n"
+       << "  ftab-build INDEX FTAB [--kmer-len KLEN | --auto] [-p N]\n"
+       << "      Build an index's ftab, a table of the query state after each KLEN-mer\n"
+       << "      over ACGT, and write it to FTAB.  --auto (the default) takes the\n"
+       << "      largest KLEN whose table fits in 5% of the index file, then steps\n"
+       << "      down while fewer than 80% of its KLEN-mers occur.  -p as for query.\n"
+       << "  ftab-verify INDEX FTAB [--crc]\n"
+       << "      Check from the headers that FTAB was built from INDEX; --crc also\n"
+       << "      checks its payload CRC-32s.\n"
+       << "  ftab-info FTAB\n"
+       << "      Print an ftab's header.\n"
+       << "\n"
+       << "Index files (INDEX_FORMAT.md):\n"
+       << "  index-plan INDEX [--mode M] [--positions] [--report R]\n"
+       << "      Print an index's header and what each query loads, and its RAM; with\n"
+       << "      query options, for that query alone.\n"
+       << "  index-verify INDEX\n"
+       << "      Check every section's CRC-32 and that the file is whole.\n"
+       << "  index-add-seq-ids INDEX SEQ_IDS OUT\n"
+       << "      Write the tms index INDEX to OUT with the sequence-ID table SEQ_IDS\n"
+       << "      (see tms-build --seq-ids), copying its other sections unchanged.\n";
+    if (!advanced) os << "\nRun 'ms --help-advanced' for development and advanced options.\n";
+}
+
+/** The overview followed by development and advanced options and commands. */
+static void usage_advanced(std::ostream& os) {
+    usage(os, true);
+    os << "\n"
+       << "Advanced query options:\n"
+       << "    --interleave DEPTH       keep DEPTH reads in flight per thread, prefetching\n"
+       << "                             each one's next row (default 32); 0 queries one\n"
+       << "                             read at a time without prefetching\n"
+       << "    --block-reads READS      each thread takes about READS reads at a time\n"
+       << "                             (default max(512, 16 * DEPTH)), sized in bytes\n"
+       << "                             from the reads seen so far\n"
+       << "    --block-bytes BYTES      each thread takes BYTES bytes of input at a time\n"
+       << "    --no-output              skip writing results (for timing)\n"
+       << "    --phi-starts             tms: matching statistics without positions load\n"
+       << "                             phi's starts-based form, not its narrower\n"
+       << "                             lengths-based form\n"
+       << "    --oracle-write FILE      record every reposition's outcome\n"
+       << "                             (ORACLE_FORMAT.md); not with an ftab\n"
+       << "    --mode oracle|oracle-scan --oracle FILE\n"
+       << "                             replay recorded outcomes: oracle moves to the\n"
+       << "                             recorded run and length; oracle-scan scans only\n"
+       << "                             the recorded side and takes the recorded length.\n"
+       << "                             Output equals the recording mode's.  An ms index's\n"
+       << "                             other mode is standard, its default.\n"
+       << "      Results do not depend on DEPTH, READS, BYTES or --phi-starts.  On a\n"
+       << "      machine with several memory nodes, the index is interleaved over them\n"
+       << "      (Linux) unless numactl sets a memory policy.  In the summary,\n"
+       << "      query_ns_per_base is the threads' summed query time per base and\n"
+       << "      wall_ns_per_base the elapsed time per base; flipped counts the reads\n"
+       << "      --orient matched on the other strand.  With smem-all, DEPTH also sets\n"
+       << "      how many phi and phi_inv walks list positions at once.\n"
+       << "\n"
+       << "Advanced build-rlbwt options:\n"
+       << "    --minima-only            keep only the minima of --lcp-bin's LCPs, as a\n"
+       << "                             --minima file does\n"
+       << "    --percentile FRAC        spillover percentile (default 0.98)\n"
+       << "    --coalesce-spillover     coalesce spillover\n"
+       << "    --spill-align ALIGN      spillover alignment\n"
+       << "    --spill-split-bits BITS  spillover split bits\n"
+       << "\n"
+       << "Development commands:\n"
+       << "  pattern INDEX PATTERN\n"
+       << "      Print the matching statistics of PATTERN with the ms index INDEX.\n"
+       << "  tms-text INDEX\n"
+       << "      Print the indexed text, read back with LF; a string collection prints\n"
+       << "      each string and its $, one per line, in the BWT order of their\n"
+       << "      terminators.  An FMD's N prints as N.\n"
+       << "  tms-inspect INDEX [--phi-lengths]\n"
+       << "      Print a tms index's structures' sizes and column widths.\n"
+       << "      --phi-lengths loads only LF and phi's lengths-based form.\n"
+       << "  inspect INDEX [--spillover-tsv FILE]\n"
+       << "      Inspect an ms index and optionally write its spillover as TSV.\n"
+       << "  ftab-survey INDEX [--kmin KLEN] [--kmax KLEN] [--verify KLEN] [-p N]\n"
+       << "      Count the KLEN-mers over ACGT that occur in an ms index's text, for\n"
+       << "      KLEN from --kmin (default 6) to --kmax (default 15), and the size of\n"
+       << "      a dense table of them; --verify checks counts up to its KLEN by brute\n"
+       << "      force.\n"
+       << "  split-report INDEX [-p N]\n"
+       << "      For each move structure, print its split parameters, intervals,\n"
+       << "      longest interval, length cap and balance against the bound 2b - 1.\n"
+       << "  index-rewrap LEGACY_INDEX INDEX\n"
+       << "      Rewrite an index of an earlier format (MSIX v4, TMSX v8) in the\n"
+       << "      current one, copying its structures' bytes.\n"
+       << "  test [DATA_DIR]          run the built-in tests (default DATA_DIR ./data)\n"
+       << "  tms-test [DATA_DIR]      run only the tms tests\n"
+       << "  fmd-test [DATA_DIR]      run only the string-collection (FMD) and large-n tests\n"
+       << "  discover [DATA_DIR]      find patterns where index types disagree with base\n"
+       << "  investigate DATA_DIR PATTERN [INDEX_TYPE] [TRACE_STEP]\n"
+       << "                           step-through trace (INDEX_TYPE:\n"
+       << "                           base|coal_split|multispill2..10)\n"
+       << "  probe DATA_DIR FIRST_ROW LAST_ROW\n"
+       << "                           compare boundary, row_min and range_min for raw,\n"
+       << "                           compressed and index\n"
+       << "  probe-internal DATA_DIR FIRST_ROW LAST_ROW\n"
+       << "                           base index: decode spillover and check that three\n"
+       << "                           query types agree\n";
 }
 
 /**
- * The split parameters for --lf-split or --phi-split B: Orbit's default
- * length capping and balancing factor B, or none for B = 0.
+ * If argv[i] is the option name, given as "name VALUE" or "name=VALUE", set
+ * v to its value, advancing i past it, and return true.
  */
-static orbit::split_params split_arg(const char* v) {
-    const ulint b = std::stoull(v);
+static bool opt_value(int argc, char** argv, int& i, const char* name, std::string& v) {
+    const size_t n = strlen(name);
+    if (strncmp(argv[i], name, n) != 0) return false;
+    if (argv[i][n] == '=') {
+        v = argv[i] + n + 1;
+        return true;
+    }
+    if (argv[i][n] != '\0' || i + 1 >= argc) return false;
+    v = argv[++i];
+    return true;
+}
+
+/** As opt_value, for an option with a short alias such as -p. */
+static bool opt_value(int argc, char** argv, int& i, const char* name, const char* alias, std::string& v) {
+    return opt_value(argc, argv, i, name, v) || opt_value(argc, argv, i, alias, v);
+}
+
+/** An unsigned option value, refusing anything that is not a whole number. */
+static unsigned long long opt_uint(const char* name, const std::string& v) {
+    size_t used = 0;
+    unsigned long long x = 0;
+    try {
+        if (!v.empty() && std::isdigit(static_cast<unsigned char>(v[0]))) x = std::stoull(v, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used == 0 || used != v.size()) throw std::invalid_argument(std::string(name) + " needs a whole number, not '" + v + "'");
+    return x;
+}
+
+/**
+ * The split parameters for --lf-split or --phi-split FACTOR: Orbit's
+ * default length capping and balancing factor FACTOR, or none for 0.
+ */
+static orbit::split_params split_arg(const char* name, const std::string& v) {
+    const ulint b = opt_uint(name, v);
     return b == 0 ? orbit::NO_SPLITTING : orbit::split_params(orbit::DEFAULT_LENGTH_CAPPING, b);
 }
 
@@ -304,8 +271,8 @@ static orbit::split_params split_arg(const char* v) {
  * Parse --lf-split's value into sp.  Returns false, after saying why, for 0:
  * LF is always split.
  */
-static bool lf_split_arg(const char* v, orbit::split_params& sp) {
-    sp = split_arg(v);
+static bool lf_split_arg(const std::string& v, orbit::split_params& sp) {
+    sp = split_arg("--lf-split", v);
     if (sp != orbit::NO_SPLITTING) return true;
     std::cerr << "--lf-split must be positive: LF is always split and balanced\n";
     return false;
@@ -336,13 +303,13 @@ struct QueryResults {
     std::vector<std::vector<RepositionDecision>> decisions;  // reposition outcomes, with --oracle-write
 };
 
-// The ftab built at index load with --ftab, or null.
+// The ftab of a query, from --ftab or --build-ftab, or null.
 static const ftab::Ftab* g_ftab = nullptr;
 // With --oracle-write, each query records its reposition outcomes; in the
 // oracle modes, they are replayed from g_oracle, read from --oracle.
 static bool g_record = false;
 static RepositionOracle g_oracle;
-// batch's --mode.
+// The query's --mode on an ms index.
 static MsMode g_ms_mode = MsMode::STANDARD;
 
 // first_read is the index of p[0] among all the reads, which says where its
@@ -361,7 +328,7 @@ static void query_one(MSIndexSpillLCP<false>& idx, const std::string& s, QueryRe
     r.ms.resize(1);
     r.ms[0] = ms_query(idx, s);
 }
-// tms-batch settings, from its command line.  They are read-only once the
+// A query's settings on a tms index, from its command line.  They are read-only once the
 // queries start.
 static TmsMode g_tms_mode = TmsMode::PSI;
 static bool g_tms_positions = false;
@@ -396,38 +363,44 @@ static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r, size
     query_many(idx, {s}, 1, r, 0, first_read);
 }
 
+/** Sets m to the tms mode named by name and returns true, or returns false. */
+static bool tms_mode_of(const std::string& name, TmsMode& m) {
+    if (name == "psi") m = TmsMode::PSI;
+    else if (name == "phi") m = TmsMode::PHI;
+    else if (name == "phiskip") m = TmsMode::PHISKIP;
+    else if (name == "dual") m = TmsMode::DUAL;
+    else if (name == "oracle") m = TmsMode::ORACLE;
+    else if (name == "oracle-scan") m = TmsMode::ORACLE_SCAN;
+    else return false;
+    return true;
+}
+
 /**
- * If argv[i] is a tms query flag that chooses what a query loads (--mode,
- * --positions, --report or --phi-starts), apply it to the tms-batch settings,
- * advancing i past its value, and return 1; return -1, after printing why, if
- * its value is unknown, and 0 if argv[i] is no such flag.
+ * If argv[i] is a tms query option that chooses what a query loads
+ * (--positions, --report, --phi-starts, and --mode if with_mode), apply it
+ * to the tms query settings, advancing i past its value, and return 1;
+ * return -1, after printing why, if its value is unknown, and 0 if argv[i]
+ * is no such option.
  */
-static int tms_query_flag(int argc, char** argv, int& i) {
+static int tms_query_flag(int argc, char** argv, int& i, bool with_mode = true) {
+    std::string v;
     if (strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
     else if (strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
-    else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-        const std::string m = argv[++i];
-        if (m == "psi") g_tms_mode = TmsMode::PSI;
-        else if (m == "phi") g_tms_mode = TmsMode::PHI;
-        else if (m == "phiskip") g_tms_mode = TmsMode::PHISKIP;
-        else if (m == "dual") g_tms_mode = TmsMode::DUAL;
-        else if (m == "oracle") g_tms_mode = TmsMode::ORACLE;
-        else if (m == "oracle-scan") g_tms_mode = TmsMode::ORACLE_SCAN;
-        else { std::cerr << "Unknown mode: " << m << "\n"; return -1; }
+    else if (with_mode && opt_value(argc, argv, i, "--mode", v)) {
+        if (!tms_mode_of(v, g_tms_mode)) { std::cerr << "Unknown mode: " << v << "\n"; return -1; }
     }
-    else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
-        const std::string r = argv[++i];
-        if (r == "ms") g_tms_report = TmsReport::MS;
-        else if (r == "smem-one") g_tms_report = TmsReport::SMEM_ONE;
-        else if (r == "smem-all") g_tms_report = TmsReport::SMEM_ALL;
-        else { std::cerr << "Unknown report: " << r << "\n"; return -1; }
+    else if (opt_value(argc, argv, i, "--report", v)) {
+        if (v == "ms") g_tms_report = TmsReport::MS;
+        else if (v == "smem-one") g_tms_report = TmsReport::SMEM_ONE;
+        else if (v == "smem-all") g_tms_report = TmsReport::SMEM_ALL;
+        else { std::cerr << "Unknown report: " << v << " (expected ms, smem-one or smem-all)\n"; return -1; }
     }
     else return 0;
     return 1;
 }
 
-/** The parts a tms-batch query with the current settings loads. */
-static TmsParts tms_batch_parts() {
+/** The parts a tms query with the current settings loads. */
+static TmsParts tms_query_load() {
     TmsParts need = tms_query_parts(g_tms_mode, g_tms_positions, g_tms_report);
     need.phi_starts = need.phi_starts || (need.phi && g_tms_phi_starts);
     return need;
@@ -459,70 +432,93 @@ static std::optional<TmsIndex> read_tms_index(const std::string& path, const Tms
     return idx;
 }
 
-/**
- * ms batch and tms-batch: load the index once, then compute matching
- * statistics for every read, on one or more threads.  Each thread queries a
- * block of reads at a time with its own K reads in flight, and output is
- * written in input order, so it does not depend on the thread count.
- */
-template <typename Index>
-static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const std::string&)) {
-    if (argc < 2) {
-        std::cerr << "batch requires INDEX_PATH and READS\n";
-        return 1;
-    }
-    std::string idx_path = argv[0], reads_path = argv[1], out_path;
+// A query's command line, parsed before the index's header says which
+// kind of index it is.  The tms settings that choose what a query loads go
+// to the g_tms_* globals as they are parsed.
+struct QueryOptions {
+    std::string idx_path, reads_path, out_path;
     bool write_output = true;
-    size_t interleave = 32, threads = 1, block_reads = 0, block_bytes = 0;
+    size_t interleave = 32, threads = 0, block_reads = 0, block_bytes = 0;
     int gzip_level = -2;  // -2: from the output name; -1: none
     ReadOrient orient = ReadOrient::FWD;
+    std::string mode;  // empty: the index kind's default
     std::string oracle_path, oracle_write_path;
-    int q = 0;
-    unsigned ftab_k = 0;  // 0: no ftab built at load
+    unsigned ftab_k = 0;    // with --build-ftab, the ftab's k; 0: none built
     std::string ftab_path;  // a stored ftab to load
-    for (int i = 2; i < argc; ++i) {
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
-        else if (strcmp(argv[i], "--ftab") == 0) ftab_k = ftab_k ? ftab_k : 14;
-        else if (strcmp(argv[i], "--ftab-k") == 0 && i + 1 < argc) ftab_k = static_cast<unsigned>(std::stoul(argv[++i]));
-        else if (strcmp(argv[i], "--ftab-file") == 0 && i + 1 < argc) ftab_path = argv[++i];
-        else if (strcmp(argv[i], "--no-output") == 0) write_output = false;
-        else if (strcmp(argv[i], "--interleave") == 0 && i + 1 < argc)
-            interleave = static_cast<size_t>(std::stoull(argv[++i]));
-        else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
-            threads = static_cast<size_t>(std::stoull(argv[++i]));
-        else if (strcmp(argv[i], "--block-reads") == 0 && i + 1 < argc)
-            block_reads = static_cast<size_t>(std::stoull(argv[++i]));
-        else if (strcmp(argv[i], "--gzip-level") == 0 && i + 1 < argc)
-            gzip_level = std::stoi(argv[++i]);
-        else if (strcmp(argv[i], "--block-bytes") == 0 && i + 1 < argc)
-            block_bytes = static_cast<size_t>(std::stoull(argv[++i]));
-        else if (strcmp(argv[i], "--orient") == 0 && i + 1 < argc) {
-            const std::string o = argv[++i];
-            if (o == "fwd") orient = ReadOrient::FWD;
-            else if (o == "rc") orient = ReadOrient::RC;
-            else if (o == "qual") orient = ReadOrient::QUAL;
-            else { std::cerr << "Unknown orientation: " << o << " (expected fwd, rc or qual)\n"; return 1; }
-        }
-        else if (std::is_same_v<Index, TmsIndex> && (q = tms_query_flag(argc, argv, i)) != 0) {
-            if (q < 0) return 1;
-        }
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--min-smem-len") == 0 && i + 1 < argc)
-            g_tms_min_smem_len = static_cast<ulint>(std::stoull(argv[++i]));
-        else if (std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--max-smem-positions") == 0 && i + 1 < argc)
-            g_tms_max_smem_positions = static_cast<ulint>(std::stoull(argv[++i]));
-        else if (!std::is_same_v<Index, TmsIndex> && strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-            const std::string m = argv[++i];
-            if (m == "standard") g_ms_mode = MsMode::STANDARD;
-            else if (m == "oracle") g_ms_mode = MsMode::ORACLE;
-            else if (m == "oracle-scan") g_ms_mode = MsMode::ORACLE_SCAN;
-            else { std::cerr << "Unknown mode: " << m << "\n"; return 1; }
-        }
-        else if (strcmp(argv[i], "--oracle") == 0 && i + 1 < argc)
-            oracle_path = argv[++i];
-        else if (strcmp(argv[i], "--oracle-write") == 0 && i + 1 < argc)
-            oracle_write_path = argv[++i];
-        else { std::cerr << "Unknown batch option: " << argv[i] << "\n"; return 1; }
+    std::vector<std::string> tms_only;  // options given that need a tms index
+};
+
+/** Parse query's arguments after the command name.  Returns false, after saying why, on a bad one. */
+static bool parse_query(int argc, char** argv, QueryOptions& o) {
+    if (argc < 2) {
+        std::cerr << "query requires INDEX and READS\n";
+        return false;
     }
+    o.idx_path = argv[0];
+    o.reads_path = argv[1];
+    std::string v;
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        int q = 0;
+        if (opt_value(argc, argv, i, "-o", v)) o.out_path = v;
+        else if (opt_value(argc, argv, i, "--ftab", v)) o.ftab_path = v;
+        else if (arg == "--build-ftab") o.ftab_k = 14;
+        else if (opt_value(argc, argv, i, "--build-ftab", v)) {
+            o.ftab_k = static_cast<unsigned>(opt_uint("--build-ftab", v));
+            if (o.ftab_k < 1 || o.ftab_k > ftab::max_k) { std::cerr << "--build-ftab's KLEN must be between 1 and 31\n"; return false; }
+        }
+        else if (arg == "--no-output") o.write_output = false;
+        else if (opt_value(argc, argv, i, "--interleave", v)) o.interleave = opt_uint("--interleave", v);
+        else if (opt_value(argc, argv, i, "--threads", "-p", v)) o.threads = opt_uint("--threads", v);
+        else if (opt_value(argc, argv, i, "--block-reads", v)) o.block_reads = opt_uint("--block-reads", v);
+        else if (opt_value(argc, argv, i, "--block-bytes", v)) o.block_bytes = opt_uint("--block-bytes", v);
+        else if (opt_value(argc, argv, i, "--gzip-level", v)) o.gzip_level = static_cast<int>(opt_uint("--gzip-level", v));
+        else if (opt_value(argc, argv, i, "--orient", v)) {
+            if (v == "fwd") o.orient = ReadOrient::FWD;
+            else if (v == "rc") o.orient = ReadOrient::RC;
+            else if (v == "qual") o.orient = ReadOrient::QUAL;
+            else { std::cerr << "Unknown orientation: " << v << " (expected fwd, rc or qual)\n"; return false; }
+        }
+        else if (opt_value(argc, argv, i, "--mode", v)) o.mode = v;
+        else if ((q = tms_query_flag(argc, argv, i, false)) != 0) {
+            if (q < 0) return false;
+            // --report ms asks for what every query gives.
+            if (arg.rfind("--report", 0) != 0 || g_tms_report != TmsReport::MS) o.tms_only.push_back(arg);
+        }
+        else if (opt_value(argc, argv, i, "--min-smem-len", v)) {
+            // ropebwt3's -l L keeps SMEMs of length L or more; the SMEM
+            // report keeps those longer than its threshold.
+            const ulint l = opt_uint("--min-smem-len", v);
+            g_tms_min_smem_len = l > 0 ? l - 1 : 0;
+            o.tms_only.push_back("--min-smem-len");
+        }
+        else if (opt_value(argc, argv, i, "--max-smem-positions", v)) {
+            g_tms_max_smem_positions = static_cast<ulint>(opt_uint("--max-smem-positions", v));
+            o.tms_only.push_back("--max-smem-positions");
+        }
+        else if (opt_value(argc, argv, i, "--oracle", v)) o.oracle_path = v;
+        else if (opt_value(argc, argv, i, "--oracle-write", v)) o.oracle_write_path = v;
+        else { std::cerr << "Unknown query option: " << arg << " (see ms --help)\n"; return false; }
+    }
+    return true;
+}
+
+/**
+ * query: load the index once, then compute matching statistics for every
+ * read, on one or more threads.  Each thread queries a block of reads at a
+ * time with its own DEPTH reads in flight, and output is written in input
+ * order, so it does not depend on the thread count.
+ */
+template <typename Index>
+static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const std::string&)) {
+    const std::string &idx_path = o.idx_path, &reads_path = o.reads_path, &out_path = o.out_path;
+    const bool write_output = o.write_output;
+    size_t interleave = o.interleave, threads = o.threads, block_reads = o.block_reads, block_bytes = o.block_bytes;
+    int gzip_level = o.gzip_level;
+    const ReadOrient orient = o.orient;
+    const std::string &oracle_path = o.oracle_path, &oracle_write_path = o.oracle_write_path;
+    unsigned ftab_k = o.ftab_k;
+    const std::string& ftab_path = o.ftab_path;
     // Positions found on the reverse complement would have to be mirrored
     // onto the other strand, which needs each string's offset in the text,
     // and the index does not store those.
@@ -537,8 +533,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         std::cerr << "--positions cannot be used with --report smem-all\n";
         return 1;
     }
-    if (ftab_k > 31) { std::cerr << "--ftab-k must be between 1 and 31\n"; return 1; }
-    if (ftab_k > 0 && !ftab_path.empty()) { std::cerr << "--ftab-file cannot be used with --ftab or --ftab-k\n"; return 1; }
+    if (ftab_k > 0 && !ftab_path.empty()) { std::cerr << "--ftab cannot be used with --build-ftab\n"; return 1; }
     // A stored table is checked against the index's header before either is
     // loaded.  A tms query that walks phi or reports positions needs its
     // toehold, and positions its window positions.
@@ -627,7 +622,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
         if (!oracle_out.good()) { std::cerr << "Failed to open oracle output: " << oracle_write_path << "\n"; return 1; }
     }
     const double load_s = std::chrono::duration<double>(clock::now() - t0).count();
-    // The ftab is loaded, or built on every CPU, after the index, and is
+    // The ftab is loaded, or built on the query's threads, after the index, and is
     // interleaved over the memory nodes as the index is.
     std::optional<ftab::Ftab> tab;
     double ftab_s = 0.0;
@@ -639,9 +634,8 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
                 tab = ftab::read_file(ftab_path, ftab_header);
                 ftab_k = tab->k();
             } else {
-                const size_t build_threads = resolve_thread_count(0);
-                if constexpr (std::is_same_v<Index, TmsIndex>) tab = ftab::build_tms(idx, ftab_k, build_threads).tab;
-                else tab = ftab::build_ms(idx, ftab_k, build_threads).tab;
+                if constexpr (std::is_same_v<Index, TmsIndex>) tab = ftab::build_tms(idx, ftab_k, threads).tab;
+                else tab = ftab::build_ms(idx, ftab_k, threads).tab;
             }
         } catch (const std::exception& e) {
             std::cerr << "ftab: " << e.what() << "\n";
@@ -883,14 +877,14 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
 #endif
             });
     } catch (const std::exception& e) {
-        std::cerr << "batch: " << e.what() << "\n";
+        std::cerr << "query: " << e.what() << "\n";
         return 1;
     }
     out->flush();
     const double total_s = std::chrono::duration<double>(clock::now() - t_all).count();
     parse_s += numbering_parse_s;
     if (oracle_mode && reads_numbered != g_oracle.patterns()) {
-        std::cerr << "batch: the oracle holds " << g_oracle.patterns() << " reads but the input has "
+        std::cerr << "query: the oracle holds " << g_oracle.patterns() << " reads but the input has "
                   << reads_numbered << "\n";
         return 1;
     }
@@ -906,7 +900,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
             all.write(oracle_out);
             oracle_out.close();
         } catch (const std::exception& e) {
-            std::cerr << "batch: " << e.what() << "\n";
+            std::cerr << "query: " << e.what() << "\n";
             return 1;
         }
         std::cerr << "oracle: reads=" << all.patterns() << " repositions=" << all.decisions.size()
@@ -945,7 +939,7 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     // parsing reads, and format_s their time formatting (and compressing)
     // output.  read_s is the time the input lock was held for reading; wall_ns_per_base is
     // the elapsed time of the whole read, query and write phase per base.
-    std::cerr << "batch: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
+    std::cerr << "query: reads=" << n_reads << " bases=" << n_bases << " threads=" << threads
               << " index_load_s=" << load_s << " ftab_k=" << ftab_k << " ftab_s=" << ftab_s << " query_s=" << query_s << " read_s=" << read_s
               << " parse_s=" << parse_s << " format_s=" << format_s
               << " orient=" << (orient == ReadOrient::FWD ? "fwd" : orient == ReadOrient::RC ? "rc" : "qual")
@@ -956,14 +950,71 @@ static int run_batch(int argc, char** argv, std::optional<Index> (*read)(const s
     return 0;
 }
 
-/** Main entry point. */
-int main(int argc, char** argv) {
-    const char* prog = (argc > 0) ? argv[0] : "ms";
-    if (argc < 2) {
-        usage(prog);
+/**
+ * query: read the index's header, whose tool field says whether it is an ms
+ * or a tms index, then run that kind's engine, refusing options only a tms
+ * index serves.
+ */
+static int run_query(int argc, char** argv) {
+    QueryOptions o;
+    if (!parse_query(argc, argv, o)) return 1;
+    orbit_idx::Header h;
+    try {
+        h = orbit_idx::read_header_file(o.idx_path);
+    } catch (const std::exception& e) {
+        std::cerr << "query: " << e.what() << "\n";
         return 1;
     }
+    if (h.tool == orbit_idx::Tool::MS) {
+        if (!o.tms_only.empty()) {
+            std::cerr << "query: " << o.tms_only[0] << " needs a tms index, and " << o.idx_path << " is an ms index\n";
+            return 1;
+        }
+        if (o.mode.empty() || o.mode == "standard") g_ms_mode = MsMode::STANDARD;
+        else if (o.mode == "oracle") g_ms_mode = MsMode::ORACLE;
+        else if (o.mode == "oracle-scan") g_ms_mode = MsMode::ORACLE_SCAN;
+        else if (TmsMode m; tms_mode_of(o.mode, m)) {
+            std::cerr << "query: --mode " << o.mode << " needs a tms index, and " << o.idx_path
+                      << " is an ms index, whose only mode is standard\n";
+            return 1;
+        } else {
+            std::cerr << "Unknown mode: " << o.mode << "\n";
+            return 1;
+        }
+        return run_batch<MSIndexSpillLCP<false>>(o, ms_serialize::read_index);
+    }
+    if (o.mode == "standard") {
+        std::cerr << "query: --mode standard is for ms indexes; " << o.idx_path
+                  << " is a tms index, whose modes are psi (the default), phi, phiskip and dual\n";
+        return 1;
+    }
+    if (!o.mode.empty() && !tms_mode_of(o.mode, g_tms_mode)) {
+        std::cerr << "Unknown mode: " << o.mode << "\n";
+        return 1;
+    }
+    // Load only the parts the query reads; the load refuses an index that
+    // lacks one.
+    return run_batch<TmsIndex>(o, [](const std::string& path) {
+        const TmsParts need = tms_query_load();
+        return read_tms_index(path, &need);
+    });
+}
+
+/** Run the command named by argv[1]. */
+static int run_command(int argc, char** argv) {
+    if (argc < 2) {
+        usage(std::cout);
+        return 0;
+    }
     const std::string cmd = argv[1];
+    if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+        usage(std::cout);
+        return 0;
+    }
+    if (cmd == "--help-advanced") {
+        usage_advanced(std::cout);
+        return 0;
+    }
     for (int i = 0; i < argc; ++i) g_command_line += (i ? " " : "") + std::string(argv[i]);
     argc -= 2;
     argv += 2;
@@ -1023,9 +1074,9 @@ int main(int argc, char** argv) {
         return ms_test::run_investigate(data_dir, pattern, index_type, trace_step) ? 0 : 1;
     }
 
-    if (cmd == "ms") {
+    if (cmd == "pattern") {
         if (argc < 2) {
-            std::cerr << "ms requires INDEX_PATH and PATTERN\n";
+            std::cerr << "pattern requires INDEX and PATTERN\n";
             return 1;
         }
         const char *idx_path = argv[0], *pattern_str = argv[1];
@@ -1047,7 +1098,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "build-rlbwt") {
         if (argc < 3) {
-            std::cerr << "build-rlbwt requires HEADS, LENS and INDEX_PATH\n";
+            std::cerr << "build-rlbwt requires HEADS, LENS and INDEX\n";
             return 1;
         }
         const std::string heads_path = argv[0], lens_path = argv[1], idx_path = argv[2];
@@ -1057,17 +1108,18 @@ int main(int argc, char** argv) {
         ulint spill_align = 0;
         uchar spill_split_bits = 0;
         orbit::split_params lf_split;
+        std::string v;
         for (int i = 3; i < argc; ++i) {
-            if (strcmp(argv[i], "--minima") == 0 && i + 1 < argc) minima_path = argv[++i];
-            else if (strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) lcp_bin_path = argv[++i];
+            if (opt_value(argc, argv, i, "--minima", v)) minima_path = v;
+            else if (opt_value(argc, argv, i, "--lcp-bin", v)) lcp_bin_path = v;
             else if (strcmp(argv[i], "--minima-only") == 0) minima_only = true;
-            else if (strcmp(argv[i], "--percentile") == 0 && i + 1 < argc) percentile_k = std::stod(argv[++i]);
+            else if (opt_value(argc, argv, i, "--percentile", v)) percentile_k = std::stod(v);
             else if (strcmp(argv[i], "--coalesce-spillover") == 0) coalesce = true;
-            else if (strcmp(argv[i], "--spill-align") == 0 && i + 1 < argc) spill_align = std::stoull(argv[++i]);
-            else if (strcmp(argv[i], "--spill-split-bits") == 0 && i + 1 < argc)
-                spill_split_bits = static_cast<uchar>(std::stoul(argv[++i]));
-            else if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
-                if (!lf_split_arg(argv[++i], lf_split)) return 1;
+            else if (opt_value(argc, argv, i, "--spill-align", v)) spill_align = opt_uint("--spill-align", v);
+            else if (opt_value(argc, argv, i, "--spill-split-bits", v))
+                spill_split_bits = static_cast<uchar>(opt_uint("--spill-split-bits", v));
+            else if (opt_value(argc, argv, i, "--lf-split", v)) {
+                if (!lf_split_arg(v, lf_split)) return 1;
             }
             else { std::cerr << "Unknown build-rlbwt option: " << argv[i] << "\n"; return 1; }
         }
@@ -1129,46 +1181,34 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (cmd == "batch") {
-        return run_batch<MSIndexSpillLCP<false>>(argc, argv, ms_serialize::read_index);
-    }
-
-    if (cmd == "tms-batch") {
-        // Load only the parts the query reads; the load refuses an index
-        // that lacks one.
-        return run_batch<TmsIndex>(argc, argv, [](const std::string& path) {
-            const TmsParts need = tms_batch_parts();
-            return read_tms_index(path, &need);
-        });
-    }
+    if (cmd == "query") return run_query(argc, argv);
 
     if (cmd == "tms-build") {
         const int npos = 3;
         if (argc < npos) {
-            std::cerr << "tms-build requires HEADS, LENS and INDEX_PATH\n";
+            std::cerr << "tms-build requires HEADS, LENS and INDEX\n";
             return 1;
         }
         TmsBuildOptions opts;
         opts.report = true;
         bool with_phi = false;
-        std::string minima_path, lcp_bin_path, phi_path, seq_ids_path;
+        std::string minima_path, lcp_bin_path, phi_path, seq_ids_path, v;
         for (int i = npos; i < argc; ++i) {
-            if (strcmp(argv[i], "--lf-split") == 0 && i + 1 < argc) {
-                if (!lf_split_arg(argv[++i], opts.lf_split)) return 1;
+            if (opt_value(argc, argv, i, "--lf-split", v)) {
+                if (!lf_split_arg(v, opts.lf_split)) return 1;
             }
-            else if (strcmp(argv[i], "--phi-split") == 0 && i + 1 < argc) opts.phi_split = split_arg(argv[++i]);
+            else if (opt_value(argc, argv, i, "--phi-split", v)) opts.phi_split = split_arg("--phi-split", v);
             else if (strcmp(argv[i], "--no-phi-inv") == 0) opts.phi_inv = false;
-            else if (strcmp(argv[i], "--layout") == 0 && i + 1 < argc) {
-                const std::string l = argv[++i];
-                if (l == "full") opts.layout = TmsLayout::FULL;
-                else if (l == "psi") opts.layout = TmsLayout::PSI;
-                else if (l == "phi") opts.layout = TmsLayout::PHI;
-                else { std::cerr << "Unknown layout: " << l << "\n"; return 1; }
+            else if (opt_value(argc, argv, i, "--layout", v)) {
+                if (v == "full") opts.layout = TmsLayout::FULL;
+                else if (v == "psi") opts.layout = TmsLayout::PSI;
+                else if (v == "phi") opts.layout = TmsLayout::PHI;
+                else { std::cerr << "Unknown layout: " << v << " (expected full, psi or phi)\n"; return 1; }
             }
-            else if (strcmp(argv[i], "--minima") == 0 && i + 1 < argc) { minima_path = argv[++i]; with_phi = true; }
-            else if (strcmp(argv[i], "--lcp-bin") == 0 && i + 1 < argc) { lcp_bin_path = argv[++i]; with_phi = true; }
-            else if (strcmp(argv[i], "--phi") == 0 && i + 1 < argc) { phi_path = argv[++i]; with_phi = true; }
-            else if (strcmp(argv[i], "--seq-ids") == 0 && i + 1 < argc) seq_ids_path = argv[++i];
+            else if (opt_value(argc, argv, i, "--minima", v)) { minima_path = v; with_phi = true; }
+            else if (opt_value(argc, argv, i, "--lcp-bin", v)) { lcp_bin_path = v; with_phi = true; }
+            else if (opt_value(argc, argv, i, "--phi", v)) { phi_path = v; with_phi = true; }
+            else if (opt_value(argc, argv, i, "--seq-ids", v)) seq_ids_path = v;
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
         if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
@@ -1312,18 +1352,20 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "ftab-build") {
-        if (argc < 2) { std::cerr << "ftab-build requires INDEX_PATH and FTAB_PATH\n"; return 1; }
+        if (argc < 2) { std::cerr << "ftab-build requires INDEX and FTAB\n"; return 1; }
         const std::string idx_path = argv[0], out_path = argv[1];
         unsigned k = 0;  // 0: --auto
         size_t threads = 0;
+        std::string v;
         for (int i = 2; i < argc; ++i) {
-            if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) k = static_cast<unsigned>(std::stoul(argv[++i]));
+            if (opt_value(argc, argv, i, "--kmer-len", v)) {
+                k = static_cast<unsigned>(opt_uint("--kmer-len", v));
+                if (k < 1 || k > ftab::max_k) { std::cerr << "--kmer-len must be between 1 and 31\n"; return 1; }
+            }
             else if (strcmp(argv[i], "--auto") == 0) k = 0;
-            else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
-                threads = static_cast<size_t>(std::stoull(argv[++i]));
+            else if (opt_value(argc, argv, i, "--threads", "-p", v)) threads = opt_uint("--threads", v);
             else { std::cerr << "Unknown ftab-build option: " << argv[i] << "\n"; return 1; }
         }
-        if (k > ftab::max_k) { std::cerr << "--k must be between 1 and 31\n"; return 1; }
         threads = resolve_thread_count(threads);
         using clock = std::chrono::steady_clock;
         try {
@@ -1382,7 +1424,7 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "ftab-verify") {
-        if (argc < 2) { std::cerr << "ftab-verify requires INDEX_PATH and FTAB_PATH\n"; return 1; }
+        if (argc < 2) { std::cerr << "ftab-verify requires INDEX and FTAB\n"; return 1; }
         bool crc = false;
         for (int i = 2; i < argc; ++i) {
             if (strcmp(argv[i], "--crc") == 0) crc = true;
@@ -1405,7 +1447,7 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "ftab-info") {
-        if (argc < 1) { std::cerr << "ftab-info requires FTAB_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "ftab-info requires FTAB\n"; return 1; }
         try {
             ftab::describe(ftab::read_header_file(argv[0]), std::cout);
         } catch (const std::exception& e) {
@@ -1416,15 +1458,15 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "ftab-survey") {
-        if (argc < 1) { std::cerr << "ftab-survey requires INDEX_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "ftab-survey requires INDEX\n"; return 1; }
         unsigned kmin = 6, kmax = 15, verify = 0;
-        size_t threads = 1;
+        size_t threads = 0;
+        std::string v;
         for (int i = 1; i < argc; ++i) {
-            if (strcmp(argv[i], "--kmin") == 0 && i + 1 < argc) kmin = static_cast<unsigned>(std::stoul(argv[++i]));
-            else if (strcmp(argv[i], "--kmax") == 0 && i + 1 < argc) kmax = static_cast<unsigned>(std::stoul(argv[++i]));
-            else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
-                threads = static_cast<size_t>(std::stoull(argv[++i]));
-            else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify = static_cast<unsigned>(std::stoul(argv[++i]));
+            if (opt_value(argc, argv, i, "--kmin", v)) kmin = static_cast<unsigned>(opt_uint("--kmin", v));
+            else if (opt_value(argc, argv, i, "--kmax", v)) kmax = static_cast<unsigned>(opt_uint("--kmax", v));
+            else if (opt_value(argc, argv, i, "--threads", "-p", v)) threads = opt_uint("--threads", v);
+            else if (opt_value(argc, argv, i, "--verify", v)) verify = static_cast<unsigned>(opt_uint("--verify", v));
             else { std::cerr << "Unknown ftab-survey option: " << argv[i] << "\n"; return 1; }
         }
         if (kmin < 1 || kmax < kmin || kmax > 31) { std::cerr << "ftab-survey needs 1 <= kmin <= kmax <= 31\n"; return 1; }
@@ -1468,7 +1510,7 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "index-plan") {
-        if (argc < 1) { std::cerr << "index-plan requires INDEX_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "index-plan requires INDEX\n"; return 1; }
         orbit_idx::Header h;
         try {
             h = orbit_idx::read_header_file(argv[0]);
@@ -1496,7 +1538,7 @@ int main(int argc, char** argv) {
             std::cout << "load plan of this build: every ms query loads every section = " << mb(total) << "\n";
             return 0;
         }
-        // What this build loads for each tms-batch command line, from the
+        // What this build loads for each tms query, from the
         // header's sections: TmsIndex::sections_for, and the start tables
         // load() builds with phi_inv.
         const TmsParts held = TmsIndex::held_parts(h);
@@ -1530,7 +1572,7 @@ int main(int argc, char** argv) {
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
         if (query) {
-            const TmsParts need = tms_batch_parts();
+            const TmsParts need = tms_query_load();
             if (!serves(need)) { std::cout << "this query: refused, the index lacks a part it needs\n"; return 0; }
             std::cout << "this query loads (" << TmsIndex::load_name(need) << "):" << describe_plan(need) << "\n";
             return 0;
@@ -1545,7 +1587,7 @@ int main(int argc, char** argv) {
                         g_tms_report = report_of[r];
                         g_tms_positions = pos;
                         g_tms_phi_starts = ps;
-                        const TmsParts need = tms_batch_parts();
+                        const TmsParts need = tms_query_load();
                         const std::string name = serves(need) ? TmsIndex::load_name(need) : "(refused: the index lacks a part)";
                         if (serves(need) && std::find(names.begin(), names.end(), name) == names.end()) {
                             names.push_back(name);
@@ -1559,13 +1601,13 @@ int main(int argc, char** argv) {
                     }
         std::cout << "load plans of this build (sections read, start tables built, and the RAM they take):\n";
         for (size_t i = 0; i < names.size(); ++i) std::cout << "  " << names[i] << ":" << plans[i] << "\n";
-        std::cout << "tms-batch queries (--mode, --report, then --positions and --phi-starts):\n";
+        std::cout << "queries on this index (--mode, --report, then --positions and --phi-starts):\n";
         for (const auto& r : rows) std::cout << r << "\n";
         return 0;
     }
 
     if (cmd == "index-verify") {
-        if (argc < 1) { std::cerr << "index-verify requires INDEX_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "index-verify requires INDEX\n"; return 1; }
         const std::string bad = orbit_idx::verify_file(argv[0]);
         if (!bad.empty()) { std::cerr << argv[0] << ": " << bad << "\n"; return 1; }
         std::cout << argv[0] << ": every section's CRC-32 matches\n";
@@ -1573,7 +1615,7 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "index-add-seq-ids") {
-        if (argc < 3) { std::cerr << "index-add-seq-ids requires INDEX_PATH, SEQ_IDS and OUT_PATH\n"; return 1; }
+        if (argc < 3) { std::cerr << "index-add-seq-ids requires INDEX, SEQ_IDS and OUT\n"; return 1; }
         try {
             const orbit_idx::Header h = orbit_idx::read_header_file(argv[0]);
             if (h.tool != orbit_idx::Tool::TMS) throw std::runtime_error(std::string(argv[0]) + " is not a tms index");
@@ -1599,7 +1641,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "index-rewrap") {
-        if (argc < 2) { std::cerr << "index-rewrap requires LEGACY_PATH and INDEX_PATH\n"; return 1; }
+        if (argc < 2) { std::cerr << "index-rewrap requires LEGACY_INDEX and INDEX\n"; return 1; }
         std::string info = "rewrapped_from=" + std::string(argv[0]) + "\n" + build_info();
         info.replace(info.find("built_by="), 9, "rewrapped_by=");
         info.replace(info.find("built_at="), 9, "rewrapped_at=");
@@ -1612,18 +1654,18 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "split-report") {
-        if (argc < 1) { std::cerr << "split-report requires INDEX_PATH\n"; return 1; }
-        size_t threads = 1;
+        if (argc < 1) { std::cerr << "split-report requires INDEX\n"; return 1; }
+        size_t threads = 0;
+        std::string v;
         for (int i = 1; i < argc; ++i) {
-            if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc)
-                threads = static_cast<size_t>(std::stoull(argv[++i]));
+            if (opt_value(argc, argv, i, "--threads", "-p", v)) threads = opt_uint("--threads", v);
             else { std::cerr << "Unknown split-report option: " << argv[i] << "\n"; return 1; }
         }
         return split_report::run(argv[0], resolve_thread_count(threads), std::cout);
     }
 
     if (cmd == "tms-inspect") {
-        if (argc < 1) { std::cerr << "tms-inspect requires INDEX_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "tms-inspect requires INDEX\n"; return 1; }
         // --phi-lengths loads LF and phi's lengths-based form alone, which
         // takes far less memory than a whole phi or full index.
         const TmsParts lf_phi_len{false, true, false, false};
@@ -1635,7 +1677,7 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "tms-text") {
-        if (argc < 1) { std::cerr << "tms-text requires INDEX_PATH\n"; return 1; }
+        if (argc < 1) { std::cerr << "tms-text requires INDEX\n"; return 1; }
         // LF alone reads the text back.
         const TmsParts lf_only;
         auto opt = read_tms_index(argv[0], &lf_only);
@@ -1697,7 +1739,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "inspect") {
         if (argc < 1) {
-            std::cerr << "inspect requires INDEX_PATH\n";
+            std::cerr << "inspect requires INDEX\n";
             return 1;
         }
         auto opt = ms_serialize::read_index(argv[0]);
@@ -1707,8 +1749,7 @@ int main(int argc, char** argv) {
         }
         ms_inspect::run_inspect(*opt);
         for (int i = 1; i < argc; ++i) {
-            if (strcmp(argv[i], "--spillover-tsv") == 0 && i + 1 < argc) {
-                std::string path = argv[++i];
+            if (std::string path; opt_value(argc, argv, i, "--spillover-tsv", path)) {
                 if (ms_inspect::run_spillover_tsv(*opt, path))
                     std::cout << "Spillover TSV written to " << path << "\n";
             }
@@ -1716,7 +1757,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::cerr << "Unknown command: " << cmd << "\n";
-    usage(prog);
+    std::cerr << "Unknown command: " << cmd << " (see ms --help)\n";
     return 1;
+}
+
+/** Main entry point. */
+int main(int argc, char** argv) {
+    try {
+        return run_command(argc, argv);
+    } catch (const std::invalid_argument& e) {
+        // A malformed option value, from opt_uint or a std::sto* call.
+        std::cerr << e.what() << "\n";
+        return 1;
+    } catch (const std::out_of_range& e) {
+        std::cerr << "an option value is out of range: " << e.what() << "\n";
+        return 1;
+    }
 }

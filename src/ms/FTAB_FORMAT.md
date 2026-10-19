@@ -2,7 +2,7 @@
 
 An ftab is a dense table, indexed by every k-mer over ACGT, of the state an Orbit-ms or Orbit-tms query reaches after reading that k-mer right to left from a cold start. A read whose last k bases occur in the text takes its state from the table and starts k steps in; its statistics in that window are implied (d + 1 at d bases from its right end). Results are byte-identical with and without the table.
 
-`ms ftab-build INDEX FTAB` writes one, as a file of its own next to an ORBITIDX index (INDEX_FORMAT.md); `batch` and `tms-batch` load it with `--ftab-file FTAB`. A table is used only with the index it was built from: its header carries a link to that index, which `--ftab-file` and `ms ftab-verify INDEX FTAB` check against the index's header alone. `ms ftab-info FTAB` prints the header. Code: `ftab.hpp` (the table), `ftab_build.hpp` (its walk and the choice of k), `ftab_file.hpp` (this format).
+`ms ftab-build INDEX FTAB` writes one, as a file of its own next to an ORBITIDX index (INDEX_FORMAT.md); `ms query` loads it with `--ftab FTAB`, or builds one at load with `--build-ftab[=KLEN]` (default KLEN 14) without storing it. A table is used only with the index it was built from: its header carries a link to that index, which `--ftab` and `ms ftab-verify INDEX FTAB` check against the index's header alone. `ms ftab-info FTAB` prints the header. Code: `ftab.hpp` (the table), `ftab_build.hpp` (its walk and the choice of k), `ftab_file.hpp` (this format).
 
 All integers are little-endian. The endian check refuses a file written on a big-endian host.
 
@@ -23,7 +23,7 @@ All integers are little-endian. The endian check refuses a file written on a big
 | 12 | u32 | endian check, 0x01020304 |
 | 16 | u32 | header bytes, 4096 |
 | 20 | u8 | k, 1 to 31 |
-| 21 | u8 | how k was chosen: 1 = given (`--k`), 2 = the auto rule (`--auto`) |
+| 21 | u8 | how k was chosen: 1 = given (`--kmer-len`), 2 = the auto rule (`--auto`) |
 | 22 | u8 | flags: bit 0 toehold, bit 1 window positions |
 | 23 | u8 | entry bits, the sum of the entry's widths |
 | 24 | u8 | LF interval bits |
@@ -65,7 +65,7 @@ Each is the index's section-table entry, in the ORBITIDX encoding, for one secti
 
 A tms table with a toehold links both forms of phi, since its phi points read the same in either and a query loads one or the other.
 
-The link matches an index when the index header's tool, layout, n, BWT runs and format version equal the copies, and each linked section is present with the same kind, rows, domain, payload bytes, row bits, column codes and widths, and CRC-32; and the index holds no other section of the list above. The rest of the index header, notably its info text, does not enter the link, so an index rewrapped from the same content (`ms index-rewrap`) still matches. `ftab-verify` and `--ftab-file` name the first field that differs.
+The link matches an index when the index header's tool, layout, n, BWT runs and format version equal the copies, and each linked section is present with the same kind, rows, domain, payload bytes, row bits, column codes and widths, and CRC-32; and the index holds no other section of the list above. The rest of the index header, notably its info text, does not enter the link, so an index rewrapped from the same content (`ms index-rewrap`) still matches. `ftab-verify` and `query --ftab` name the first field that differs.
 
 ## Info text
 
@@ -81,7 +81,7 @@ Entry x, for the k-mer whose character d places from its right end has code (A 0
 
 The table is ceil(4^k · E / 64) + 1 words; the last word is spare, so that a read of an entry never runs past the end.
 
-Tables of ms indexes, and of tms indexes with the psi layout, have no toehold. Tables of tms indexes that hold phi (full and phi layouts) have a toehold and window positions, and serve every `tms-batch` mode, `--positions` and SMEM reports. A table of a phi layout is filled by a walk that reads repositions' LCEs from phi's PLCP values, since that layout has no psi.
+Tables of ms indexes, and of tms indexes with the psi layout, have no toehold. Tables of tms indexes that hold phi (full and phi layouts) have a toehold and window positions, and serve every tms `query` mode, `--positions` and SMEM reports. A table of a phi layout is filled by a walk that reads repositions' LCEs from phi's PLCP values, since that layout has no psi.
 
 ## Window positions
 
@@ -89,4 +89,4 @@ With `--positions`, a tms query reports for each statistic a text position, the 
 
 ## Choosing k (informative)
 
-`ftab-build --k K` builds k = K. `--auto` (the default) takes the largest k whose table and window payloads fit in 5% of the index file's bytes; then, while fewer than 80% of that k's k-mers occur, it takes one smaller, stopping at 1. The walk that builds the table at the largest k that fits counts the occurring j-mers at every depth up to it, so the k it steps down to is known from that one walk; the table at that k then takes a second walk.
+`ftab-build --kmer-len KLEN` builds k = KLEN. `--auto` (the default) takes the largest k whose table and window payloads fit in 5% of the index file's bytes; then, while fewer than 80% of that k's k-mers occur, it takes one smaller, stopping at 1. The walk that builds the table at the largest k that fits counts the occurring j-mers at every depth up to it, so the k it steps down to is known from that one walk; the table at that k then takes a second walk.
