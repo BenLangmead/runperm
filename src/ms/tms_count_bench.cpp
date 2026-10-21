@@ -10,6 +10,8 @@
 //                    (default walk,backward,adaptive:16,adaptive:64,adaptive:256)
 //   --rounds R       rounds over the configurations, in rotated order (default 3)
 //   --block-bases N  bases per query block (default 4,000,000)
+//   --max-walk-steps N  skip walk at a cap once a run has shown that it would
+//                    take more than N phi and phi_inv steps (default: never)
 //
 // For each read set, cap, method and round, the reads are queried in blocks
 // as ms query does with one thread: matching statistics (with toeholds
@@ -17,9 +19,11 @@
 // ropebwt3 mem -p N.  OUT_PREFIX.tsv gets one row per run with the time of
 // each phase (load time is reported apart from all of them), what counting
 // did, and a hash of the formatted output, which must be the same for every
-// method at a cap; the program fails if it is not.  OUT_PREFIX.dist.tsv gets
+// method at a cap; the program fails if it is not.  backward runs first in
+// the first round, so that its counts say how long the walk would take.  OUT_PREFIX.dist.tsv gets
 // each set's SMEM length and count distribution, and OUT_PREFIX.hist.tsv the
-// joint histogram of length and count in powers of two.
+// joint histogram of length and count in powers of two, and
+// OUT_PREFIX.skipped.tsv the walks skipped and the steps they would take.
 #include "tms_smem.hpp"
 #include "tms_query.hpp"
 #include <algorithm>
@@ -119,6 +123,7 @@ int main(int argc, char** argv) {
     }
     const std::string idx_path = argv[1], out_prefix = argv[2];
     size_t k = 32, rounds = 3, block_bases = 4000000;
+    ulint max_walk_steps = ~ulint(0);
     unsigned row_shift = TmsCounter::DEFAULT_SHIFT;
     TmsMode mode = TmsMode::PSI;
     std::vector<ulint> caps{1, 100};
@@ -130,6 +135,7 @@ int main(int argc, char** argv) {
         else if (a == "--rounds" && i + 1 < argc) rounds = std::stoul(argv[++i]);
         else if (a == "--row-shift" && i + 1 < argc) row_shift = static_cast<unsigned>(std::stoul(argv[++i]));
         else if (a == "--block-bases" && i + 1 < argc) block_bases = std::stoul(argv[++i]);
+        else if (a == "--max-walk-steps" && i + 1 < argc) max_walk_steps = std::stoull(argv[++i]);
         else if (a == "--mode" && i + 1 < argc) {
             const std::string m = argv[++i];
             mode = m == "psi" ? TmsMode::PSI : m == "dual" ? TmsMode::DUAL : m == "phi" ? TmsMode::PHI
@@ -150,6 +156,8 @@ int main(int argc, char** argv) {
     }
     std::vector<Method> methods;
     for (const auto& m : method_names) methods.push_back(parse_method(m));
+    std::stable_partition(methods.begin(), methods.end(),
+                          [](const Method& m) { return m.opts.method == TmsCount::BACKWARD; });
 
     // Load, timed apart from everything else.
     const auto t_load = clock_type::now();
@@ -170,7 +178,8 @@ int main(int argc, char** argv) {
     std::cerr << "load_s=" << load_s << " counter_s=" << counter_s << " counter_bytes=" << counter.bytes()
               << " lf_intervals=" << idx.move_runs() << " n=" << idx.domain() << "\n";
 
-    std::ofstream tsv(out_prefix + ".tsv"), dist(out_prefix + ".dist.tsv"), hist(out_prefix + ".hist.tsv");
+    std::ofstream tsv(out_prefix + ".tsv"), dist(out_prefix + ".dist.tsv"), hist(out_prefix + ".hist.tsv"),
+        skipped(out_prefix + ".skipped.tsv");
     tsv << "set\treads\tbases\tmethod\tbudget\tshort_len\tcap\tround\tms_s\treport_s\twalk_s\tsearch_s\tlist_s"
            "\tformat_s\tsmems\twalked\tswitched\tsearched\twalk_steps\tsearch_steps\ttop_moves\tbot_moves"
            "\tscan_rows\tlf_ff\tfar_ends\tsum_rows\tlist_steps\tlisted\trepositions\thash\n";
@@ -178,6 +187,7 @@ int main(int argc, char** argv) {
             "\tlen_q75\tlen_q90\tlen_max\tcount_mean\tcount_q10\tcount_q25\tcount_q50\tcount_q75\tcount_q90"
             "\tcount_q99\tcount_max\tsum_count\tsum_len\n";
     hist << "set\tlen_log2\tcount_log2\tsmems\n";
+    skipped << "set\tcap\twalk_steps\n";
     const SeqIdTable* ids = idx.seq_ids();
 
     for (const auto& [name, spec] : sets) {
@@ -201,9 +211,19 @@ int main(int argc, char** argv) {
         bool have_dist = false;
         for (ulint cap : caps) {
             std::map<std::string, uint64_t> hashes;
+            // The walk's steps, from any run's counts: each SMEM's count less one.
+            ulint walk_steps = 0;
+            bool walk_known = false;
             for (size_t round = 0; round < rounds; ++round)
                 for (size_t mi = 0; mi < methods.size(); ++mi) {
                     const Method& m = methods[(mi + round) % methods.size()];
+                    if (m.opts.method == TmsCount::WALK && walk_known && walk_steps > max_walk_steps) {
+                        if (round == 0)
+                            std::cerr << name << " cap " << cap << ": walk skipped, it would take " << walk_steps
+                                      << " steps\n";
+                        if (round == 0) skipped << name << '\t' << cap << '\t' << walk_steps << '\n';
+                        continue;
+                    }
                     tms_count_stats = TmsCountStats{};
 #ifdef TMS_STATS
                     tms_stats = TmsStats{};
@@ -214,7 +234,7 @@ int main(int argc, char** argv) {
                     uint64_t h = 1469598103934665603ULL;
                     std::vector<ulint> lens, counts;
                     std::map<std::pair<unsigned, unsigned>, ulint> joint;
-                    ulint sum_count = 0, sum_len = 0;
+                    ulint sum_count = 0, sum_len = 0, run_steps = 0;
                     std::vector<std::string> block;
                     std::vector<std::vector<ulint>> ms, pos;
                     std::vector<TmsSmemHits> hits;
@@ -239,6 +259,7 @@ int main(int argc, char** argv) {
                         for (const auto& hh : hits)
                             for (const auto& s : hh.smems) {
                                 listed += s.listed;
+                                run_steps += s.count - 1;
                                 if (!have_dist) {
                                     lens.push_back(s.len);
                                     counts.push_back(s.count);
@@ -248,6 +269,8 @@ int main(int argc, char** argv) {
                                 }
                             }
                     }
+                    walk_steps = run_steps;
+                    walk_known = true;
                     ulint reps = 0;
 #ifdef TMS_STATS
                     reps = tms_stats.repositions;
