@@ -20,7 +20,8 @@
 # text's by tms-build, which counts the strings; one that fits both but
 # splits the text at other points must make query fail when a match
 # crosses a contig's end.
-# smem-all with --positions must be refused.
+# smem-all with --positions must be refused.  Counting by backward search
+# (--count backward and adaptive) must give the walk's output byte for byte.
 #
 # Usage: test_rope.sh MS FMD2RLBWT TERALCP [ROPEBWT3] [WORK_DIR]
 # TERALCP must support -ophi.
@@ -114,6 +115,15 @@ for cap in 1 3 100 0; do
         "$MS" query "$W/added.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
             --min-smem-len "$minlen" -o "$W/added.$cap.$minlen" 2>/dev/null
         cmp -s "$W/orbit.$cap.$minlen" "$W/added.$cap.$minlen" || { echo "the two indexes' outputs differ"; exit 1; }
+        # Counting by backward search, alone or after a short walk, gives
+        # the walk's output byte for byte.
+        for count in backward adaptive:0 adaptive:3 adaptive:3:12 adaptive:64; do
+            IFS=: read -r method budget short <<< "$count"
+            "$MS" query "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+                --min-smem-len "$minlen" --count "$method" ${budget:+--count-budget "$budget"} \
+                ${short:+--count-short-len "$short"} --count-row-shift 1 -o "$W/count.$cap.$minlen" 2>/dev/null
+            cmp -s "$W/orbit.$cap.$minlen" "$W/count.$cap.$minlen" || { echo "--count $count differs from the walk"; exit 1; }
+        done
         "$MS" query "$W/plain.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
             --min-smem-len "$minlen" -o "$W/raw.$cap.$minlen" 2>/dev/null
         python3 - "$W" "$cap" "$minlen" <<'EOF'
