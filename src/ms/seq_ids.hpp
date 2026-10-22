@@ -19,6 +19,11 @@
  * In a tms index the table is the SEQ_IDS section (see INDEX_FORMAT.md): per
  * contig, in order, its length as a uint64_t, its name's byte count as a
  * uint32_t and the name, all little-endian.
+ *
+ * Locating a position, done once per listed SMEM position, reads a bucket
+ * table over the high bits of text positions (build_lookup), which narrows
+ * the search for its strand to the few strands that start in its bucket,
+ * and appends the strand's "name:+:" or "name:-:" label in one copy.
  */
 
 #ifndef _MS_SEQ_IDS_HPP
@@ -40,6 +45,14 @@ struct SeqIdTable {
     std::vector<uint64_t> lens;
     // starts[2k + s]: the text position of strand s of contig k.
     std::vector<uint64_t> starts;
+    // label_text[label_at[j] .. label_at[j + 1]): "name:+:" or "name:-:" for
+    // strand j = 2k + s, strand s of contig k, all in one buffer.
+    std::string label_text;
+    std::vector<uint32_t> label_at{0};
+    // bucket[b]: the strand holding text position b << bucket_shift; empty
+    // until build_lookup, and then the last entry is the last strand.
+    std::vector<uint32_t> bucket;
+    unsigned bucket_shift = 0;
 
     /** The text length the table describes: both strands of every contig, each with its terminator. */
     uint64_t text_length() const { return starts.empty() ? 0 : starts.back() + lens.back() + 1; }
@@ -51,6 +64,51 @@ struct SeqIdTable {
         lens.push_back(len);
         starts.push_back(at);
         starts.push_back(at + len + 1);
+        for (const char* tail : {":+:", ":-:"}) {
+            label_text += name;
+            label_text += tail;
+            if (label_text.size() > UINT32_MAX) throw std::runtime_error("sequence names too long for the table");
+            label_at.push_back(static_cast<uint32_t>(label_text.size()));
+        }
+        bucket.clear();
+    }
+
+    /**
+     * Build the bucket table that narrows locate's search, with about four
+     * buckets per strand.  read and from_payload build it; a table extended
+     * with add afterwards searches all strands until it is built again.
+     */
+    void build_lookup() {
+        bucket.clear();
+        const uint64_t n = text_length();
+        if (n == 0 || starts.size() > UINT32_MAX) return;
+        bucket_shift = 0;
+        while ((n - 1) >> bucket_shift >= 4 * starts.size()) ++bucket_shift;
+        const uint64_t buckets = ((n - 1) >> bucket_shift) + 1;
+        bucket.resize(buckets + 1);
+        size_t j = 0;
+        for (uint64_t b = 0; b < buckets; ++b) {
+            const uint64_t x = b << bucket_shift;
+            while (j + 1 < starts.size() && starts[j + 1] <= x) ++j;
+            bucket[b] = static_cast<uint32_t>(j);
+        }
+        bucket[buckets] = static_cast<uint32_t>(starts.size() - 1);
+    }
+
+    /** The strand holding text position p, or starts.size() if p precedes every strand. */
+    size_t strand_of(uint64_t p) const {
+        if (bucket.empty() || p >= text_length())
+            return static_cast<size_t>(std::upper_bound(starts.begin(), starts.end(), p) - starts.begin()) - 1;
+        const uint64_t b = p >> bucket_shift;
+        // The strand lies between the ones holding the bucket's first
+        // position and the next bucket's.
+        size_t lo = bucket[b], hi = bucket[b + 1];
+        while (lo < hi) {
+            const size_t mid = (lo + hi + 1) / 2;
+            if (starts[mid] <= p) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
     }
 
     /** Write the table as a SEQ_IDS section payload. */
@@ -80,6 +138,7 @@ struct SeqIdTable {
             at += nb;
         }
         if (at != b.size()) throw std::runtime_error("malformed SEQ_IDS section");
+        t.build_lookup();
         return t;
     }
 
@@ -118,6 +177,7 @@ struct SeqIdTable {
         if (err) throw std::runtime_error("error reading " + path);
         if (!line.empty()) take();
         if (t.names.empty()) throw std::runtime_error(path + " lists no sequences");
+        t.build_lookup();
         return t;
     }
 
@@ -130,11 +190,12 @@ struct SeqIdTable {
      * which a match of a read never does in an index of this table's text.
      */
     void locate(uint64_t p, uint64_t len, size_t& k, int& strand, uint64_t& off) const {
-        const size_t j = static_cast<size_t>(std::upper_bound(starts.begin(), starts.end(), p) - starts.begin());
-        if (j == 0) throw std::runtime_error("text position " + std::to_string(p) + " precedes every sequence");
-        k = (j - 1) / 2;
-        strand = static_cast<int>((j - 1) % 2);
-        const uint64_t local = p - starts[j - 1];
+        if (starts.empty() || p < starts[0])
+            throw std::runtime_error("text position " + std::to_string(p) + " precedes every sequence");
+        const size_t j = strand_of(p);
+        k = j / 2;
+        strand = static_cast<int>(j % 2);
+        const uint64_t local = p - starts[j];
         if (local + len > lens[k])
             throw std::runtime_error("match at text position " + std::to_string(p) + " of length " +
                                      std::to_string(len) + " crosses the end of " + names[k] + " (" +
@@ -148,10 +209,8 @@ struct SeqIdTable {
         int strand;
         uint64_t off;
         locate(p, len, k, strand, off);
-        line += names[k];
-        line += ':';
-        line += strand ? '-' : '+';
-        line += ':';
+        const size_t j = 2 * k + static_cast<size_t>(strand);
+        line.append(label_text, label_at[j], label_at[j + 1] - label_at[j]);
         append_uint(line, off);
     }
 };

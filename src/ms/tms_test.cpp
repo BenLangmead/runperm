@@ -1465,6 +1465,57 @@ size_t check_counting(TmsIndex& idx, const std::vector<std::string>& pats, const
 }  // namespace
 
 /**
+ * SeqIdTable's bucket lookup locates every text position as a search of all
+ * strand starts does, giving the same contig, strand and offset and the same
+ * label, and failing with the same message for a match that leaves its
+ * strand, on random tables with long, short and one-base contigs, at
+ * random positions and at every strand's first and last positions.  A table
+ * extended after its lookup is built, and a table made with add alone, are
+ * searched in full.
+ */
+bool test_seq_id_lookup() {
+    std::cout << "Testing the sequence-ID table's bucket lookup against a full search" << std::endl;
+    std::mt19937_64 rng(71);
+    size_t checked = 0;
+    for (int trial = 0; trial < 60; ++trial) {
+        SeqIdTable plain;
+        const size_t contigs = 1 + rng() % (trial % 4 == 0 ? 3 : 400);
+        for (size_t k = 0; k < contigs; ++k) {
+            const uint64_t len = rng() % 3 == 0 ? 1 + rng() % 4 : rng() % 5 == 0 ? 1 + rng() % 1000000 : 1 + rng() % 500;
+            plain.add("c" + std::to_string(k) + std::string(rng() % 30, 'x'), len);
+        }
+        SeqIdTable fast = plain;
+        fast.build_lookup();
+        assert(plain.bucket.empty() && !fast.bucket.empty());
+        auto same = [&](uint64_t p, uint64_t len) {
+            std::string a, b;
+            bool ea = false, eb = false;
+            try { plain.append_location(a, p, len); } catch (const std::exception& e) { ea = true; a = e.what(); }
+            try { fast.append_location(b, p, len); } catch (const std::exception& e) { eb = true; b = e.what(); }
+            if (ea != eb || a != b) {
+                std::cout << "  FAILED: position " << p << " length " << len << ": " << a << " | " << b << std::endl;
+                assert(false && "the bucket lookup must locate as the full search does");
+            }
+            ++checked;
+        };
+        const uint64_t n = fast.text_length();
+        for (int i = 0; i < 2000; ++i) same(rng() % n, 1 + rng() % 5);
+        for (size_t j = 0; j < fast.starts.size(); ++j) {
+            const uint64_t first = fast.starts[j], last = first + fast.lens[j / 2];  // last is the terminator
+            for (uint64_t p : {first, first + 1, last - 1, last})
+                if (p < n) same(p, 1);
+        }
+        // Extending the table drops its lookup until it is built again.
+        fast.add("extra", 7);
+        plain.add("extra", 7);
+        assert(fast.bucket.empty());
+        same(fast.starts.back() + 3, 2);
+    }
+    std::cout << "  " << checked << " positions PASSED" << std::endl;
+    return true;
+}
+
+/**
  * Counting SMEM occurrences by backward search and adaptively gives the
  * same counts and listed positions as the walk, on the fuzz texts and
  * minishred with one terminator, in every split variant, and on string
@@ -2110,6 +2161,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_smem_report(data_dir);
     std::cout << std::endl;
     test_smem_count(data_dir);
+    std::cout << std::endl;
+    test_seq_id_lookup();
     std::cout << std::endl;
     test_layouts(data_dir);
     std::cout << std::endl;
