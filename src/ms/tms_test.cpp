@@ -1422,6 +1422,7 @@ size_t check_counting(TmsIndex& idx, const std::vector<std::string>& pats, const
     o.method = TmsCount::BACKWARD;
     opts.push_back(o);
     o.method = TmsCount::ADAPTIVE;
+    o.budget_per_len = 0;
     for (ulint budget : {0, 1, 3, 20})
         for (ulint short_len : {0, 4}) {
             o.budget = budget;

@@ -6,8 +6,9 @@
 //   --mode M         psi (default), dual or phi: how matching statistics reposition
 //   --row-shift R    backward search's row-start sampling (default 4)
 //   --caps a,b,...   positions listed per SMEM (default 1,100)
-//   --methods LIST   comma-separated walk, backward, adaptive:B, adaptive:B:S
-//                    or adaptive:B:S:A (budget B + A * L, short length S)
+//   --methods LIST   comma-separated walk, backward, adaptive (the defaults),
+//                    adaptive:B, adaptive:B:S or adaptive:B:S:A (budget B + A * L,
+//                    A = 0 unless given, short length S)
 //                    (default walk,backward,adaptive:16,adaptive:64,adaptive:256)
 //   --rounds R       rounds over the configurations, in rotated order (default 3)
 //   --block-bases N  bases per query block (default 4,000,000)
@@ -82,7 +83,10 @@ Method parse_method(const std::string& m) {
         std::stringstream ss(m);
         std::string part;
         std::getline(ss, part, ':');
-        if (std::getline(ss, part, ':')) x.opts.budget = std::stoull(part);
+        if (std::getline(ss, part, ':')) {
+            x.opts.budget = std::stoull(part);
+            x.opts.budget_per_len = 0;
+        }
         if (std::getline(ss, part, ':')) x.opts.short_len = std::stoull(part);
         if (std::getline(ss, part, ':')) x.opts.budget_per_len = std::stod(part);
     } else {
