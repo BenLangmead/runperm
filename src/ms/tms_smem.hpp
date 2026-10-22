@@ -495,10 +495,27 @@ inline void tms_format_smems_rope(const std::string& name, const TmsSmemHits& hi
         if (h.listed > 0) {
             text += '\t';
             append_uint(text, h.listed);
-            for (ulint c = 0; c < h.listed; ++c) {
-                text += '\t';
-                if (ids) ids->append_location(text, hits.pos[at++], h.len);
-                else append_uint(text, hits.pos[at++]);
+            if (ids) {
+                // Locate every position first, so that their table reads
+                // overlap, then write them in place in room for all of them
+                // and trim what is left.
+                thread_local std::vector<std::pair<size_t, uint64_t>> where;
+                where.resize(h.listed);
+                for (ulint c = 0; c < h.listed; ++c) ids->locate_strand(hits.pos[at + c], h.len, where[c].first, where[c].second);
+                at += h.listed;
+                const size_t start = text.size(), width = 1 + ids->max_location();
+                text.resize(start + h.listed * width);
+                char* out = &text[start];
+                for (const auto& [j, off] : where) {
+                    *out++ = '\t';
+                    out = ids->put_strand_offset(out, j, off);
+                }
+                text.resize(static_cast<size_t>(out - text.data()));
+            } else {
+                for (ulint c = 0; c < h.listed; ++c) {
+                    text += '\t';
+                    append_uint(text, hits.pos[at++]);
+                }
             }
         }
         text += '\n';

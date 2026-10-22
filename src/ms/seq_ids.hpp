@@ -31,6 +31,7 @@
 
 #include "format_int.hpp"
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <ostream>
@@ -49,6 +50,8 @@ struct SeqIdTable {
     // strand j = 2k + s, strand s of contig k, all in one buffer.
     std::string label_text;
     std::vector<uint32_t> label_at{0};
+    // The longest label.
+    size_t max_label = 0;
     // bucket[b]: the strand holding text position b << bucket_shift; empty
     // until build_lookup, and then the last entry is the last strand.
     std::vector<uint32_t> bucket;
@@ -67,6 +70,7 @@ struct SeqIdTable {
         for (const char* tail : {":+:", ":-:"}) {
             label_text += name;
             label_text += tail;
+            max_label = std::max(max_label, name.size() + 3);
             if (label_text.size() > UINT32_MAX) throw std::runtime_error("sequence names too long for the table");
             label_at.push_back(static_cast<uint32_t>(label_text.size()));
         }
@@ -203,15 +207,44 @@ struct SeqIdTable {
         off = strand ? lens[k] - (local + len) : local;
     }
 
-    /** Append "name:strand:offset" for the match of length len at text position p. */
-    void append_location(std::string& line, uint64_t p, uint64_t len) const {
+    /**
+     * The strand j (2k + s) and forward-strand offset off of the match of
+     * length len at text position p, as locate gives them.
+     */
+    void locate_strand(uint64_t p, uint64_t len, size_t& j, uint64_t& off) const {
         size_t k;
         int strand;
-        uint64_t off;
         locate(p, len, k, strand, off);
-        const size_t j = 2 * k + static_cast<size_t>(strand);
-        line.append(label_text, label_at[j], label_at[j + 1] - label_at[j]);
-        append_uint(line, off);
+        j = 2 * k + static_cast<size_t>(strand);
+    }
+
+    /** Write strand j's label and offset off at out, as put_location does. */
+    char* put_strand_offset(char* out, size_t j, uint64_t off) const {
+        const size_t n = label_at[j + 1] - label_at[j];
+        std::memcpy(out, label_text.data() + label_at[j], n);
+        return std::to_chars(out + n, out + n + 20, off).ptr;
+    }
+
+    /** The most bytes put_location writes. */
+    size_t max_location() const { return max_label + 20; }
+
+    /**
+     * Write "name:strand:offset" for the match of length len at text
+     * position p at out, which has room for max_location() bytes, and return
+     * the end of what it wrote.
+     */
+    char* put_location(char* out, uint64_t p, uint64_t len) const {
+        size_t j;
+        uint64_t off;
+        locate_strand(p, len, j, off);
+        return put_strand_offset(out, j, off);
+    }
+
+    /** Append "name:strand:offset" for the match of length len at text position p. */
+    void append_location(std::string& line, uint64_t p, uint64_t len) const {
+        const size_t at = line.size();
+        line.resize(at + max_location());
+        line.resize(static_cast<size_t>(put_location(&line[at], p, len) - line.data()));
     }
 };
 
