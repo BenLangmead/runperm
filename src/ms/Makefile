@@ -40,6 +40,11 @@ debug: ms
 tms_chain_bench: tms_chain_bench.cpp index_format.cpp $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -o tms_chain_bench tms_chain_bench.cpp index_format.cpp
 
+# Benchmark of smem-all's counting methods on one load of a tms index (see
+# tms_count_bench.cpp); counts matching statistics repositions as ms-steps does
+tms_count_bench: tms_count_bench.cpp index_format.cpp $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -DNDEBUG -DTMS_STATS -o tms_count_bench tms_count_bench.cpp index_format.cpp -lz
+
 .PHONY: test test-threads test-reader test-rewrap test-ftab all clean debug bench
 test: ms
 	./ms test ../../data

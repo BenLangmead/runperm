@@ -28,10 +28,12 @@
 #define _TMS_SMEM_HPP
 
 #include "seq_ids.hpp"
+#include "tms_count.hpp"
 #include "tms_index.hpp"
 #include "tms_query.hpp"
 #include "format_int.hpp"
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -147,6 +149,11 @@ struct Walks {
     // it has one.
     TmsIndex::PhiPos first{};
     bool has_step = false;
+    // The most steps the up and down walks may take together, and whether
+    // they reached it with the interval not yet ended.  A walk that is over
+    // its limit stops, and its counts and positions are not used.
+    ulint limit = TMS_ALL_POSITIONS;
+    bool over = false;
 };
 
 /**
@@ -170,6 +177,10 @@ struct Walks {
  * interval, which it finds last.  A down walk runs after the up walks and
  * keeps the positions nearest x that fit in max_listed after the up walk's
  * and x.
+ *
+ * A walk stops once the up and down walks have taken an SMEM's limit of
+ * steps together with the LCP still at least its length, and marks it over;
+ * walks of an SMEM that is over are skipped.
  */
 template <bool Down>
 void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed, std::vector<ulint>& found) {
@@ -194,6 +205,10 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
         }
         for (size_t t = 0; t < m; ++t) {
             Walks& e = w[g + t];
+            if (e.over) {
+                e.has_step = false;
+                continue;
+            }
             const Pos p = wk.locate(e.x, range[t].first, range[t].second);
             e.has_step = wk.lcp(p) >= e.len;
             if (e.has_step) e.first = wk.start_step(p);
@@ -204,12 +219,13 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
     struct Slot {
         Pos p;        // the pending step
         size_t smem;  // which entry of w
-        ulint len, count, budget;
+        ulint len, count, budget, limit;
         std::vector<ulint> buf;
     };
     // Record a finished walk in w and found.
     auto flush = [&](Slot& s) {
         Walks& e = w[s.smem];
+        tms_count_stats.walk_steps += s.count;
         if constexpr (Down) {
             e.down_count = s.count;
             e.down_at = found.size();
@@ -226,8 +242,16 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
     // Load the next walk with a step to take into s.  Walks without one
     // keep their counts of 0.  Returns false once no walks are left.
     auto begin = [&](Slot& s) {
-        while (next < w.size() && !w[next].has_step) ++next;
-        if (next == w.size()) return false;
+        for (;; ++next) {
+            if (next == w.size()) return false;
+            Walks& e = w[next];
+            if (!e.has_step || e.over) continue;
+            s.limit = e.limit;
+            if constexpr (Down)
+                if (e.limit != TMS_ALL_POSITIONS) s.limit = e.limit - e.up_count;
+            if (s.limit > 0) break;
+            e.over = true;
+        }
         s.smem = next++;
         const Walks& e = w[s.smem];
         s.p = e.first;
@@ -251,8 +275,11 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
         ++s.count;
         if (s.buf.size() < s.budget) s.buf.push_back(x);
         if (lcp >= s.len) {
-            wk.prefetch(s.p.interval);
-            return true;
+            if (s.count < s.limit) {
+                wk.prefetch(s.p.interval);
+                return true;
+            }
+            w[s.smem].over = true;
         }
         flush(s);
         return begin(s);
@@ -273,41 +300,107 @@ void run_walks(TmsIndex& idx, std::vector<Walks>& w, size_t k, ulint max_listed,
 }  // namespace tms_smem_detail
 
 /**
+ * How tms_report_smems_batch counts SMEM_ALL's occurrences (see
+ * tms_count.hpp): with a method other than WALK, the counter built for the
+ * index and the block's reads, which backward search reads.
+ */
+struct TmsCounting {
+    TmsCountOptions opts;
+    const TmsCounter* counter = nullptr;
+    const std::vector<std::string>* patterns = nullptr;
+};
+
+/**
  * tms_report_smems for reads 0 to ms.size() - 1 of a block, into hits[j].
  * For SMEM_ALL with k > 0, the up and down walks of all the block's SMEMs
  * run up to k at a time; the results are the same as with k = 0, which runs
  * tms_report_smems on each read in turn.
+ *
+ * With counting whose method is not WALK, SMEM_ALL counts some or all SMEMs
+ * by backward search instead, up to k searches at a time (one with k = 0),
+ * and lists their positions from the top of the interval with phi_inv; the
+ * results are again the same.  BACKWARD searches every SMEM and reads no
+ * toeholds, so pos may then be empty.  ADAPTIVE walks each SMEM longer than
+ * opts.short_len for up to opts.budget steps and searches those whose walk
+ * has not ended by then, and the shorter ones without walking.
  */
 inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<ulint>>& ms,
                                    const std::vector<std::vector<ulint>>& pos, ulint min_len, TmsReport report,
                                    size_t k, std::vector<TmsSmemHits>& hits,
-                                   ulint max_listed = TMS_ALL_POSITIONS) {
+                                   ulint max_listed = TMS_ALL_POSITIONS, const TmsCounting* counting = nullptr) {
     if (report == TmsReport::SMEM_ALL && !idx.has_phi_inv())
         throw std::invalid_argument("listing every position of an SMEM needs an index with phi_inv");
+    const TmsCount method = counting && report == TmsReport::SMEM_ALL ? counting->opts.method : TmsCount::WALK;
+    if (method != TmsCount::WALK && (!counting->counter || !counting->patterns))
+        throw std::invalid_argument("counting by backward search needs a counter and the reads");
     hits.resize(ms.size());
-    if (report != TmsReport::SMEM_ALL || k == 0) {
+    if (report != TmsReport::SMEM_ALL || (k == 0 && method == TmsCount::WALK)) {
         for (size_t j = 0; j < ms.size(); ++j) tms_report_smems(idx, ms[j], pos[j], min_len, report, hits[j], max_listed);
         return;
     }
+    using clock = std::chrono::steady_clock;
     using tms_smem_detail::Walks;
+    TmsCountStats& st = tms_count_stats;
     std::vector<Walks> w;
     for (size_t j = 0; j < ms.size(); ++j) {
         hits[j].smems.clear();
         hits[j].pos.clear();
         for (size_t i : tms_smems(ms[j], min_len)) {
             hits[j].smems.push_back({i, ms[j][i], 0, 0});
-            w.push_back({pos[j][i], ms[j][i]});
+            const ulint x = method == TmsCount::BACKWARD ? 0 : pos[j][i];
+            w.push_back({x, ms[j][i]});
+            Walks& e = w.back();
+            if (method == TmsCount::BACKWARD || (method == TmsCount::ADAPTIVE && e.len <= counting->opts.short_len))
+                e.over = true;
+            else if (method == TmsCount::ADAPTIVE)
+                e.limit = counting->opts.budget;
         }
     }
+    st.smems += w.size();
     std::vector<ulint> found;
-    tms_smem_detail::run_walks<false>(idx, w, k, max_listed, found);
-    tms_smem_detail::run_walks<true>(idx, w, k, max_listed, found);
+    if (method != TmsCount::BACKWARD) {
+        const auto t0 = clock::now();
+        tms_smem_detail::run_walks<false>(idx, w, std::max<size_t>(k, 1), max_listed, found);
+        tms_smem_detail::run_walks<true>(idx, w, std::max<size_t>(k, 1), max_listed, found);
+        st.walk_s += std::chrono::duration<double>(clock::now() - t0).count();
+    }
+    // Backward search for the SMEMs whose walks are over or did not run.
+    std::vector<TmsSearchItem> items;
+    {
+        size_t at = 0;
+        for (size_t j = 0; j < ms.size(); ++j)
+            for (const auto& h : hits[j].smems) {
+                const Walks& e = w[at++];
+                if (!e.over) continue;
+                items.push_back({(*counting->patterns)[j].data() + h.start, h.len});
+                if (method == TmsCount::ADAPTIVE && e.limit != TMS_ALL_POSITIONS) ++st.switched;
+            }
+    }
+    st.searched += items.size();
+    st.walked += w.size() - items.size();
+    if (!items.empty()) {
+        const auto t0 = clock::now();
+        tms_backward_search_batch(idx, *counting->counter, items, std::max<size_t>(k, 1));
+        st.search_s += std::chrono::duration<double>(clock::now() - t0).count();
+    }
     // Row order: the up walk's positions reversed, then x, then the down
-    // walk's.
-    size_t at = 0;
-    for (auto& h : hits)
+    // walk's; or, for a search, the positions listed from the top.
+    size_t at = 0, item = 0;
+    std::vector<std::pair<size_t, size_t>> lists;  // (read, item) of each search, in order
+    std::vector<size_t> list_at;                    // where each search's positions start in its read's pos
+    for (size_t j = 0; j < hits.size(); ++j) {
+        auto& h = hits[j];
         for (auto& s : h.smems) {
             const Walks& e = w[at++];
+            if (e.over) {
+                const TmsSearchItem& it = items[item];
+                s.count = it.count;
+                s.listed = std::min(s.count, max_listed);
+                lists.emplace_back(j, item++);
+                list_at.push_back(h.pos.size());
+                h.pos.resize(h.pos.size() + s.listed);
+                continue;
+            }
             s.count = e.up_count + 1 + e.down_count;
             s.listed = std::min(s.count, max_listed);
             const auto up = found.begin() + static_cast<std::ptrdiff_t>(e.up_at);
@@ -317,6 +410,19 @@ inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<
             const auto down = found.begin() + static_cast<std::ptrdiff_t>(e.down_at);
             h.pos.insert(h.pos.end(), down, down + static_cast<std::ptrdiff_t>(e.down_kept));
         }
+    }
+    if (!lists.empty()) {
+        const auto t0 = clock::now();
+        std::vector<TmsListItem> li;
+        li.reserve(lists.size());
+        for (size_t x = 0; x < lists.size(); ++x) {
+            const auto [j, it] = lists[x];
+            const ulint n = std::min(items[it].count, max_listed);
+            if (n > 0) li.push_back({items[it].top_x, n, hits[j].pos.data() + list_at[x]});
+        }
+        tms_list_batch(idx, li, std::max<size_t>(k, 1));
+        st.list_s += std::chrono::duration<double>(clock::now() - t0).count();
+    }
 }
 
 /**

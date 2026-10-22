@@ -1,6 +1,7 @@
 *.dSYM
 ms
 tms_chain_bench
+tms_count_bench
 ms-bench
 ms-stats
 ms-steps

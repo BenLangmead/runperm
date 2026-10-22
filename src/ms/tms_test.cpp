@@ -1405,6 +1405,116 @@ void check_phi_against(TmsIndex& idx, const std::vector<ulint>& sa, const std::v
 
 }  // namespace
 
+namespace {
+/**
+ * Check that every counting method gives the walk's SMEM_ALL hits for the
+ * statistics len and toeholds pos of pats on idx, for several caps and
+ * numbers in flight and, for ADAPTIVE, budgets and length thresholds.  The
+ * counter's row-start table samples every fourth interval, so that counts
+ * of intervals more than four intervals apart read it.  Returns the
+ * comparisons made.
+ */
+size_t check_counting(TmsIndex& idx, const std::vector<std::string>& pats, const std::vector<std::vector<ulint>>& len,
+                      const std::vector<std::vector<ulint>>& pos, ulint min_len) {
+    const TmsCounter ctr(idx, 2);
+    std::vector<TmsCountOptions> opts;
+    TmsCountOptions o;
+    o.method = TmsCount::BACKWARD;
+    opts.push_back(o);
+    o.method = TmsCount::ADAPTIVE;
+    for (ulint budget : {0, 1, 3, 20})
+        for (ulint short_len : {0, 4}) {
+            o.budget = budget;
+            o.short_len = short_len;
+            opts.push_back(o);
+        }
+    const std::vector<std::vector<ulint>> none(pats.size());
+    size_t compared = 0;
+    for (ulint cap : {ulint(0), ulint(1), ulint(2), ulint(5), TMS_ALL_POSITIONS})
+        for (size_t k : {size_t(0), size_t(1), size_t(7), size_t(32)}) {
+            std::vector<TmsSmemHits> want, got;
+            tms_report_smems_batch(idx, len, pos, min_len, TmsReport::SMEM_ALL, k, want, cap);
+            for (const auto& co : opts) {
+                const TmsCounting counting{co, &ctr, &pats};
+                tms_report_smems_batch(idx, len, co.method == TmsCount::BACKWARD ? none : pos, min_len,
+                                       TmsReport::SMEM_ALL, k, got, cap, &counting);
+                for (size_t j = 0; j < pats.size(); ++j) {
+                    std::string a, b;
+                    tms_format_smems(want[j], TmsReport::SMEM_ALL, a);
+                    tms_format_smems(got[j], TmsReport::SMEM_ALL, b);
+                    if (a != b) {
+                        std::cout << "  FAILED: counting method " << int(co.method) << " budget " << co.budget
+                                  << " short_len " << co.short_len << " cap " << cap << " k " << k << " on "
+                                  << pats[j] << ":\n    walk     " << a << "\n    counting " << b << std::endl;
+                        assert(false && "every counting method must give the walk's counts and positions");
+                        return compared;
+                    }
+                    ++compared;
+                }
+            }
+        }
+    return compared;
+}
+}  // namespace
+
+/**
+ * Counting SMEM occurrences by backward search and adaptively gives the
+ * same counts and listed positions as the walk, on the fuzz texts and
+ * minishred with one terminator, in every split variant, and on string
+ * collections with many terminators, whose phi and phi_inv come from
+ * samples.  The inputs make some top and bottom ends move to other runs and
+ * some counts read the row-start table, and the adaptive method both walk
+ * and switch.
+ */
+bool test_smem_count(const std::string& data_dir) {
+    std::cout << "Testing SMEM counting by backward search against the walk" << std::endl;
+    std::mt19937 rng(47);
+    tms_count_stats = TmsCountStats{};
+    size_t compared = 0;
+    for (const auto& in : batch_inputs(data_dir, rng)) {
+        auto pats = fuzz_patterns(in.text, rng, in.text.size() > 5000 ? 40 : 60);
+        for (const auto& o : split_variants()) {
+            TmsIndex idx(in.heads, in.lens, o, &in.tops);
+            std::vector<std::vector<ulint>> len, pos;
+            tms_query_batch(idx, pats, 8, len, TmsMode::PSI, &pos);
+            for (ulint min_len : {0, 5}) compared += check_counting(idx, pats, len, pos, min_len);
+        }
+    }
+    for (int k = 0; k < 20; ++k) {
+        std::vector<std::string> strings;
+        const int count = 1 + rng() % 12;
+        for (int i = 0; i < count; ++i) {
+            if (!strings.empty() && rng() % 4 == 0) {
+                strings.push_back(strings[rng() % strings.size()]);
+                continue;
+            }
+            std::string w(1 + rng() % (k % 3 == 0 ? 6 : 80), 'A');
+            for (auto& c : w) c = "ACGT"[rng() % (k % 5 == 0 ? 2 : 4)];
+            strings.push_back(w);
+        }
+        MultiText t = make_multi_text(strings);
+        std::vector<std::string> pats;
+        for (std::string q : fuzz_patterns(t.str, rng, 30)) {
+            for (auto& c : q)
+                if (c == '$') c = 'A';
+            pats.push_back(q);
+        }
+        for (TmsBuildOptions o : split_variants()) {
+            TmsIndex idx(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
+            std::vector<std::vector<ulint>> len, pos;
+            tms_query_batch(idx, pats, 8, len, TmsMode::PSI, &pos, true);
+            compared += check_counting(idx, pats, len, pos, 0);
+        }
+    }
+    const TmsCountStats& st = tms_count_stats;
+    assert(st.top_moves > 0 && st.bot_moves > 0 && st.far_ends > 0 && st.switched > 0 && st.walked > 0 &&
+           st.list_steps > 0 && "the inputs must exercise every part of counting");
+    std::cout << "  " << compared << " read listings agree (" << st.searched << " searches, " << st.top_moves
+              << " top and " << st.bot_moves << " bottom moves, " << st.far_ends << " counts from the table, "
+              << st.switched << " adaptive switches) PASSED" << std::endl;
+    return true;
+}
+
 /**
  * Indexes whose phi and phi_inv come from per-run suffix array and LCP
  * samples (as TeraLCP -ophi writes them) instead of a walk of LF.  With one
@@ -1991,6 +2101,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_smem_detection();
     std::cout << std::endl;
     test_smem_report(data_dir);
+    std::cout << std::endl;
+    test_smem_count(data_dir);
     std::cout << std::endl;
     test_layouts(data_dir);
     std::cout << std::endl;

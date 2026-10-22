@@ -162,6 +162,19 @@ static void usage_advanced(std::ostream& os) {
        << "    --phi-starts             tms: matching statistics without positions load\n"
        << "                             phi's starts-based form, not its narrower\n"
        << "                             lengths-based form\n"
+       << "    --count walk|backward|adaptive\n"
+       << "                             how smem-all counts an SMEM's occurrences: walk\n"
+       << "                             (default) steps phi and phi_inv over all of them;\n"
+       << "                             backward finds its BWT interval by backward search,\n"
+       << "                             L steps for length L, and lists positions from the\n"
+       << "                             interval's top; adaptive walks at most B steps,\n"
+       << "                             then searches if the walk has not ended\n"
+       << "    --count-budget B         adaptive: B (default 64)\n"
+       << "    --count-short-len S      adaptive: search SMEMs of length at most S\n"
+       << "                             without walking (default 0)\n"
+       << "    --count-row-shift R      backward and adaptive sample every 2^R-th LF row\n"
+       << "                             start in a table built after loading and timed\n"
+       << "                             with it (default 4)\n"
        << "    --oracle-write FILE      record every reposition's outcome\n"
        << "                             (ORACLE_FORMAT.md); not with an ftab\n"
        << "    --mode oracle|oracle-scan --oracle FILE\n"
@@ -170,7 +183,8 @@ static void usage_advanced(std::ostream& os) {
        << "                             the recorded side and takes the recorded length.\n"
        << "                             Output equals the recording mode's.  An ms index's\n"
        << "                             other mode is standard, its default.\n"
-       << "      Results do not depend on DEPTH, READS, BYTES or --phi-starts.  On a\n"
+       << "      Results do not depend on DEPTH, READS, BYTES, --phi-starts or --count.\n"
+       << "      On a\n"
        << "      machine with several memory nodes, the index is interleaved over them\n"
        << "      (Linux) unless numactl sets a memory policy.  In the summary,\n"
        << "      query_ns_per_base is the threads' summed query time per base and\n"
@@ -336,6 +350,11 @@ static bool g_tms_phi_starts = false;
 static TmsReport g_tms_report = TmsReport::MS;
 static ulint g_tms_min_smem_len = 0;
 static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
+// How smem-all counts occurrences, and what backward search reads, built
+// after the index is loaded when the method is not walk.
+static TmsCountOptions g_tms_count;
+static unsigned g_tms_count_shift = TmsCounter::DEFAULT_SHIFT;
+static TmsCounter g_tms_counter;
 
 // With an SMEM report, the SMEMs are found as part of the query.  smem_k
 // walks are in flight when smem-all lists positions (0 lists them one SMEM
@@ -344,14 +363,19 @@ static ulint g_tms_max_smem_positions = TMS_ALL_POSITIONS;
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t smem_k,
                        size_t first_read) {
     const bool smems = g_tms_report != TmsReport::MS;
+    // Backward search counts and lists smem-all's SMEMs without toeholds.
+    const bool toeholds = g_tms_positions || (smems && !(g_tms_report == TmsReport::SMEM_ALL &&
+                                                          g_tms_count.method == TmsCount::BACKWARD));
     RepositionOracleView view{};
     const bool replay = g_tms_mode == TmsMode::ORACLE || g_tms_mode == TmsMode::ORACLE_SCAN;
     if (replay) view = RepositionOracleView::of(g_oracle, first_read, p.size());
-    tms_query_batch(idx, p, k, r.ms, g_tms_mode, g_tms_positions || smems ? &r.pos : nullptr, true, g_ftab,
+    tms_query_batch(idx, p, k, r.ms, g_tms_mode, toeholds ? &r.pos : nullptr, true, g_ftab,
                     replay ? &view : nullptr, g_record ? &r.decisions : nullptr);
+    if (!toeholds) r.pos.clear();
     if (!smems) return;
+    const TmsCounting counting{g_tms_count, &g_tms_counter, &p};
     tms_report_smems_batch(idx, r.ms, r.pos, g_tms_min_smem_len, g_tms_report, smem_k, r.hits,
-                           g_tms_max_smem_positions);
+                           g_tms_max_smem_positions, &counting);
 }
 static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t k, QueryResults& r, size_t first_read) {
     query_many(idx, p, k, r, k, first_read);
@@ -376,8 +400,9 @@ static bool tms_mode_of(const std::string& name, TmsMode& m) {
 }
 
 /**
- * If argv[i] is a tms query option that chooses what a query loads
- * (--positions, --report, --phi-starts, and --mode if with_mode), apply it
+ * If argv[i] is a tms query option that chooses what a query loads or how
+ * smem-all counts (--positions, --report, --phi-starts, the --count options,
+ * and --mode if with_mode), apply it
  * to the tms query settings, advancing i past its value, and return 1;
  * return -1, after printing why, if its value is unknown, and 0 if argv[i]
  * is no such option.
@@ -395,6 +420,18 @@ static int tms_query_flag(int argc, char** argv, int& i, bool with_mode = true) 
         else if (v == "smem-all") g_tms_report = TmsReport::SMEM_ALL;
         else { std::cerr << "Unknown report: " << v << " (expected ms, smem-one or smem-all)\n"; return -1; }
     }
+    else if (opt_value(argc, argv, i, "--count", v)) {
+        if (v == "walk") g_tms_count.method = TmsCount::WALK;
+        else if (v == "backward") g_tms_count.method = TmsCount::BACKWARD;
+        else if (v == "adaptive") g_tms_count.method = TmsCount::ADAPTIVE;
+        else { std::cerr << "Unknown counting method: " << v << " (expected walk, backward or adaptive)\n"; return -1; }
+    }
+    else if (opt_value(argc, argv, i, "--count-budget", v))
+        g_tms_count.budget = static_cast<ulint>(opt_uint("--count-budget", v));
+    else if (opt_value(argc, argv, i, "--count-short-len", v))
+        g_tms_count.short_len = static_cast<ulint>(opt_uint("--count-short-len", v));
+    else if (opt_value(argc, argv, i, "--count-row-shift", v))
+        g_tms_count_shift = static_cast<unsigned>(opt_uint("--count-row-shift", v));
     else return 0;
     return 1;
 }
@@ -604,6 +641,23 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
                 std::cerr << "smem-all: positions as contig:strand:offset, " << t->names.size() << " sequences\n";
             else
                 std::cerr << "smem-all: positions as text positions; the index holds no sequence-ID table\n";
+        }
+    }
+    // The counter is part of preparing the index, so it is timed with the load.
+    double count_init_s = 0.0;
+    if constexpr (std::is_same_v<Index, TmsIndex>) {
+        if (g_tms_report == TmsReport::SMEM_ALL && g_tms_count.method != TmsCount::WALK) {
+            const auto tc = clock::now();
+            try {
+                InterleavedAllocation spread;
+                g_tms_counter = TmsCounter(idx, g_tms_count_shift);
+            } catch (const std::exception& e) {
+                std::cerr << "count: " << e.what() << "\n";
+                return 1;
+            }
+            count_init_s = std::chrono::duration<double>(clock::now() - tc).count();
+            std::cerr << "count: backward search table " << g_tms_counter.bytes() << " bytes, row shift "
+                      << g_tms_counter.rows().shift() << ", built in " << count_init_s << " s\n";
         }
     }
     if (oracle_mode) {
@@ -826,6 +880,7 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
     PerfCounters perf;
     double query_s = 0.0, read_s = 0.0, parse_s = 0.0, format_s = 0.0, orient_s = 0.0;
     size_t n_reads = 0, n_bases = 0, n_flipped = 0;
+    TmsCountStats count_total;
 #ifdef TMS_STATS
     TmsStats tms_total;
 #endif
@@ -865,6 +920,7 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
                 n_reads += w.reads;
                 n_bases += w.bases;
                 n_flipped += w.flipped;
+                count_total += tms_count_stats;
 #ifdef TMS_STATS
                 tms_total += tms_stats;
 #endif
@@ -934,6 +990,21 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
     else std::cerr << "stepstats: none recorded; steps are recorded with --interleave 0\n";
     ff_total.print(std::cerr);
 #endif
+    if (std::is_same_v<Index, TmsIndex> && g_tms_report == TmsReport::SMEM_ALL) {
+        // Counting's share of query_s (walk_s, search_s and list_s sum the
+        // threads' time in each phase) and what it did.
+        const TmsCountStats& c = count_total;
+        const char* method[] = {"walk", "backward", "adaptive"};
+        std::cerr << "count: method=" << method[static_cast<int>(g_tms_count.method)]
+                  << " budget=" << g_tms_count.budget << " short_len=" << g_tms_count.short_len
+                  << " smems=" << c.smems << " walked=" << c.walked << " switched=" << c.switched
+                  << " searched=" << c.searched << " walk_steps=" << c.walk_steps
+                  << " search_steps=" << c.search_steps << " top_moves=" << c.top_moves
+                  << " bot_moves=" << c.bot_moves << " scan_rows=" << c.scan_rows << " lf_ff=" << c.lf_ff
+                  << " far_ends=" << c.far_ends << " sum_rows=" << c.sum_rows << " list_steps=" << c.list_steps
+                  << " walk_s=" << c.walk_s << " search_s=" << c.search_s << " list_s=" << c.list_s
+                  << " count_init_s=" << count_init_s << "\n";
+    }
     perf.report(std::cerr, n_bases);
     // query_s sums the threads' time in queries, parse_s their time
     // parsing reads, and format_s their time formatting (and compressing)
