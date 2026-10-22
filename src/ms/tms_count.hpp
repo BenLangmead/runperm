@@ -59,8 +59,11 @@ enum class TmsCount {
 struct TmsCountOptions {
     TmsCount method = TmsCount::WALK;
     // ADAPTIVE: walk steps (up and down together) before switching to
-    // backward search.
+    // backward search, budget + budget_per_len * L for an SMEM of length L.
+    // Backward search takes L extensions, so a budget in proportion to L
+    // bounds the cost of walking first by the cost of searching.
     ulint budget = 64;
+    double budget_per_len = 0;
     // ADAPTIVE: SMEMs at most this long are backward searched without
     // walking first.
     ulint short_len = 0;

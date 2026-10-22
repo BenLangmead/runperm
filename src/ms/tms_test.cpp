@@ -1428,6 +1428,12 @@ size_t check_counting(TmsIndex& idx, const std::vector<std::string>& pats, const
             o.short_len = short_len;
             opts.push_back(o);
         }
+    o.short_len = 0;
+    for (double per_len : {0.25, 1.0}) {
+        o.budget = 2;
+        o.budget_per_len = per_len;
+        opts.push_back(o);
+    }
     const std::vector<std::vector<ulint>> none(pats.size());
     size_t compared = 0;
     for (ulint cap : {ulint(0), ulint(1), ulint(2), ulint(5), TMS_ALL_POSITIONS})

@@ -321,8 +321,9 @@ struct TmsCounting {
  * and lists their positions from the top of the interval with phi_inv; the
  * results are again the same.  BACKWARD searches every SMEM and reads no
  * toeholds, so pos may then be empty.  ADAPTIVE walks each SMEM longer than
- * opts.short_len for up to opts.budget steps and searches those whose walk
- * has not ended by then, and the shorter ones without walking.
+ * opts.short_len for up to opts.budget + opts.budget_per_len * L steps and
+ * searches those whose walk has not ended by then, and the shorter ones
+ * without walking.
  */
 inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<ulint>>& ms,
                                    const std::vector<std::vector<ulint>>& pos, ulint min_len, TmsReport report,
@@ -353,7 +354,7 @@ inline void tms_report_smems_batch(TmsIndex& idx, const std::vector<std::vector<
             if (method == TmsCount::BACKWARD || (method == TmsCount::ADAPTIVE && e.len <= counting->opts.short_len))
                 e.over = true;
             else if (method == TmsCount::ADAPTIVE)
-                e.limit = counting->opts.budget;
+                e.limit = counting->opts.budget + static_cast<ulint>(counting->opts.budget_per_len * double(e.len));
         }
     }
     st.smems += w.size();

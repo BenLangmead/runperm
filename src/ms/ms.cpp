@@ -167,9 +167,10 @@ static void usage_advanced(std::ostream& os) {
        << "                             (default) steps phi and phi_inv over all of them;\n"
        << "                             backward finds its BWT interval by backward search,\n"
        << "                             L steps for length L, and lists positions from the\n"
-       << "                             interval's top; adaptive walks at most B steps,\n"
-       << "                             then searches if the walk has not ended\n"
+       << "                             interval's top; adaptive walks at most B + A * L\n"
+       << "                             steps, then searches if the walk has not ended\n"
        << "    --count-budget B         adaptive: B (default 64)\n"
+       << "    --count-budget-per-len A adaptive: A (default 0)\n"
        << "    --count-short-len S      adaptive: search SMEMs of length at most S\n"
        << "                             without walking (default 0)\n"
        << "    --count-row-shift R      backward and adaptive sample every 2^R-th LF row\n"
@@ -269,6 +270,20 @@ static unsigned long long opt_uint(const char* name, const std::string& v) {
         used = 0;
     }
     if (used == 0 || used != v.size()) throw std::invalid_argument(std::string(name) + " needs a whole number, not '" + v + "'");
+    return x;
+}
+
+/** A nonnegative decimal option value, refusing anything else. */
+static double opt_unonneg(const char* name, const std::string& v) {
+    size_t used = 0;
+    double x = -1;
+    try {
+        if (!v.empty() && (std::isdigit(static_cast<unsigned char>(v[0])) || v[0] == '.')) x = std::stod(v, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used == 0 || used != v.size() || !(x >= 0))
+        throw std::invalid_argument(std::string(name) + " needs a nonnegative number, not '" + v + "'");
     return x;
 }
 
@@ -428,6 +443,8 @@ static int tms_query_flag(int argc, char** argv, int& i, bool with_mode = true) 
     }
     else if (opt_value(argc, argv, i, "--count-budget", v))
         g_tms_count.budget = static_cast<ulint>(opt_uint("--count-budget", v));
+    else if (opt_value(argc, argv, i, "--count-budget-per-len", v))
+        g_tms_count.budget_per_len = opt_unonneg("--count-budget-per-len", v);
     else if (opt_value(argc, argv, i, "--count-short-len", v))
         g_tms_count.short_len = static_cast<ulint>(opt_uint("--count-short-len", v));
     else if (opt_value(argc, argv, i, "--count-row-shift", v))
@@ -996,7 +1013,8 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
         const TmsCountStats& c = count_total;
         const char* method[] = {"walk", "backward", "adaptive"};
         std::cerr << "count: method=" << method[static_cast<int>(g_tms_count.method)]
-                  << " budget=" << g_tms_count.budget << " short_len=" << g_tms_count.short_len
+                  << " budget=" << g_tms_count.budget << " budget_per_len=" << g_tms_count.budget_per_len
+                  << " short_len=" << g_tms_count.short_len
                   << " smems=" << c.smems << " walked=" << c.walked << " switched=" << c.switched
                   << " searched=" << c.searched << " walk_steps=" << c.walk_steps
                   << " search_steps=" << c.search_steps << " top_moves=" << c.top_moves
