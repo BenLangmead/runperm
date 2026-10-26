@@ -72,7 +72,7 @@
  * is copied from its rows at the end of the build.  LF and phi each take their
  * own splitting parameters.
  *
- * An index is built with one of three layouts (TmsLayout), so that it holds
+ * An index is built with one of four layouts (TmsLayout), so that it holds
  * only what its queries read:
  *
  *  - full: everything above.  Built without LCP values, it holds what psi
@@ -82,6 +82,13 @@
  *  - phi: LF with the PHI columns, phi and optionally phi_inv.  LF's rows are
  *    then the split LF intervals alone, since nothing walks psi.  Enough for
  *    every query that does not walk psi.
+ *  - psi-locate: the full layout without phi's lengths-based form, which
+ *    only walks of phi read.  Enough for matching statistics with psi, with
+ *    or without positions, and both SMEM reports with every counting method.
+ *    The PHI columns stay, since positions take the toehold from them at each
+ *    reposition, and so do phi's starts-based form and phi_inv with their
+ *    LCP columns, which counting walks read.  Queries that walk phi need its
+ *    lengths-based form unless they ask for the starts-based one.
  *
  * The LF data columns a layout omits have width 0 (see Orbit's
  * permutation_impl), so they take no bits and read as 0, and the columns
@@ -141,7 +148,7 @@ enum class TmsPhiCols { PLCP, COUNT };
 enum class TmsPhiInvCols { PLCPB, COUNT };
 
 /** Which structures a TmsIndex is built with (see the file comment). */
-enum class TmsLayout { FULL, PSI, PHI };
+enum class TmsLayout { FULL, PSI, PHI, PSI_LOCATE };
 
 /**
  * Parts of a TmsIndex beyond LF, which every query reads: psi is LF's PSI
@@ -152,10 +159,14 @@ enum class TmsLayout { FULL, PSI, PHI };
 struct TmsParts {
     bool psi = false, phi = false, phi_inv = false;
     // With phi, phi's starts-based form rather than its lengths-based form.
-    // An index that holds phi holds both forms.
+    // An index that holds phi holds the starts-based form, and the
+    // lengths-based form unless its layout is psi-locate.
     bool phi_starts = false;
     // The sequence-ID table, if the index holds one.
     bool seq_ids = false;
+    // Of the parts an index holds: with phi, phi's lengths-based form.  A
+    // query needs it when it needs phi without phi_starts.
+    bool phi_len = false;
 };
 
 /**
@@ -252,7 +263,8 @@ public:
      * and the index also gets phi (and phi_inv if opts.phi_inv); this walks
      * LF over all n rows from row 0 and so needs a single terminator.
      * opts.layout says which parts to build: the psi layout takes no
-     * run_tops, and the phi layout needs them.  opts.lf_split must split.
+     * run_tops, and the phi and psi-locate layouts need them.  opts.lf_split
+     * must split.
      * lens and run_tops may be std::vectors or packed orbit::int_vectors.
      */
     template <typename Lens = std::vector<ulint>, typename Tops = std::vector<ulint>>
@@ -281,6 +293,8 @@ private:
         const bool lcp = run_tops || samples;
         if (opts.layout == TmsLayout::PSI && lcp) throw std::invalid_argument("a psi layout takes no LCP values");
         if (opts.layout == TmsLayout::PHI && !lcp) throw std::invalid_argument("a phi layout needs LCP values");
+        if (opts.layout == TmsLayout::PSI_LOCATE && (!lcp || !opts.phi_inv))
+            throw std::invalid_argument("a psi-locate layout needs LCP values and phi_inv");
         check_lf_split(opts.lf_split);
         auto phase = [&](const char* name) { if (opts.report) mem_report::phase(name, heads.size()); };
         has_psi_ = opts.layout != TmsLayout::PHI;
@@ -308,7 +322,8 @@ private:
             lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
                               : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
             phase("tms_build_phi");
-            has_phi_ = has_phi_starts_ = has_phi_len_ = true;
+            has_phi_ = has_phi_starts_ = true;
+            has_phi_len_ = opts.layout != TmsLayout::PSI_LOCATE;
             has_phi_inv_ = opts.phi_inv;
         } else if (samples) {
             // As above, without a walk: LF's encoding is needed only to find
@@ -319,7 +334,8 @@ private:
             lf_enc = has_psi_ ? Enc::lf_interval_encoding(row_heads, row_lens, orbit::NO_SPLITTING)
                               : Enc::lf_interval_encoding(heads, lens, opts.lf_split);
             phase("tms_build_phi");
-            has_phi_ = has_phi_starts_ = has_phi_len_ = true;
+            has_phi_ = has_phi_starts_ = true;
+            has_phi_len_ = opts.layout != TmsLayout::PSI_LOCATE;
             has_phi_inv_ = opts.phi_inv;
         }
         // The data columns take the widths of their largest values, and the
@@ -427,8 +443,8 @@ public:
     /**
      * Write the index as an ORBITIDX file (see index_format.hpp): a header
      * with a section per structure, then LF, with psi the F block starts, and
-     * with phi both of its forms and phi_inv if present.  Throws if the index was loaded with only
-     * some of its parts.
+     * with phi the forms of it it holds and phi_inv if present.  Throws if the
+     * index was loaded with only some of its parts.
      */
     size_t serialize(std::ostream& out) {
         if (!complete_)
@@ -436,7 +452,10 @@ public:
         using namespace orbit_idx;
         Header h;
         h.tool = Tool::TMS;
-        h.layout = has_psi_ && has_phi_ ? Layout::FULL : has_psi_ ? Layout::PSI : has_phi_ ? Layout::PHI : Layout::NONE;
+        h.layout = has_psi_ && has_phi_ ? (has_phi_len_ ? Layout::FULL : Layout::PSI_LOCATE)
+                   : has_psi_           ? Layout::PSI
+                   : has_phi_           ? Layout::PHI
+                                        : Layout::NONE;
         h.n = lf_.domain();
         h.bwt_runs = bwt_runs_;
         h.info = info_;
@@ -454,10 +473,8 @@ public:
                                 }
                             }});
         }
-        if (has_phi_) {
-            srcs.push_back(move_table_source(Section::PHI_LEN, phi_len_, PHI_LEN_COLS));
-            srcs.push_back(move_table_source(Section::PHI_START, phi_, PHI_COLS));
-        }
+        if (has_phi_len_) srcs.push_back(move_table_source(Section::PHI_LEN, phi_len_, PHI_LEN_COLS));
+        if (has_phi_starts_) srcs.push_back(move_table_source(Section::PHI_START, phi_, PHI_COLS));
         if (has_phi_inv_) srcs.push_back(move_table_source(Section::PHI_INV, phi_inv_, PHI_INV_COLS));
         if (seq_ids_) srcs.push_back(seq_ids_source(*seq_ids_));
         return write_file(out, h, srcs);
@@ -622,10 +639,10 @@ public:
      * The parts the index holds, or those loaded if load() skipped some;
      * phi_starts says whether the starts-based form of phi is present.
      */
-    TmsParts parts() const { return TmsParts{has_psi_, has_phi_, has_phi_inv_, has_phi_starts_}; }
-    /** The name of the layout with the given parts: full, psi, phi, or none (LF alone). */
+    TmsParts parts() const { return TmsParts{has_psi_, has_phi_, has_phi_inv_, has_phi_starts_, false, has_phi_len_}; }
+    /** The name of the layout with the given parts: full, psi-locate, psi, phi, or none (LF alone). */
     static std::string layout_name(const TmsParts& p) {
-        return p.psi && p.phi ? "full" : p.psi ? "psi" : p.phi ? "phi" : "none";
+        return p.psi && p.phi ? (p.phi_len ? "full" : "psi-locate") : p.psi ? "psi" : p.phi ? "phi" : "none";
     }
 
     /** True if byte c occurs in the indexed text. */
@@ -998,9 +1015,29 @@ public:
     static TmsParts held_parts(const orbit_idx::Header& h) {
         using orbit_idx::Section;
         if (h.tool != orbit_idx::Tool::TMS) throw std::runtime_error("not a tms index");
-        const bool phi = h.find(Section::PHI_LEN) && h.find(Section::PHI_START);
-        return TmsParts{h.find(Section::F_STARTS) != nullptr, phi, phi && h.find(Section::PHI_INV) != nullptr, phi};
+        TmsParts p;
+        p.psi = h.find(Section::F_STARTS) != nullptr;
+        p.phi_len = h.find(Section::PHI_LEN) != nullptr;
+        p.phi_starts = h.find(Section::PHI_START) != nullptr;
+        p.phi = p.phi_len || p.phi_starts;
+        p.phi_inv = p.phi && h.find(Section::PHI_INV) != nullptr;
+        return p;
     }
+
+    /**
+     * What an index with parts held lacks of the parts in want, or an empty
+     * string if it serves them.
+     */
+    static std::string missing_part(const TmsParts& held, const TmsParts& want) {
+        if (want.psi && !held.psi) return "psi (the PSI columns)";
+        if (want.phi && !held.phi) return "phi (phi and the PHI columns)";
+        if (want.phi && want.phi_starts && !held.phi_starts) return "phi's starts-based form (PHI_START)";
+        if (want.phi && !want.phi_starts && !held.phi_len) return "phi's lengths-based form (PHI_LEN)";
+        if (want.phi_inv && !held.phi_inv) return "phi_inv";
+        return "";
+    }
+    /** Whether an index with parts held serves a query that needs want. */
+    static bool serves(const TmsParts& held, const TmsParts& want) { return missing_part(held, want).empty(); }
     /**
      * The alphabet code of byte c in LF's character column, or no_code if c
      * does not occur; and the code of c as an F character, its F block, or
@@ -1242,7 +1279,7 @@ private:
             if (!bad.empty()) throw std::runtime_error("tms index's SEQ_IDS section does not fit it: " + bad);
         }
         complete_ = !need || (want.psi == held.psi && want.phi == held.phi && has_phi_inv_ == held.phi_inv &&
-                              (!held.phi || (has_phi_len_ && has_phi_starts_)) &&
+                              has_phi_len_ == held.phi_len && has_phi_starts_ == held.phi_starts &&
                               (seq_ids_.has_value() || !h.find(Section::SEQ_IDS)));
         info_ = h.info;
         compute_occurs();
@@ -1252,14 +1289,13 @@ private:
 
     /** Throw, naming what is missing and how to build it, if an index with parts held lacks one in want. */
     static void check_parts(const TmsParts& held, const TmsParts& want) {
-        std::string missing;
-        if (want.psi && !held.psi) missing = "psi (the PSI columns)";
-        else if (want.phi && !held.phi) missing = "phi (phi and the PHI columns)";
-        else if (want.phi_inv && !held.phi_inv) missing = "phi_inv";
-        else return;
+        const std::string missing = missing_part(held, want);
+        if (missing.empty()) return;
         // The smallest layout with every part the query needs.
-        std::string build = want.psi && want.phi ? "full" : want.psi ? "psi or full" : "phi or full";
-        if (want.phi) build += ", with --minima or --lcp-bin";
+        std::string build = want.psi && want.phi ? (want.phi_starts ? "psi-locate or full" : "full")
+                            : want.psi           ? "psi or full"
+                                                 : "phi or full";
+        if (want.phi) build += ", with --phi, --minima or --lcp-bin";
         if (want.phi_inv) build += " and without --no-phi-inv";
         throw std::runtime_error("this query needs " + missing + ", which this index (layout " + layout_name(held) +
                                  (held.phi && !held.phi_inv ? ", without phi_inv" : "") +

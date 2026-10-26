@@ -22,7 +22,7 @@ The file ends where the last section ends; `ms index-verify` checks this along w
 | 12 | u32 | endian check, 0x01020304 |
 | 16 | u32 | header bytes, 4096 |
 | 20 | u16 | tool: 1 = ms, 2 = tms |
-| 22 | u16 | layout: 0 = none (ms), 1 = full, 2 = psi, 3 = phi |
+| 22 | u16 | layout: 0 = none (ms), 1 = full, 2 = psi, 3 = phi, 4 = psi-locate |
 | 24 | u64 | n, the text length, terminators included |
 | 32 | u64 | BWT runs: maximal runs of one character in LF's rows |
 | 40 | u16 | sections |
@@ -61,6 +61,10 @@ A tms index built from a ropebwt3 FMD may hold the FMD's sequence-ID table, rope
 
 Neither changes the sections an ftab links to, so an ftab built from the index without the table serves it with the table. Earlier `ms` binaries load such an index and ignore the section.
 
+## The psi-locate layout
+
+A psi-locate index (`ms tms-build --layout psi-locate`) holds the sections of a full one but PHI_LEN, which only walks of φ read: LF with its PSI and PHI columns, F_STARTS, PHI_START, PHI_INV and SEQ_IDS if added. It serves `--mode psi` with and without `--positions`, and both SMEM reports with every `--count` method. Positions read `phi_int` at each reposition for the toehold, and counting walks read PHI_START's `plcp` and PHI_INV's `plcpb`, so these stay. Queries that walk φ's lengths-based form (`--mode phi`, `phiskip` or `dual` without `--phi-starts`) are refused. `ms index-psi-locate FULL OUT` writes one from a full index, copying every section but PHI_LEN byte for byte, so it equals a psi-locate build of the same input apart from provenance (`psi_locate_by`, `psi_locate_at`). A query loads the same sections from either layout, so a psi-locate index takes less disk but not less RAM.
+
 ## What this software loads (informative)
 
 This section describes the current `ms` binary, not the format.
@@ -81,6 +85,8 @@ This section describes the current `ms` binary, not the format.
 | `--mode oracle` or `oracle-scan` (replaying recorded repositions) | LF |
 | `--mode oracle` or `oracle-scan` with `--positions` or `--report smem-one` | LF, PHI_START |
 | `--report smem-all` | LF, PHI_START, PHI_INV, SEQ_IDS if held, plus F_STARTS outside phi and oracle modes |
+
+A psi-locate index refuses the queries in this table that load PHI_LEN.
 
 `ms index-plan INDEX` prints, for the index at hand, the sections and start tables each tms `query` command line loads and the RAM they take.
 

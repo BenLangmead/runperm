@@ -22,6 +22,12 @@
 # crosses a contig's end.
 # smem-all with --positions must be refused.  Every counting method (--count
 # walk, backward and adaptive) must give the default's output byte for byte.
+# A psi-locate index, built with tms-build --layout psi-locate and derived
+# from the full one by index-psi-locate, must be the same file apart from
+# provenance, and give the full index's output byte for byte for psi
+# matching statistics, --positions, smem-one and smem-all with every counting
+# method; matching statistics in the modes that read phi's lengths-based
+# form (phi, phi-walk, phiskip, dual, dual-walk) must be refused.
 #
 # Usage: test_rope.sh MS FMD2RLBWT TERALCP [ROPEBWT3] [WORK_DIR]
 # TERALCP must support -ophi and -ominima.
@@ -106,6 +112,48 @@ assert added[2][:-1] == plain[2] and added[0][4096:len(plain[0])] == plain[0][40
 assert added[3].startswith(plain[3]) and 'seq_ids_from=' in added[3]
 print('tms-build --seq-ids and index-add-seq-ids agree; the copied sections are unchanged')
 PYEOF
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/loc.idx" --phi "$W/ref.phi" --minima "$W/ref.min" \
+    --seq-ids "$W/ref.fmd.len.gz" --layout psi-locate >/dev/null 2>&1
+"$MS" index-psi-locate "$W/ref.idx" "$W/derived.idx" >/dev/null
+"$MS" index-verify "$W/derived.idx" >/dev/null
+python3 - "$W" <<'PYEOF'
+import struct, sys
+w = sys.argv[1]
+def parse(p):
+    b = open(p, 'rb').read()
+    ns, ni = struct.unpack_from('<H', b, 40)[0], struct.unpack_from('<H', b, 44)[0]
+    secs = [b[128 + 80 * i:128 + 80 * (i + 1)] for i in range(ns)]
+    return b, b[:44] + b[46:128], secs, b[128 + 80 * ns:128 + 80 * ns + ni].decode()
+full, loc, derived = (parse(f'{w}/{x}.idx') for x in ('ref', 'loc', 'derived'))
+assert struct.unpack_from('<H', loc[0], 22)[0] == 4, 'tms-build --layout psi-locate wrote another layout'
+assert loc[1] == derived[1] and loc[2] == derived[2] and loc[0][4096:] == derived[0][4096:], \
+    'tms-build --layout psi-locate and index-psi-locate differ'
+ids = lambda secs: [struct.unpack_from('<H', e, 0)[0] for e in secs]
+assert ids(full[2]) == [1, 2, 3, 4, 5, 7] and ids(loc[2]) == [1, 2, 4, 5, 7], 'psi-locate must drop PHI_LEN alone'
+# The kept sections' entries match the full index's but for their offsets.
+strip = lambda e: e[:8] + e[16:]
+assert [strip(e) for e in loc[2]] == [strip(e) for e in full[2] if struct.unpack_from('<H', e, 0)[0] != 3]
+assert 'psi_locate_by=' in derived[3]
+print('tms-build --layout psi-locate and index-psi-locate agree; they hold the full sections but PHI_LEN')
+PYEOF
+for q in "" "--positions" "--report smem-one"; do
+    "$MS" query "$W/ref.idx" "$W/reads.fa" $q -o "$W/full.q" 2>/dev/null
+    for x in loc derived; do
+        "$MS" query "$W/$x.idx" "$W/reads.fa" $q -o "$W/$x.q" 2>/dev/null
+        cmp -s "$W/full.q" "$W/$x.q" || { echo "psi-locate ($x) output differs for '$q'"; exit 1; }
+    done
+done
+for mode in phi phi-walk phiskip dual dual-walk; do
+    if "$MS" query "$W/loc.idx" "$W/reads.fa" --mode $mode -o "$W/bad.out" 2> "$W/bad.err"; then
+        echo "psi-locate accepted --mode $mode"; exit 1
+    fi
+    grep -q "lengths-based" "$W/bad.err" || { echo "psi-locate refused --mode $mode for another reason"; exit 1; }
+done
+"$MS" index-plan "$W/loc.idx" --mode dual | grep -q refused || { echo "index-plan did not refuse dual"; exit 1; }
+"$MS" index-plan "$W/loc.idx" --mode psi --report smem-all | grep -q "LF F_STARTS PHI_START PHI_INV SEQ_IDS" ||
+    { echo "index-plan does not load psi smem-all's sections"; exit 1; }
+if "$MS" index-psi-locate "$W/loc.idx" "$W/bad.idx" 2>/dev/null; then echo "index-psi-locate accepted a psi-locate index"; exit 1; fi
+echo "psi-locate: psi MS, --positions and smem-one equal the full index's; phi, phi-walk, phiskip, dual and dual-walk refused"
 
 for cap in 1 3 100 0; do
     for minlen in 1 20; do
@@ -123,6 +171,13 @@ for cap in 1 3 100 0; do
                 --min-smem-len "$minlen" --count "$method" ${budget:+--count-budget "$budget"} \
                 ${short:+--count-short-len "$short"} --count-row-shift 1 -o "$W/count.$cap.$minlen" 2>/dev/null
             cmp -s "$W/orbit.$cap.$minlen" "$W/count.$cap.$minlen" || { echo "--count $count differs from the default"; exit 1; }
+            for x in loc derived; do
+                "$MS" query "$W/$x.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+                    --min-smem-len "$minlen" --count "$method" ${budget:+--count-budget "$budget"} \
+                    ${short:+--count-short-len "$short"} --count-row-shift 1 -o "$W/count.$cap.$minlen" 2>/dev/null
+                cmp -s "$W/orbit.$cap.$minlen" "$W/count.$cap.$minlen" ||
+                    { echo "psi-locate ($x) --count $count differs from the full index"; exit 1; }
+            done
         done
         # Every LCE mode gives psi's output, phi and dual reading the LCP
         # summaries built from the FMD's minima.

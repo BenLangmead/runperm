@@ -19,6 +19,8 @@
 #include <set>
 #include <cassert>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -1575,6 +1577,185 @@ bool test_smem_count(const std::string& data_dir) {
     return true;
 }
 
+namespace {
+/**
+ * The SMEM_ALL listings of pats on idx, from statistics len and toeholds pos,
+ * by every counting method (walk, backward, and adaptive with several
+ * budgets), for several caps and numbers in flight, one string per listing.
+ */
+std::vector<std::string> counting_outputs(TmsIndex& idx, const std::vector<std::string>& pats,
+                                          const std::vector<std::vector<ulint>>& len,
+                                          const std::vector<std::vector<ulint>>& pos, ulint min_len) {
+    const TmsCounter ctr(idx, 2);
+    std::vector<TmsCountOptions> opts;
+    TmsCountOptions o;
+    o.method = TmsCount::WALK;
+    opts.push_back(o);
+    o.method = TmsCount::BACKWARD;
+    opts.push_back(o);
+    o.method = TmsCount::ADAPTIVE;
+    for (ulint budget : {0, 3, 20}) {
+        o.budget = budget;
+        opts.push_back(o);
+    }
+    std::vector<std::string> out;
+    for (ulint cap : {ulint(1), ulint(2), ulint(5), TMS_ALL_POSITIONS})
+        for (size_t k : {size_t(1), size_t(7), size_t(32)})
+            for (const auto& co : opts) {
+                std::vector<TmsSmemHits> hits;
+                const TmsCounting counting{co, &ctr, &pats};
+                tms_report_smems_batch(idx, len, pos, min_len, TmsReport::SMEM_ALL, k, hits, cap,
+                                       co.method == TmsCount::WALK ? nullptr : &counting);
+                std::string s;
+                for (const auto& h : hits) tms_format_smems(h, TmsReport::SMEM_ALL, s);
+                out.push_back(std::move(s));
+            }
+    return out;
+}
+
+/** Write idx as an ORBITIDX file at path. */
+void write_index(TmsIndex& idx, const std::string& path) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    idx.serialize(out);
+}
+
+/** The bytes of the file at path. */
+std::string file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+}  // namespace
+
+/**
+ * The psi-locate layout holds the full layout's LF, F block starts, phi's
+ * starts-based form and phi_inv, without phi's lengths-based form.  Its
+ * matching statistics with psi, with and without positions, and both SMEM
+ * reports, with every counting method and several caps, equal the full
+ * layout's byte for byte, packed and column access, built and loaded whole
+ * or with only a query's parts, on the fuzz texts and minishred with one
+ * terminator and on string collections whose phi comes from samples.  An
+ * index derived from a full one by dropping PHI_LEN (index-psi-locate) is
+ * the built one's file byte for byte.  Queries that walk phi's lengths-based
+ * form are refused, and a psi-locate build needs LCP values and phi_inv.
+ */
+bool test_psi_locate(const std::string& data_dir) {
+    std::cout << "Testing the psi-locate layout against the full layout" << std::endl;
+    std::mt19937 rng(67);
+    size_t compared = 0, derived = 0;
+    const auto tmp = std::filesystem::temp_directory_path() / ("tms_psi_locate_" + std::to_string(rng()));
+    std::filesystem::create_directories(tmp);
+    const std::string full_path = (tmp / "full.idx").string(), built_path = (tmp / "built.idx").string(),
+                      derived_path = (tmp / "derived.idx").string();
+    // Compare a full index with psi-locate ones built alongside it.
+    auto compare = [&](TmsIndex& full, TmsIndex& built, const std::vector<std::string>& pats, bool big) {
+        TmsIndex loc = round_trip(built);
+        assert(loc.has_psi() && loc.has_phi() && loc.has_phi_inv() && loc.has_phi_starts() && !loc.has_phi_lengths());
+        assert(TmsIndex::layout_name(loc.parts()) == "psi-locate");
+        assert(loc.lf().get_widths() == full.lf().get_widths() && loc.move_runs() == full.move_runs());
+        // Derived from the full index's file, it is the built one's file.
+        write_index(full, full_path);
+        write_index(built, built_path);
+        orbit_idx::drop_sections(full_path, derived_path, orbit_idx::section_bit(orbit_idx::Section::PHI_LEN),
+                                 orbit_idx::Layout::PSI_LOCATE, "");
+        if (file_bytes(derived_path) != file_bytes(built_path)) {
+            std::cout << "  FAILED: a derived psi-locate index differs from a built one" << std::endl;
+            assert(false && "dropping PHI_LEN from a full index must give the built psi-locate index");
+            return false;
+        }
+        const orbit_idx::Header h = orbit_idx::read_header_file(derived_path);
+        assert(h.layout == orbit_idx::Layout::PSI_LOCATE && !h.find(orbit_idx::Section::PHI_LEN));
+        ++derived;
+        for (bool positions : {false, true})
+            for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
+                const TmsParts need = tms_query_parts(TmsMode::PSI, positions, report);
+                TmsIndex part = round_trip(built, &need);
+                for (size_t k : {1, 7, 32})
+                    for (bool packed : {true, false}) {
+                        if (big && !packed && k == 7) continue;
+                        const auto want = query_output(full, pats, k, TmsMode::PSI, positions, report, packed);
+                        for (TmsIndex* x : {&built, &loc, &part}) {
+                            if (query_output(*x, pats, k, TmsMode::PSI, positions, report, packed) != want) {
+                                std::cout << "  FAILED: psi-locate output differs, k " << k << std::endl;
+                                assert(false && "a psi-locate index must answer as the full index does");
+                                return false;
+                            }
+                            ++compared;
+                        }
+                    }
+            }
+        // Every counting method and cap.
+        std::vector<std::vector<ulint>> len, pos, len2, pos2;
+        tms_query_batch(full, pats, 8, len, TmsMode::PSI, &pos);
+        tms_query_batch(loc, pats, 8, len2, TmsMode::PSI, &pos2);
+        assert(len == len2 && pos == pos2);
+        for (ulint min_len : {0, 5}) {
+            const auto want = counting_outputs(full, pats, len, pos, min_len);
+            if (counting_outputs(loc, pats, len, pos, min_len) != want) {
+                std::cout << "  FAILED: psi-locate SMEM counting differs" << std::endl;
+                assert(false && "a psi-locate index must count and list as the full index does");
+                return false;
+            }
+            compared += want.size();
+        }
+        // Refusals: queries that walk phi's lengths-based form.
+        for (TmsMode mode : {TmsMode::PHI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL, TmsMode::DUAL_WALK}) {
+            const TmsParts need = tms_query_parts(mode, false, TmsReport::MS);
+            assert(!TmsIndex::serves(loc.parts(), need));
+            assert(throws<std::runtime_error>([&] { round_trip(built, &need); }, "lengths-based form"));
+        }
+        TmsParts starts_need = tms_query_parts(TmsMode::DUAL, false, TmsReport::MS);
+        starts_need.phi_starts = true;
+        assert(TmsIndex::serves(loc.parts(), starts_need));
+        return true;
+    };
+    for (const auto& in : batch_inputs(data_dir, rng)) {
+        const bool big = in.text.size() > 5000;
+        auto pats = fuzz_patterns(in.text, rng, big ? 40 : 80);
+        for (const auto& base : {split_variants()[0], split_variants()[3]}) {
+            TmsBuildOptions o = base;
+            o.layout = TmsLayout::PSI_LOCATE;
+            TmsIndex full(in.heads, in.lens, base, &in.tops), built(in.heads, in.lens, o, &in.tops);
+            if (!compare(full, built, pats, big)) return false;
+            TmsBuildOptions no_inv = o;
+            no_inv.phi_inv = false;
+            assert(throws<std::invalid_argument>([&] { TmsIndex(in.heads, in.lens, o); }, "psi-locate"));
+            assert(throws<std::invalid_argument>([&] { TmsIndex(in.heads, in.lens, no_inv, &in.tops); }, "psi-locate"));
+        }
+    }
+    for (int k = 0; k < 8; ++k) {
+        std::vector<std::string> strings;
+        const int count = 1 + rng() % 12;
+        for (int i = 0; i < count; ++i) {
+            if (!strings.empty() && rng() % 4 == 0) {
+                strings.push_back(strings[rng() % strings.size()]);
+                continue;
+            }
+            std::string w(1 + rng() % (k % 3 == 0 ? 6 : 80), 'A');
+            for (auto& c : w) c = "ACGT"[rng() % (k % 5 == 0 ? 2 : 4)];
+            strings.push_back(w);
+        }
+        MultiText t = make_multi_text(strings);
+        std::vector<std::string> pats;
+        for (std::string q : fuzz_patterns(t.str, rng, 30)) {
+            for (auto& c : q)
+                if (c == '$') c = 'A';
+            pats.push_back(q);
+        }
+        for (TmsBuildOptions o : {split_variants()[0], split_variants()[3]}) {
+            TmsIndex full(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
+            o.layout = TmsLayout::PSI_LOCATE;
+            TmsIndex built(t.heads, t.lens, o, samples_for(t.heads, t.lens, t.sa, t.lcp));
+            if (!compare(full, built, pats, false)) return false;
+        }
+    }
+    std::filesystem::remove_all(tmp);
+    std::cout << "  " << compared << " outputs agree, " << derived << " derived files equal built ones PASSED"
+              << std::endl;
+    return true;
+}
+
 /**
  * Indexes whose phi and phi_inv come from per-run suffix array and LCP
  * samples (as TeraLCP -ophi writes them) instead of a walk of LF.  With one
@@ -2341,6 +2522,8 @@ bool run_all_tests(const std::string& data_dir) {
     test_seq_id_lookup();
     std::cout << std::endl;
     test_layouts(data_dir);
+    std::cout << std::endl;
+    test_psi_locate(data_dir);
     std::cout << std::endl;
     test_tms_oracle(data_dir);
     std::cout << std::endl;

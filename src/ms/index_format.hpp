@@ -52,7 +52,7 @@ inline constexpr size_t MAX_COLS = 12, SCALARS = 4;
 enum class Tool : uint16_t { MS = 1, TMS = 2 };
 
 /** A tms index's layout, or NONE for an ms index. */
-enum class Layout : uint16_t { NONE = 0, FULL = 1, PSI = 2, PHI = 3 };
+enum class Layout : uint16_t { NONE = 0, FULL = 1, PSI = 2, PHI = 3, PSI_LOCATE = 4 };
 
 /** Section ids.  A set of sections is a mask with bit id set for each (see section_bit). */
 enum class Section : uint16_t { LF = 1, F_STARTS = 2, PHI_LEN = 3, PHI_START = 4, PHI_INV = 5, MS_SPILL = 6, SEQ_IDS = 7 };
@@ -113,6 +113,7 @@ inline const char* layout_name(Layout l) {
         case Layout::FULL: return "full";
         case Layout::PSI: return "psi";
         case Layout::PHI: return "phi";
+        case Layout::PSI_LOCATE: return "psi-locate";
     }
     return "?";
 }
@@ -727,6 +728,15 @@ std::string rewrap_legacy(const std::string& from, const std::string& to, const 
  * failure.
  */
 void add_section(const std::string& from, const std::string& to, SectionSource& s, const std::string& info);
+
+/**
+ * Copy the index at from to to without the sections in the mask drop (see
+ * section_bit), with layout layout and info appended to the provenance.
+ * The kept sections' bytes are copied once each, in order, and checked
+ * against their CRC-32s.  Throws on failure.
+ */
+void drop_sections(const std::string& from, const std::string& to, uint32_t drop, Layout layout,
+                   const std::string& info);
 
 }  // namespace orbit_idx
 

@@ -74,7 +74,7 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      a 64-bit row count.  --lf-split sets Orbit's balancing factor for LF\n"
        << "      (positive; default: Orbit's default).  Results do not depend on it.\n"
        << "  tms-build HEADS LENS INDEX [--minima FILE | --lcp-bin FILE] [--phi FILE]\n"
-       << "            [--layout full|psi|phi] [--seq-ids FILE] [--no-phi-inv]\n"
+       << "            [--layout full|psi|phi|psi-locate] [--seq-ids FILE] [--no-phi-inv]\n"
        << "            [--lf-split FACTOR] [--phi-split FACTOR]\n"
        << "      Build a tms index.  LF and psi need no LCP input.  phi, phi_inv and\n"
        << "      the LCP summaries --mode phi and dual read (each LF row's LCP at its\n"
@@ -85,7 +85,10 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      does.  --layout keeps what some queries read: full (default) keeps\n"
        << "      everything; psi keeps LF and psi and serves only --mode psi without\n"
        << "      positions or SMEMs; phi keeps LF, phi, phi_inv and the summaries and\n"
-       << "      serves every query but --mode psi and dual.  --no-phi-inv drops\n"
+       << "      serves every query but --mode psi and dual; psi-locate keeps what\n"
+       << "      --mode psi reads with positions and SMEM reports, which is the full\n"
+       << "      layout without phi's lengths-based form, and needs LCP input and\n"
+       << "      phi_inv.  --no-phi-inv drops\n"
        << "      phi_inv, which only --report smem-all reads.  --seq-ids stores\n"
        << "      ropebwt3's sequence-ID table (the FMD's .len.gz) for smem-all.\n"
        << "      --phi-split 0 leaves phi unsplit.\n"
@@ -151,7 +154,10 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      Check every section's CRC-32 and that the file is whole.\n"
        << "  index-add-seq-ids INDEX SEQ_IDS OUT\n"
        << "      Write the tms index INDEX to OUT with the sequence-ID table SEQ_IDS\n"
-       << "      (see tms-build --seq-ids), copying its other sections unchanged.\n";
+       << "      (see tms-build --seq-ids), copying its other sections unchanged.\n"
+       << "  index-psi-locate INDEX OUT\n"
+       << "      Write the full-layout tms index INDEX to OUT as a psi-locate one\n"
+       << "      (see tms-build --layout), copying every section but PHI_LEN.\n";
     if (!advanced) os << "\nRun 'ms --help-advanced' for development and advanced options.\n";
 }
 
@@ -1386,7 +1392,8 @@ static int run_command(int argc, char** argv) {
                 if (v == "full") opts.layout = TmsLayout::FULL;
                 else if (v == "psi") opts.layout = TmsLayout::PSI;
                 else if (v == "phi") opts.layout = TmsLayout::PHI;
-                else { std::cerr << "Unknown layout: " << v << " (expected full, psi or phi)\n"; return 1; }
+                else if (v == "psi-locate") opts.layout = TmsLayout::PSI_LOCATE;
+                else { std::cerr << "Unknown layout: " << v << " (expected full, psi, phi or psi-locate)\n"; return 1; }
             }
             else if (opt_value(argc, argv, i, "--minima", v)) { minima_path = v; with_phi = true; }
             else if (opt_value(argc, argv, i, "--lcp-bin", v)) { lcp_bin_path = v; with_phi = true; }
@@ -1412,6 +1419,10 @@ static int run_command(int argc, char** argv) {
         }
         if (opts.layout == TmsLayout::PHI && !with_phi) {
             std::cerr << "--layout phi needs LCP input (--phi, --minima or --lcp-bin)\n";
+            return 1;
+        }
+        if (opts.layout == TmsLayout::PSI_LOCATE && (!with_phi || !opts.phi_inv)) {
+            std::cerr << "--layout psi-locate needs LCP input (--phi, --minima or --lcp-bin) and phi_inv\n";
             return 1;
         }
         // The sequence-ID table is read first, so that a bad one fails
@@ -1758,9 +1769,7 @@ static int run_command(int argc, char** argv) {
         // header's sections: TmsIndex::sections_for, and the start tables
         // load() builds with phi_inv.
         const TmsParts held = TmsIndex::held_parts(h);
-        auto serves = [&](const TmsParts& need) {
-            return (!need.psi || held.psi) && (!need.phi || held.phi) && (!need.phi_inv || held.phi_inv);
-        };
+        auto serves = [&](const TmsParts& need) { return TmsIndex::serves(held, need); };
         auto describe_plan = [&](const TmsParts& need) {
             std::ostringstream os;
             const uint32_t mask = TmsIndex::sections_for(need);
@@ -1894,6 +1903,27 @@ static int run_command(int argc, char** argv) {
                       << ")\n";
         } catch (const std::exception& e) {
             std::cerr << "index-add-seq-ids: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
+    if (cmd == "index-psi-locate") {
+        if (argc < 2) { std::cerr << "index-psi-locate requires INDEX and OUT\n"; return 1; }
+        try {
+            const orbit_idx::Header h = orbit_idx::read_header_file(argv[0]);
+            if (h.tool != orbit_idx::Tool::TMS || h.layout != orbit_idx::Layout::FULL)
+                throw std::runtime_error(std::string(argv[0]) + " is not a full-layout tms index");
+            if (!TmsIndex::held_parts(h).phi_inv) throw std::runtime_error(std::string(argv[0]) + " holds no phi_inv");
+            std::string info = build_info();
+            info.replace(info.find("built_by="), 9, "psi_locate_by=");
+            info.replace(info.find("built_at="), 9, "psi_locate_at=");
+            const auto t0 = std::chrono::steady_clock::now();
+            orbit_idx::drop_sections(argv[0], argv[1], orbit_idx::section_bit(orbit_idx::Section::PHI_LEN),
+                                     orbit_idx::Layout::PSI_LOCATE, info);
+            std::cout << "Wrote " << argv[1] << ": " << argv[0] << " as a psi-locate index (s="
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << ")\n";
+        } catch (const std::exception& e) {
+            std::cerr << "index-psi-locate: " << e.what() << "\n";
             return 1;
         }
         return 0;
