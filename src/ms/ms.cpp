@@ -30,6 +30,7 @@
 #include "ftab_build.hpp"
 #include "ftab_file.hpp"
 #include <zlib.h>
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -396,8 +397,16 @@ static void query_many(TmsIndex& idx, const std::vector<std::string>& p, size_t 
     RepositionOracleView view{};
     const bool replay = g_tms_mode == TmsMode::ORACLE || g_tms_mode == TmsMode::ORACLE_SCAN;
     if (replay) view = RepositionOracleView::of(g_oracle, first_read, p.size());
+#ifdef TMS_REP_LOG
+    const size_t logged = tms_rep_log.size();
+#endif
     tms_query_batch(idx, p, k, r.ms, g_tms_mode, toeholds ? &r.pos : nullptr, true, g_ftab,
                     replay ? &view : nullptr, g_record ? &r.decisions : nullptr);
+#ifdef TMS_REP_LOG
+    // The log numbers patterns within the call; number them among all the reads.
+    for (size_t e = logged; e < tms_rep_log.size(); ++e)
+        tms_rep_log[e].pattern = static_cast<uint32_t>(first_read + tms_rep_log[e].pattern);
+#endif
     if (!toeholds) r.pos.clear();
     if (!smems) return;
     const TmsCounting counting{g_tms_count, &g_tms_counter, &p};
@@ -646,7 +655,14 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
     g_record = !oracle_write_path.empty();
     // The oracle's reads are numbered across the whole input, so blocks are
     // parsed as they are read, in order, to number them.
+#ifdef TMS_REP_LOG
+    // The reposition log names reads by their number in the input, and is
+    // written to the file TMS_REP_LOG names, if it is set.
+    const char* rep_log_path = std::getenv("TMS_REP_LOG");
+    const bool number_reads = true;
+#else
     const bool number_reads = oracle_mode || g_record;
+#endif
     threads = resolve_thread_count(threads);
     // Output named *.gz is gzip-compressed, each block as a gzip member by
     // the thread that formats it; members written one after another form one
@@ -792,6 +808,9 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
     // read, until they are written in order at the end.
     std::mutex record_mu;
     std::map<size_t, RepositionOracle> recorded;
+#ifdef TMS_REP_LOG
+    std::vector<TmsRepRecord> rep_log;
+#endif
     size_t reads_numbered = 0;
     double numbering_parse_s = 0.0;
     // With --positions, a tab-separated field holds the positions (-1 for
@@ -893,6 +912,13 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
             std::lock_guard<std::mutex> lk(record_mu);
             recorded.emplace(b.first_read, std::move(part));
         }
+#ifdef TMS_REP_LOG
+        if (rep_log_path) {
+            std::lock_guard<std::mutex> lk(record_mu);
+            rep_log.insert(rep_log.end(), tms_rep_log.begin(), tms_rep_log.end());
+        }
+        tms_rep_log.clear();
+#endif
         if (oriented) {
             auto to = clock::now();
             restore_orientation(w.flips, w.r.ms, w.scratch);
@@ -993,6 +1019,24 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
         std::cerr << "oracle: reads=" << all.patterns() << " repositions=" << all.decisions.size()
                   << " bytes=" << 32 + 8 * all.patterns() + 16 * all.decisions.size() << "\n";
     }
+#ifdef TMS_REP_LOG
+    if (rep_log_path) {
+        // In read order and, within a read, in query order (right to left),
+        // so that the logs of two modes line up record for record.
+        std::sort(rep_log.begin(), rep_log.end(), [](const TmsRepRecord& a, const TmsRepRecord& b) {
+            return a.pattern != b.pattern ? a.pattern < b.pattern : a.at > b.at;
+        });
+        std::ofstream lout(rep_log_path, std::ios::binary);
+        lout.write(reinterpret_cast<const char*>(rep_log.data()),
+                   static_cast<std::streamsize>(rep_log.size() * sizeof(TmsRepRecord)));
+        if (!lout.good()) {
+            std::cerr << "query: failed to write the reposition log " << rep_log_path << "\n";
+            return 1;
+        }
+        std::cerr << "replog: repositions=" << rep_log.size() << " bytes=" << rep_log.size() * sizeof(TmsRepRecord)
+                  << " path=" << rep_log_path << "\n";
+    }
+#endif
 #ifdef TMS_STATS
     {
         const TmsStats& tms_stats = tms_total;

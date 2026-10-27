@@ -74,6 +74,29 @@ inline thread_local TmsStats tms_stats;
 #error "MS_STEP_STATS reads the TMS_STATS counters"
 #endif
 
+#ifdef TMS_REP_LOG
+/**
+ * One reposition of the batched engine, logged when it chooses a candidate:
+ * which pattern and character, the cap and the chosen LCE, the BWT distance to
+ * the nearer candidate, the chosen interval, and the psi and phi steps its LCE
+ * walks took on both sides in this mode.  Every mode chooses the same
+ * candidates, so the logs of two modes on the same patterns hold the same
+ * repositions, and only their step counts differ.
+ */
+struct TmsRepRecord {
+    uint32_t pattern;   // index among the patterns of the call (ms.cpp makes it a read number)
+    uint32_t at;        // the mismatched character, pat[at]
+    uint64_t cap, lce;  // the match length before the reposition, and the LCE chosen
+    uint64_t dist;      // rows from the current row to the nearer candidate's
+    uint64_t interval;  // the chosen candidate's LF interval
+    uint64_t scan;      // LF rows read by the candidate scans
+    uint64_t psi, phi;  // LCE walk steps
+};
+static_assert(sizeof(TmsRepRecord) == 64, "TmsRepRecord is written as 64 bytes");
+// Each query thread appends to its own log; ms.cpp collects them.
+inline thread_local std::vector<TmsRepRecord> tms_rep_log;
+#endif
+
 /**
  * Number of leading characters of pat[0 .. m) that the suffix at psi point q
  * shares, capped at cap.  At most cap - 1 psi steps.
@@ -277,6 +300,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         // DUALSUM: the summaries' upper bound on the capped LCE, where a psi walk stops.
         ulint bound = std::numeric_limits<ulint>::max();
         bool psi_on, phi_on, done, lost;
+#ifdef TMS_REP_LOG
+        ulint n_psi, n_phi;  // walk steps taken
+#endif
         bool active() const { return !done && !lost; }
     };
     using OracleSlot = std::conditional_t<
@@ -307,6 +333,10 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         Side up, down;
 #ifdef MS_STEP_STATS
         size_t m;         // the pattern's length
+#endif
+#ifdef TMS_REP_LOG
+        size_t j;         // the pattern's index
+        ulint rep_dist, rep_scan;
 #endif
     };
     // LF rows prefetched on each side of the current row before a
@@ -359,6 +389,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                 s.orc_end = replay->decisions + replay->offsets[j + 1];
             }
             if constexpr (Record) s.rec = &(*record)[j];
+#ifdef TMS_REP_LOG
+            s.j = j;
+#endif
             s.pat = patterns[j].data();
             s.ms = out_len[j].data();
             if constexpr (Positions) s.ms_pos = (*out_pos)[j].data();
@@ -427,6 +460,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     auto step_side = [&](Side& x, const char* rest, ulint cap) {
         if (PsiWalks && x.psi_on) {
             TMS_COUNT(psi_steps, 1);
+#ifdef TMS_REP_LOG
+            ++x.n_psi;
+#endif
             uchar ch;
             const FLPos next = acc.psi_step(x.q, ch);
             if (ch == fl_sym[static_cast<uchar>(rest[x.psi_lce])] && ++x.psi_lce < (DualSum ? std::min(cap, x.bound) : cap)) {
@@ -441,6 +477,9 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         }
         if (PhiWalks && x.phi_on) {
             TMS_COUNT(phi_steps, 1);
+#ifdef TMS_REP_LOG
+            ++x.n_phi;
+#endif
             const PhiPos p = idx.finish_phi(x.p);
             MS_FF((PhiStarts ? FF_PHI_STARTS : FF_PHI_LEN), p.interval - x.p.interval);
             x.phi_min = std::min(x.phi_min, idx.plcp(p));
@@ -674,6 +713,10 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     } else {
                         TMS_COUNT(dist, std::min(found_up ? dist_up : INF, found_down ? dist_down : INF));
                         TMS_COUNT(dist1, (found_up && dist_up == 1) || (found_down && dist_down == 1));
+#ifdef TMS_REP_LOG
+                        s.rep_dist = std::min(found_up ? dist_up : INF, found_down ? dist_down : INF);
+                        s.rep_scan = s.d - s.u;
+#endif
                         s.up = Side{};
                         s.down = Side{};
                         s.up.lost = !found_up;
@@ -801,6 +844,14 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                 if (!chosen_now && !s.up.active() && !s.down.active()) {
                     TMS_COUNT(lce, std::max(s.up.done ? s.up.value : 0, s.down.done ? s.down.value : 0));
                     TMS_COUNT(lce_capped, (s.up.done && s.up.value == cap) || (s.down.done && s.down.value == cap));
+#ifdef TMS_REP_LOG
+                    const bool rep_up = s.up.done && (s.down.lost || s.up.value >= s.down.value);
+                    if constexpr (!Replay)
+                        tms_rep_log.push_back(TmsRepRecord{
+                            static_cast<uint32_t>(s.j), static_cast<uint32_t>(s.i - 1), cap,
+                            rep_up ? s.up.value : s.down.value, s.rep_dist, rep_up ? s.u : s.d, s.rep_scan,
+                            s.up.n_psi + s.down.n_psi, s.up.n_phi + s.down.n_phi});
+#endif
                     LFPos from{};
                     if (s.up.done && (s.down.lost || s.up.value >= s.down.value)) {
                         from.interval = s.u + 1;

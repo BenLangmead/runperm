@@ -32,6 +32,12 @@ ms-stats: $(MS_SRCS) $(MS_HDRS)
 ms-steps: $(MS_SRCS) $(MS_HDRS)
 	$(CXX) $(CXXFLAGS) -DNDEBUG -DMS_STATS -DTMS_STATS -DMS_STEP_STATS -o ms-steps $(MS_SRCS) -lz
 
+# Counting build (as ms-stats with TMS_STATS) that also logs every tms
+# reposition's LCE walk steps to the file named by the environment variable
+# TMS_REP_LOG (see TmsRepRecord), as ms-replog.
+ms-replog: $(MS_SRCS) $(MS_HDRS)
+	$(CXX) $(CXXFLAGS) -DNDEBUG -DMS_STATS -DTMS_STATS -DTMS_REP_LOG -o ms-replog $(MS_SRCS) -lz
+
 # Debug build: -O0 -g for breakpoints (e.g. lldb ./ms, then run test ../../data)
 debug: CXXFLAGS += -O0 -g
 debug: ms
@@ -83,4 +89,4 @@ tools/fmd2rlbwt/fmd2rlbwt:
 all: ms
 
 clean:
-	rm -f ms ms-bench ms-stats ms-steps tms_chain_bench read_chunks_test
+	rm -f ms ms-bench ms-stats ms-steps ms-replog tms_chain_bench read_chunks_test
