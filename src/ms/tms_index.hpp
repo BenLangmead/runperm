@@ -38,7 +38,7 @@
  *    rows its scan has already read.
  *  - Optionally, with phi, two LCP summary columns per LF row (see
  *    TmsLcpSummary): TOP_LCP, the LCP of the row's head with the row above,
- *    and INT_MIN, the least LCP of the row's other rows.  They let a phi
+ *    and INTERIOR_MIN, the least LCP of the row's other rows.  They let a phi
  *    reposition (--mode phisum) take whole rows' minima from the rows its
  *    scan reads, walking phi only over the current row.
  *  - With psi, a table of F block starts.  An F block starts at a row start
@@ -136,7 +136,7 @@ using ulint = orbit::ulint;
 #define TMS_ALWAYS_INLINE inline
 #endif
 
-enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, TOP_LCP, INT_MIN, COUNT };
+enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, TOP_LCP, INTERIOR_MIN, COUNT };
 enum class TmsPhiCols { PLCP, COUNT };
 enum class TmsPhiInvCols { PLCPB, COUNT };
 
@@ -353,7 +353,7 @@ private:
                 max_int = std::max<ulint>(max_int, sum->int_min[k]);
             }
             widths[col(TmsLFCols::TOP_LCP)] = std::max<uchar>(1, orbit::bit_width(max_top));
-            widths[col(TmsLFCols::INT_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
+            widths[col(TmsLFCols::INTERIOR_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
         }
         lf_ = LF(lf_enc, widths, LF::in_place_data);
         lf_enc = Enc();
@@ -372,7 +372,7 @@ private:
         if (const TmsLcpSummary* sum = opts.lcp_summary) {
             for (size_t k = 0; k < sum->top.size(); ++k) {
                 lf_.template set_data<TmsLFCols::TOP_LCP>(k, sum->top[k]);
-                lf_.template set_data<TmsLFCols::INT_MIN>(k, sum->int_min[k]);
+                lf_.template set_data<TmsLFCols::INTERIOR_MIN>(k, sum->int_min[k]);
             }
         }
         phase("tms_assemble");
@@ -557,7 +557,7 @@ public:
     bool has_lcp_summary() const { return lf_.get_widths()[LF::template data_column<TmsLFCols::TOP_LCP>()] > 0; }
     /** The LCP summaries of LF row k: the LCP at its head row, and the least of its other rows'. */
     ulint top_lcp(ulint k) const { return lf_.template get<TmsLFCols::TOP_LCP>(k); }
-    ulint int_min(ulint k) const { return lf_.template get<TmsLFCols::INT_MIN>(k); }
+    ulint int_min(ulint k) const { return lf_.template get<TmsLFCols::INTERIOR_MIN>(k); }
 
     /** The lengths of LF's rows, in row order: those that lf_row_lengths gave the build. */
     orbit::int_vector row_lengths() const {
@@ -603,11 +603,11 @@ public:
         const auto& all = lf_.get_widths();
         for (size_t c = 0; c < widths.size(); ++c) widths[c] = all[all.size() - widths.size() + c];
         widths[col(TmsLFCols::TOP_LCP)] = std::max<uchar>(1, orbit::bit_width(max_top));
-        widths[col(TmsLFCols::INT_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
+        widths[col(TmsLFCols::INTERIOR_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
         lf_.set_data_widths(widths);
         for (size_t k = 0; k < sum.top.size(); ++k) {
             lf_.template set_data<TmsLFCols::TOP_LCP>(k, sum.top[k]);
-            lf_.template set_data<TmsLFCols::INT_MIN>(k, sum.int_min[k]);
+            lf_.template set_data<TmsLFCols::INTERIOR_MIN>(k, sum.int_min[k]);
         }
     }
 
@@ -1032,7 +1032,7 @@ public:
         static constexpr size_t psi_int_col = LF::template data_column<TmsLFCols::PSI_INT>();
         static constexpr size_t psi_off_col = LF::template data_column<TmsLFCols::PSI_OFF>();
         static constexpr size_t top_lcp_col = LF::template data_column<TmsLFCols::TOP_LCP>();
-        static constexpr size_t int_min_col = LF::template data_column<TmsLFCols::INT_MIN>();
+        static constexpr size_t int_min_col = LF::template data_column<TmsLFCols::INTERIOR_MIN>();
         static_assert(ptr_col < off_col && chr_col < psi_int_col && psi_int_col < psi_off_col, "unexpected LF column order");
         LFRows lf;
         // The first row of F blocks 1 to F_BLOCKS, or a value past every row.
@@ -1175,8 +1175,8 @@ private:
     using Col = orbit_idx::Col;
     static constexpr std::array<Col, 10> LF_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::CHARACTER,
                                                  Col::PSI_INT, Col::PSI_OFF, Col::PHI_INT, Col::PHI_OFF,
-                                                 Col::TOP_LCP, Col::INT_MIN};
-    // LF's last columns, TOP_LCP and INT_MIN, are written only with
+                                                 Col::TOP_LCP, Col::INTERIOR_MIN};
+    // LF's last columns, TOP_LCP and INTERIOR_MIN, are written only with
     // summaries, so an index without them has the LF section of a build
     // that predates them, and such a section loads with them at width 0.
     static constexpr size_t SUMMARY_COLS = 2;

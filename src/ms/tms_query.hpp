@@ -205,11 +205,11 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * do not depend on the mode or on k.
  *
  * PHISUM splits each phi LCE into whole LF rows and the current row's part.
- * The scan takes the minimum of the TOP_LCP and INT_MIN summaries (see
+ * The scan takes the minimum of the TOP_LCP and INTERIOR_MIN summaries (see
  * TmsLcpSummary) of the rows it crosses, and the candidate row's TOP_LCP on
  * the succ side, the current row's on the pred side.  That minimum, capped,
  * bounds the side's LCE from above, and its minimum with the current row's
- * INT_MIN bounds it from below.  A side whose bounds agree is done without
+ * INTERIOR_MIN bounds it from below.  A side whose bounds agree is done without
  * walking; otherwise it walks phi over the current row's part alone, with
  * its minimum starting at the upper bound and stopping once it reaches the
  * lower one.  pred walks up from the toehold to below the current row's
@@ -296,7 +296,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint lo, hi;     // the LF rows prefetched for the scans
         ulint dist_up, dist_down;  // rows from the current row to u's tail and d's head
         bool found_up, found_down, scanned_up, scanned_down;
-        // PHISUM: the current row's TOP_LCP, INT_MIN and character code, and
+        // PHISUM: the current row's TOP_LCP, INTERIOR_MIN and character code, and
         // its rows below the current one; the summaries' minima over the
         // rows the scans crossed and succ's TOP_LCP; and the first row below
         // the current one that starts a BWT run, once found, with the rows
