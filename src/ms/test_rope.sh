@@ -24,7 +24,7 @@
 # walk, backward and adaptive) must give the default's output byte for byte.
 #
 # Usage: test_rope.sh MS FMD2RLBWT TERALCP [ROPEBWT3] [WORK_DIR]
-# TERALCP must support -ophi.
+# TERALCP must support -ophi and -ominima.
 set -euo pipefail
 MS=$1
 FMD2RLBWT=$2
@@ -82,9 +82,9 @@ EOF
 "$RB3" build -d -o "$W/ref.fmd" "$W/ref.fa" 2>/dev/null
 "$RB3" ssa -o "$W/ref.fmd.ssa" "$W/ref.fmd" 2>/dev/null
 "$FMD2RLBWT" "$W/ref.fmd" "$W/ref" >/dev/null
-"$TERALCP" -f fmd -i "$W/ref.fmd" -ophi "$W/ref.phi" -t "$W/teralcp.tmp" -v quiet
-"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/plain.idx" --phi "$W/ref.phi" >/dev/null 2>&1
-"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/ref.idx" --phi "$W/ref.phi" \
+"$TERALCP" -f fmd -i "$W/ref.fmd" -ophi "$W/ref.phi" -ominima "$W/ref.min" -t "$W/teralcp.tmp" -v quiet
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/plain.idx" --phi "$W/ref.phi" --minima "$W/ref.min" >/dev/null 2>&1
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/ref.idx" --phi "$W/ref.phi" --minima "$W/ref.min" \
     --seq-ids "$W/ref.fmd.len.gz" >/dev/null 2>&1
 "$MS" index-add-seq-ids "$W/plain.idx" "$W/ref.fmd.len.gz" "$W/added.idx" >/dev/null
 "$MS" index-verify "$W/added.idx" >/dev/null
@@ -123,6 +123,13 @@ for cap in 1 3 100 0; do
                 --min-smem-len "$minlen" --count "$method" ${budget:+--count-budget "$budget"} \
                 ${short:+--count-short-len "$short"} --count-row-shift 1 -o "$W/count.$cap.$minlen" 2>/dev/null
             cmp -s "$W/orbit.$cap.$minlen" "$W/count.$cap.$minlen" || { echo "--count $count differs from the default"; exit 1; }
+        done
+        # Every LCE mode gives psi's output, phi and dual reading the LCP
+        # summaries built from the FMD's minima.
+        for mode in phi dual phi-walk dual-walk; do
+            "$MS" query "$W/ref.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
+                --min-smem-len "$minlen" --mode "$mode" -o "$W/mode.$cap.$minlen" 2>/dev/null
+            cmp -s "$W/orbit.$cap.$minlen" "$W/mode.$cap.$minlen" || { echo "--mode $mode differs from psi"; exit 1; }
         done
         "$MS" query "$W/plain.idx" "$W/reads.fa" --report smem-all --max-smem-positions "$cap" \
             --min-smem-len "$minlen" -o "$W/raw.$cap.$minlen" 2>/dev/null
@@ -195,7 +202,7 @@ done
 # A table for another text is refused when it is stored.
 for cmd in build add; do
     if [ $cmd = build ]; then
-        run=("$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" --seq-ids "$W/short.len.gz")
+        run=("$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" --minima "$W/ref.min" --seq-ids "$W/short.len.gz")
     else
         run=("$MS" index-add-seq-ids "$W/plain.idx" "$W/short.len.gz" "$W/bad.idx")
     fi
@@ -203,7 +210,7 @@ for cmd in build add; do
     echo "$cmd refused short.len.gz: $(tail -1 "$W/bad.err" | sed "s|$W/||g")"
 done
 # tms-build counts the text's strings, which the header does not give.
-if "$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" \
+if "$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/bad.idx" --phi "$W/ref.phi" --minima "$W/ref.min" \
     --seq-ids "$W/merged.len.gz" > "$W/bad.err" 2>&1; then
     echo "tms-build accepted a table with a string count other than the text's"; exit 1
 fi
@@ -211,7 +218,7 @@ grep -q strings "$W/bad.err" || { echo "the merged table was not refused for its
 echo "build refused merged.len.gz: $(tail -1 "$W/bad.err" | sed "s|$W/||g")"
 # A table that fits the text's length and string count but splits it
 # elsewhere is stored, and query fails when a match crosses an end.
-"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/shifted.idx" --phi "$W/ref.phi" \
+"$MS" tms-build "$W/ref.bwt.heads" "$W/ref.bwt.len" "$W/shifted.idx" --phi "$W/ref.phi" --minima "$W/ref.min" \
     --seq-ids "$W/shifted.len.gz" >/dev/null 2>&1
 if "$MS" query "$W/shifted.idx" "$W/reads.fa" --report smem-all --max-smem-positions 3 \
     -o "$W/bad.out" 2> "$W/bad.err"; then
