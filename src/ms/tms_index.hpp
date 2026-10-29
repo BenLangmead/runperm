@@ -36,6 +36,11 @@
  *    The phi point of a tail row is one phi step from the next row's head's
  *    phi point, so a reposition reads both candidates' start points from
  *    rows its scan has already read.
+ *  - Optionally, with phi, two LCP summary columns per LF row (see
+ *    TmsLcpSummary): TOP_LCP, the LCP of the row's head with the row above,
+ *    and INT_MIN, the least LCP of the row's other rows.  They let a phi
+ *    reposition (--mode phisum) take whole rows' minima from the rows its
+ *    scan reads, walking phi only over the current row.
  *  - With psi, a table of F block starts.  An F block starts at a row start
  *    (the image of the first run of its character), so a row's F character
  *    is the block its index falls in.
@@ -131,7 +136,7 @@ using ulint = orbit::ulint;
 #define TMS_ALWAYS_INLINE inline
 #endif
 
-enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, COUNT };
+enum class TmsLFCols { PSI_INT, PSI_OFF, PHI_INT, PHI_OFF, TOP_LCP, INT_MIN, COUNT };
 enum class TmsPhiCols { PLCP, COUNT };
 enum class TmsPhiInvCols { PLCPB, COUNT };
 
@@ -180,6 +185,22 @@ struct TmsPhiSamples {
     }
 };
 
+/**
+ * LCP summaries of each LF row R of a TmsIndex, in row order: top[R] is the
+ * LCP at R's head row and int_min[R] the least LCP of its other rows, or a
+ * value at least every LCP in the index if R has one row.  They come from
+ * each run's retained LCP pairs (as a TeraLCP minima file holds them), cut
+ * into the LF rows as ms's build cuts them (ms_build::row_summaries), so a
+ * row inside a run gets the top max(u, d) of apply_lf_splitting and an
+ * interior minimum over the pairs it keeps.  Every value is an LCP inside a
+ * reposition's range or at least that range's minimum, and the range's
+ * minimum is among them or the LCPs the walk reads, so the minima a
+ * reposition takes are exact.
+ */
+struct TmsLcpSummary {
+    orbit::int_vector top, int_min;
+};
+
 /** Splitting parameters for each move structure of a TmsIndex. */
 struct TmsBuildOptions {
     // LF and phi are walked one dependent step at a time, so balancing them
@@ -191,6 +212,9 @@ struct TmsBuildOptions {
     // Build phi_inv along with phi (same splitting as phi).
     bool phi_inv = true;
     TmsLayout layout = TmsLayout::FULL;
+    // With phi, the LCP summary columns' values, one per LF row (see
+    // lf_row_lengths); null builds the index without them.
+    const TmsLcpSummary* lcp_summary = nullptr;
     // Print memory at the phase boundaries of the build (see mem_report).
     bool report = false;
 };
@@ -301,7 +325,7 @@ private:
         // The data columns take the widths of their largest values, and the
         // columns of parts the index lacks take no bits and read as 0.  LF is
         // built with them and its data written in place.
-        std::array<uchar, 4> widths{};
+        std::array<uchar, static_cast<size_t>(TmsLFCols::COUNT)> widths{};
         if (has_psi_) {
             ulint max_int = 0, max_off = 0;
             fill_psi(row_heads, [&](ulint i) { return lf_enc.get_length(i); }, [&](ulint, ulint to, ulint off) {
@@ -318,6 +342,19 @@ private:
             // Every phi point read has offset 0, so PHI_OFF takes no bits.
             widths[col(TmsLFCols::PHI_OFF)] = 0;
         }
+        if (const TmsLcpSummary* sum = opts.lcp_summary) {
+            if (!has_phi_) throw std::invalid_argument("LCP summaries need an index with phi");
+            if (sum->top.size() != lf_enc.intervals() || sum->int_min.size() != lf_enc.intervals())
+                throw std::invalid_argument("LCP summaries must have one value per LF row");
+            // At least one bit each, so that a loaded index can tell it has them.
+            ulint max_top = 0, max_int = 0;
+            for (size_t k = 0; k < sum->top.size(); ++k) {
+                max_top = std::max<ulint>(max_top, sum->top[k]);
+                max_int = std::max<ulint>(max_int, sum->int_min[k]);
+            }
+            widths[col(TmsLFCols::TOP_LCP)] = std::max<uchar>(1, orbit::bit_width(max_top));
+            widths[col(TmsLFCols::INT_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
+        }
         lf_ = LF(lf_enc, widths, LF::in_place_data);
         lf_enc = Enc();
         row_lens = orbit::int_vector();
@@ -332,6 +369,12 @@ private:
             for (size_t k = 0; k < phi_cols.size(); ++k) lf_.template set_data<TmsLFCols::PHI_INT>(k, phi_cols.get<0>(k));
             phi_cols = orbit::packed_matrix<1>();
         }
+        if (const TmsLcpSummary* sum = opts.lcp_summary) {
+            for (size_t k = 0; k < sum->top.size(); ++k) {
+                lf_.template set_data<TmsLFCols::TOP_LCP>(k, sum->top[k]);
+                lf_.template set_data<TmsLFCols::INT_MIN>(k, sum->int_min[k]);
+            }
+        }
         phase("tms_assemble");
         if (has_phi_len_) {
             // phi's lengths-based form comes from the finished starts-based
@@ -344,6 +387,31 @@ private:
     }
 
 public:
+
+    /**
+     * The lengths of the LF rows that an index built with heads, lens and
+     * opts has, in row order: the union rows with psi, else LF's split
+     * intervals.  An LCP summary (TmsBuildOptions::lcp_summary) has one value
+     * per row.
+     */
+    template <typename Lens>
+    static orbit::int_vector lf_row_lengths(const std::vector<uchar>& heads, const Lens& lens,
+                                            const TmsBuildOptions& opts) {
+        check_lf_split(opts.lf_split);
+        if (opts.layout != TmsLayout::PHI) {
+            std::vector<uchar> row_heads;
+            orbit::int_vector row_lens;
+            union_rows(heads, lens, opts.lf_split, row_heads, row_lens);
+            return row_lens;
+        }
+        using Enc = orbit::rlbwt::rlbwt_interval_encoding<ms_alpha::alphabet>;
+        const Enc enc = Enc::lf_interval_encoding(heads, lens, opts.lf_split);
+        ulint max_len = 0;
+        for (ulint k = 0; k < enc.intervals(); ++k) max_len = std::max(max_len, enc.get_length(k));
+        orbit::int_vector rows(enc.intervals(), orbit::bit_width(max_len));
+        for (ulint k = 0; k < enc.intervals(); ++k) rows.set(k, enc.get_length(k));
+        return rows;
+    }
 
     /**
      * Throw unless sp splits LF: TmsIndex's LF is always split, with length
@@ -485,6 +553,11 @@ public:
     bool has_psi() const { return has_psi_; }
     bool has_phi() const { return has_phi_; }
     bool has_phi_inv() const { return has_phi_inv_; }
+    /** Whether LF holds the LCP summary columns (see TmsLcpSummary). */
+    bool has_lcp_summary() const { return lf_.get_widths()[LF::template data_column<TmsLFCols::TOP_LCP>()] > 0; }
+    /** The LCP summaries of LF row k: the LCP at its head row, and the least of its other rows'. */
+    ulint top_lcp(ulint k) const { return lf_.template get<TmsLFCols::TOP_LCP>(k); }
+    ulint int_min(ulint k) const { return lf_.template get<TmsLFCols::INT_MIN>(k); }
     /** Whether phi's starts-based form, and its lengths-based form, are present. */
     bool has_phi_starts() const { return has_phi_starts_; }
     bool has_phi_lengths() const { return has_phi_len_; }
@@ -901,6 +974,8 @@ public:
         static constexpr size_t chr_col = LF::character_column();
         static constexpr size_t psi_int_col = LF::template data_column<TmsLFCols::PSI_INT>();
         static constexpr size_t psi_off_col = LF::template data_column<TmsLFCols::PSI_OFF>();
+        static constexpr size_t top_lcp_col = LF::template data_column<TmsLFCols::TOP_LCP>();
+        static constexpr size_t int_min_col = LF::template data_column<TmsLFCols::INT_MIN>();
         static_assert(ptr_col < off_col && chr_col < psi_int_col && psi_int_col < psi_off_col, "unexpected LF column order");
         LFRows lf;
         // The first row of F blocks 1 to F_BLOCKS, or a value past every row.
@@ -913,6 +988,8 @@ public:
         Row row(ulint i) const { return lf.row_start(i); }
         ulint length(Row r) const { return lf.template get_at<len_col>(r); }
         uchar code(Row r) const { return static_cast<uchar>(lf.template get_at<chr_col>(r)); }
+        ulint top_lcp(Row r) const { return lf.template get_at<top_lcp_col>(r); }
+        ulint int_min(Row r) const { return lf.template get_at<int_min_col>(r); }
         /** Resolve an LF position whose offset may run past its interval's end; returns its row. */
         Row resolve_LF(LFPos& p) const {
 #ifdef MS_STEP_STATS
@@ -984,6 +1061,8 @@ public:
         Row row(ulint i) const { return i; }
         ulint length(Row i) const { return idx->get_length(i); }
         uchar code(Row i) const { return idx->get_character(i); }
+        ulint top_lcp(Row i) const { return idx->top_lcp(i); }
+        ulint int_min(Row i) const { return idx->int_min(i); }
         Row resolve_LF(LFPos& p) const {
             p = idx->finish_LF(p);
             return p.interval;
@@ -1006,7 +1085,7 @@ public:
            << "\n";
         const auto& w = lf_.get_widths();
         os << "LF: intervals=" << lf_.intervals() << " runs=" << bwt_runs_ << " n=" << lf_.domain()
-           << " widths(len,ptr,off,chr,psi_int,psi_off,phi_int,phi_off)=";
+           << " widths(len,ptr,off,chr,psi_int,psi_off,phi_int,phi_off,top_lcp,int_min)=";
         widths(w);
         os << " row_bits=" << row_bits(w) << "\n";
         double total = double(row_bits(w)) * lf_.intervals();
@@ -1037,8 +1116,9 @@ public:
 private:
     // Each structure's column codes, in the order its rows hold them.
     using Col = orbit_idx::Col;
-    static constexpr std::array<Col, 8> LF_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::CHARACTER,
-                                                Col::PSI_INT, Col::PSI_OFF, Col::PHI_INT, Col::PHI_OFF};
+    static constexpr std::array<Col, 10> LF_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::CHARACTER,
+                                                 Col::PSI_INT, Col::PSI_OFF, Col::PHI_INT, Col::PHI_OFF,
+                                                 Col::TOP_LCP, Col::INT_MIN};
     static constexpr std::array<Col, 4> PHI_LEN_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::PLCP};
     static constexpr std::array<Col, 4> PHI_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCP};
     static constexpr std::array<Col, 4> PHI_INV_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCPB};

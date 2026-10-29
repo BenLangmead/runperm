@@ -159,6 +159,37 @@ inline void for_each_row(const Lens& lens, const orbit::int_vector& rows, bool m
     if (k != rows.size()) throw std::logic_error("LF split rows do not match the runs");
 }
 
+/**
+ * Each row's LCP summary for a tms index (see TmsLcpSummary), with the rows
+ * cut from the runs as for_each_row cuts them, minima only: the row's top,
+ * and the least value of its other retained pairs, or the greatest value of
+ * any row if it has none.  The source is read twice, the first time for the
+ * columns' widths.  Returns the tops and the interior minima, packed.
+ */
+template <typename Lens, typename Source>
+inline std::pair<orbit::int_vector, orbit::int_vector> row_summaries(const Lens& lens, const orbit::int_vector& rows,
+                                                                     Source&& source) {
+    auto interior_min = [](const RunLcpPairs& p) {
+        ulint m = LCP_GAP;
+        for (size_t j = 1; j < p.size(); ++j) m = std::min(m, p[j].second);
+        return m;
+    };
+    ulint max_value = 0;
+    for_each_row(lens, rows, true, source, [&](size_t, size_t, const RunLcpPairs& p) {
+        max_value = std::max(max_value, p[0].second);
+        if (const ulint m = interior_min(p); m != LCP_GAP) max_value = std::max(max_value, m);
+    });
+    const uchar w = std::max<uchar>(1, orbit::bit_width(max_value));
+    std::pair<orbit::int_vector, orbit::int_vector> out{orbit::int_vector(rows.size(), w),
+                                                        orbit::int_vector(rows.size(), w)};
+    for_each_row(lens, rows, true, source, [&](size_t i, size_t, const RunLcpPairs& p) {
+        const ulint m = interior_min(p);
+        out.first.set(i, p[0].second);
+        out.second.set(i, m == LCP_GAP ? max_value : m);
+    });
+    return out;
+}
+
 /** A row's top and min-sub LCP values, as build_spill_data_from_pairs computes them. */
 inline std::pair<ulint, ulint> top_and_sub(const RunLcpPairs& pairs) {
     if (pairs.size() == 1) return {pairs[0].second, 0};

@@ -68,6 +68,7 @@ enum class Kind : uint16_t {
 enum class Col : uint8_t {
     LENGTH = 1, START = 2, POINTER = 3, OFFSET = 4, CHARACTER = 5,
     PSI_INT = 16, PSI_OFF = 17, PHI_INT = 18, PHI_OFF = 19, PLCP = 20, PLCPB = 21,
+    TOP_LCP = 22, INT_MIN = 23,
     LCP_TOP = 32, LCP_MIN_SUB = 33, LCP_SPILL = 34,
 };
 
@@ -97,6 +98,8 @@ inline const char* col_name(uint8_t c) {
         case Col::PHI_OFF: return "phi_off";
         case Col::PLCP: return "plcp";
         case Col::PLCPB: return "plcpb";
+        case Col::TOP_LCP: return "top_lcp";
+        case Col::INT_MIN: return "int_min";
         case Col::LCP_TOP: return "lcp_top";
         case Col::LCP_MIN_SUB: return "lcp_min_sub";
         case Col::LCP_SPILL: return "lcp_spill";

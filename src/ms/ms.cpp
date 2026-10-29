@@ -74,7 +74,7 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      (positive; default: Orbit's default).  Results do not depend on it.\n"
        << "  tms-build HEADS LENS INDEX [--phi FILE | --minima FILE | --lcp-bin FILE]\n"
        << "            [--layout full|psi|phi] [--seq-ids FILE] [--no-phi-inv]\n"
-       << "            [--lf-split FACTOR] [--phi-split FACTOR]\n"
+       << "            [--lf-split FACTOR] [--phi-split FACTOR] [--lcp-summary]\n"
        << "      Build a tms index.  LF and psi need no LCP input; phi and phi_inv\n"
        << "      need one of --phi (a TeraLCP -ophi file, which allows one terminator\n"
        << "      per string, as in an FMD), --minima or --lcp-bin (which need one\n"
@@ -84,7 +84,9 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      every query but --mode psi, phiskip and dual.  --no-phi-inv drops\n"
        << "      phi_inv, which only --report smem-all reads.  --seq-ids stores\n"
        << "      ropebwt3's sequence-ID table (the FMD's .len.gz) for smem-all.\n"
-       << "      --phi-split 0 leaves phi unsplit.\n"
+       << "      --phi-split 0 leaves phi unsplit.  --lcp-summary adds each LF row's\n"
+       << "      LCP at its head and least LCP below it, which --mode phisum reads;\n"
+       << "      it needs --minima or --lcp-bin.\n"
        << "\n"
        << "Query:\n"
        << "  query INDEX READS [options]\n"
@@ -106,9 +108,12 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "    --build-ftab[=KLEN]      build an ftab of KLEN-mers after loading\n"
        << "                             (default KLEN 14)\n"
        << "  tms index only:\n"
-       << "    --mode psi|phi|phiskip|dual\n"
+       << "    --mode psi|phi|phisum|phiskip|dual\n"
        << "                             how repositions compute LCEs (default psi; psi,\n"
-       << "                             phiskip and dual need psi, phi needs phi)\n"
+       << "                             phiskip and dual need psi, phi needs phi; phisum\n"
+       << "                             walks phi only over the current row, taking whole\n"
+       << "                             rows' LCP minima from an index built with\n"
+       << "                             --lcp-summary)\n"
        << "    --positions              add a field with an occurrence position for each\n"
        << "                             value (-1 where it is 0); needs phi\n"
        << "    --report ms|smem-one|smem-all\n"
@@ -407,6 +412,7 @@ static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r, size
 static bool tms_mode_of(const std::string& name, TmsMode& m) {
     if (name == "psi") m = TmsMode::PSI;
     else if (name == "phi") m = TmsMode::PHI;
+    else if (name == "phisum") m = TmsMode::PHISUM;
     else if (name == "phiskip") m = TmsMode::PHISKIP;
     else if (name == "dual") m = TmsMode::DUAL;
     else if (name == "oracle") m = TmsMode::ORACLE;
@@ -995,6 +1001,13 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
                   << " scan_visits/rep=" << double(tms_stats.scan_visits) / tms_stats.repositions
                   << " lf_ff/step=" << double(tms_stats.lf_ff) / tms_stats.lf_steps
                   << " walk_visits/base=" << double(tms_stats.walk_visits) / tms_stats.bases << "\n";
+        if (g_tms_mode == TmsMode::PHISUM)
+            std::cerr << "stats: phisum up_settled=" << tms_stats.sum_up_settled << " up_walked=" << tms_stats.sum_up_walked
+                      << " down_settled=" << tms_stats.sum_down_settled << " down_walked=" << tms_stats.sum_down_walked
+                      << " partial_steps=" << tms_stats.sum_partial_steps << " cont_walks=" << tms_stats.sum_cont_walks
+                      << " cont_steps=" << tms_stats.sum_cont_steps
+                      << " partial_steps/rep=" << double(tms_stats.sum_partial_steps) / tms_stats.repositions
+                      << " cont_steps/rep=" << double(tms_stats.sum_cont_steps) / tms_stats.repositions << "\n";
     }
 #endif
 #ifdef MS_STATS
@@ -1281,7 +1294,7 @@ static int run_command(int argc, char** argv) {
         }
         TmsBuildOptions opts;
         opts.report = true;
-        bool with_phi = false;
+        bool with_phi = false, lcp_summary = false;
         std::string minima_path, lcp_bin_path, phi_path, seq_ids_path, v;
         for (int i = npos; i < argc; ++i) {
             if (opt_value(argc, argv, i, "--lf-split", v)) {
@@ -1299,7 +1312,12 @@ static int run_command(int argc, char** argv) {
             else if (opt_value(argc, argv, i, "--lcp-bin", v)) { lcp_bin_path = v; with_phi = true; }
             else if (opt_value(argc, argv, i, "--phi", v)) { phi_path = v; with_phi = true; }
             else if (opt_value(argc, argv, i, "--seq-ids", v)) seq_ids_path = v;
+            else if (strcmp(argv[i], "--lcp-summary") == 0) lcp_summary = true;
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
+        }
+        if (lcp_summary && minima_path.empty() && lcp_bin_path.empty()) {
+            std::cerr << "--lcp-summary needs --minima or --lcp-bin\n";
+            return 1;
         }
         if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
             std::cerr << "give at most one of --phi, --minima and --lcp-bin\n";
@@ -1390,6 +1408,29 @@ static int run_command(int argc, char** argv) {
                 return 1;
             }
         }
+        // The LCP summaries, from two more reads of the LCP input, cut into
+        // the LF rows the index will have.
+        TmsLcpSummary summary;
+        double summary_s = 0;
+        if (lcp_summary) {
+            const auto ts = clock::now();
+            try {
+                const orbit::int_vector rows = TmsIndex::lf_row_lengths(heads, lens, opts);
+                ulint n = 0;
+                for (ulint l : lens) n += l;
+                auto sums = minima_path.empty()
+                                ? ms_build::row_summaries(lens, rows, ms_build::lcp_bin_source(lcp_bin_path, lens, true))
+                                : ms_build::row_summaries(lens, rows, ms_build::minima_source(minima_path, heads.size(), n));
+                summary.top = std::move(sums.first);
+                summary.int_min = std::move(sums.second);
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to build LCP summaries: " << e.what() << "\n";
+                return 1;
+            }
+            opts.lcp_summary = &summary;
+            summary_s = std::chrono::duration<double>(clock::now() - ts).count();
+            mem_report::phase("tms_lcp_summary", heads.size());
+        }
         // The run lengths and tops, packed.
         orbit::int_vector run_lens, run_tops;
         {
@@ -1437,7 +1478,9 @@ static int run_command(int argc, char** argv) {
         mem_report::phase("tms_write", heads.size());
         idx.describe(std::cout);
         std::cout << "Built tms index: " << idx_path << " (runs=" << heads.size() << ", bytes=" << bytes
-                  << ", load_s=" << load_s << ", build_s=" << build_s << ")\n";
+                  << ", load_s=" << load_s << ", build_s=" << build_s;
+        if (lcp_summary) std::cout << ", lcp_summary_s=" << summary_s << " (in load_s)";
+        std::cout << ")\n";
         return 0;
     }
 
@@ -1656,8 +1699,8 @@ static int run_command(int argc, char** argv) {
             os << "  = " << mb(total);
             return os.str();
         };
-        const char* modes[] = {"psi", "phi", "phiskip", "dual", "oracle", "oracle-scan"};
-        const TmsMode mode_of[] = {TmsMode::PSI,  TmsMode::PHI,    TmsMode::PHISKIP,
+        const char* modes[] = {"psi", "phi", "phisum", "phiskip", "dual", "oracle", "oracle-scan"};
+        const TmsMode mode_of[] = {TmsMode::PSI,  TmsMode::PHI,    TmsMode::PHISUM,     TmsMode::PHISKIP,
                                    TmsMode::DUAL, TmsMode::ORACLE, TmsMode::ORACLE_SCAN};
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
@@ -1669,7 +1712,7 @@ static int run_command(int argc, char** argv) {
         }
         std::vector<std::string> names, plans;
         std::vector<std::string> rows;
-        for (int m = 0; m < 6; ++m)
+        for (int m = 0; m < 7; ++m)
             for (int r = 0; r < 3; ++r)
                 for (int pos = 0; pos < 2; ++pos)
                     for (int ps = 0; ps < 2; ++ps) {

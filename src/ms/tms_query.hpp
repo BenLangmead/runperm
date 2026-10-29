@@ -39,7 +39,17 @@
 #ifdef TMS_STATS
 struct TmsStats { ulint bases = 0, repositions = 0, psi_steps = 0, phi_steps = 0, scan_rows = 0, dist = 0, len_at_rep = 0, lce = 0, lce_capped = 0, dist1 = 0,
                   lf_ff = 0, lf_steps = 0, scan_visits = 0, walk_visits = 0;
+                  // PHISUM: sides settled from the summaries alone and sides
+                  // that walked phi, the walks' steps over the current row's
+                  // part, and the walks down that also crossed rows continuing
+                  // the current row's run, with their steps there.
+                  ulint sum_up_settled = 0, sum_up_walked = 0, sum_down_settled = 0, sum_down_walked = 0,
+                        sum_partial_steps = 0, sum_cont_walks = 0, sum_cont_steps = 0;
                   TmsStats& operator+=(const TmsStats& o) {
+                      sum_up_settled += o.sum_up_settled; sum_up_walked += o.sum_up_walked;
+                      sum_down_settled += o.sum_down_settled; sum_down_walked += o.sum_down_walked;
+                      sum_partial_steps += o.sum_partial_steps; sum_cont_walks += o.sum_cont_walks;
+                      sum_cont_steps += o.sum_cont_steps;
                       bases += o.bases; repositions += o.repositions; psi_steps += o.psi_steps; phi_steps += o.phi_steps;
                       scan_rows += o.scan_rows; dist += o.dist; len_at_rep += o.len_at_rep; lce += o.lce;
                       lce_capped += o.lce_capped; dist1 += o.dist1; lf_ff += o.lf_ff; lf_steps += o.lf_steps;
@@ -142,6 +152,7 @@ inline std::vector<ulint> tms_query(TmsIndex& idx, const std::string& pattern) {
 enum class TmsMode {
     PSI,      // compare the pattern with the candidate's suffix, read with psi
     PHI,      // walk phi across the rows between, reading PLCP
+    PHISUM,   // as PHI, with whole rows' minima from the LCP summaries, walking only the current row
     PHISKIP,  // psi if the match length is below the row distance, else phi
     DUAL,     // psi if the match length is below the row distance, else both, first to finish wins
     ORACLE,   // replay recorded outcomes: no candidate scan and no LCE (see RepositionOracle)
@@ -183,6 +194,20 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * a side stops as soon as it can no longer win (ties go to pred).  Every
  * mode therefore chooses the same candidate, and the lengths and positions
  * do not depend on the mode or on k.
+ *
+ * PHISUM splits each phi LCE into whole LF rows and the current row's part.
+ * The scan takes the minimum of the TOP_LCP and INT_MIN summaries (see
+ * TmsLcpSummary) of the rows it crosses, and the candidate row's TOP_LCP on
+ * the succ side, the current row's on the pred side.  That minimum, capped,
+ * bounds the side's LCE from above, and its minimum with the current row's
+ * INT_MIN bounds it from below.  A side whose bounds agree is done without
+ * walking; otherwise it walks phi over the current row's part alone, with
+ * its minimum starting at the upper bound and stopping once it reaches the
+ * lower one.  pred walks up from the toehold to below the current row's
+ * head.  succ walks up to the row below the current one from the tail of
+ * the row above the next row that starts a BWT run, since phi points are
+ * stored only at run heads; when the rows below the current one continue
+ * its run (LF splitting), the walk crosses them too.
  *
  * Rows are read through the row access acc (TmsIndex::PackedAccess or
  * ColumnAccess).  out_len[j] receives the statistics for patterns[j]; if positions is true,
@@ -232,6 +257,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint phi_min;    // phi walk: minimum LCP so far
         ulint phi_left;   // phi walk: LCP values still to read
         ulint value;      // the capped LCE, once done
+        ulint floor;      // phi walk: a lower bound on the LCP values still to read
+        ulint cont_left;  // PHISUM succ walk: values still to read in rows continuing the current row's run
         bool psi_on, phi_on, done, lost;
         bool active() const { return !done && !lost; }
     };
@@ -252,6 +279,14 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint lo, hi;     // the LF rows prefetched for the scans
         ulint dist_up, dist_down;  // rows from the current row to u's tail and d's head
         bool found_up, found_down, scanned_up, scanned_down;
+        // PHISUM: the current row's TOP_LCP, INT_MIN and character code, and
+        // its rows below the current one; the summaries' minima over the
+        // rows the scans crossed and succ's TOP_LCP; and the first row below
+        // the current one that starts a BWT run, once found, with the rows
+        // above it below the current row's.
+        ulint top_r, int_r, part_down, sum_up, sum_down, top_d, head_below, cont_len;
+        uchar code_r;
+        bool head_found;
         Side up, down;
 #ifdef MS_STEP_STATS
         size_t m;         // the pattern's length
@@ -352,18 +387,22 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     // Slots [slots.data(), end) are in flight.
     Slot* end = slots.data();
     while (end < slots.data() + k && start(*end)) ++end;
-    auto lower = [](const Side& x) { return x.done ? x.value : x.psi_on ? x.psi_lce : 0; };
+    auto lower = [](const Side& x) {
+        return x.done ? x.value : x.psi_on ? x.psi_lce : x.phi_on ? std::min(x.phi_min, x.floor) : 0;
+    };
     auto upper = [](const Side& x, ulint cap) { return x.done ? x.value : x.phi_on ? std::min(x.phi_min, cap) : cap; };
     auto setup = [&](Side& x, ulint dist, ulint cap) {
         if constexpr (Mode == TmsMode::PSI) x.psi_on = true;
-        else if constexpr (Mode == TmsMode::PHI) x.phi_on = true;
+        else if constexpr (Mode == TmsMode::PHI || Mode == TmsMode::PHISUM) x.phi_on = true;
         else if constexpr (Mode == TmsMode::PHISKIP) { x.psi_on = cap < dist; x.phi_on = !x.psi_on; }
         else { x.psi_on = true; x.phi_on = cap >= dist; }
         x.psi_lce = 0;
         x.phi_min = INF;
         x.phi_left = dist;
     };
-    constexpr bool PsiWalks = Mode != TmsMode::PHI && !Replay, PhiWalks = Mode != TmsMode::PSI && !Replay;
+    constexpr bool PsiWalks = Mode != TmsMode::PHI && Mode != TmsMode::PHISUM && !Replay,
+                   PhiWalks = Mode != TmsMode::PSI && !Replay;
+    constexpr bool Sum = Mode == TmsMode::PHISUM;
     auto step_side = [&](Side& x, const char* rest, ulint cap) {
         if (PsiWalks && x.psi_on) {
             TMS_COUNT(psi_steps, 1);
@@ -383,7 +422,15 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
             const PhiPos p = idx.finish_phi(x.p);
             MS_FF((PhiStarts ? FF_PHI_STARTS : FF_PHI_LEN), p.interval - x.p.interval);
             x.phi_min = std::min(x.phi_min, idx.plcp(p));
-            if (x.phi_min == 0 || --x.phi_left == 0) {
+            if constexpr (Sum) {
+                if (x.cont_left > 0) {
+                    --x.cont_left;
+                    TMS_COUNT(sum_cont_steps, 1);
+                } else {
+                    TMS_COUNT(sum_partial_steps, 1);
+                }
+            }
+            if (x.phi_min <= x.floor || --x.phi_left == 0) {
                 x.done = true;
                 x.value = std::min(x.phi_min, cap);
             } else {
@@ -497,6 +544,15 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     acc.prefetch_rows(s.lo, s.hi);
                     s.dist_up = pos.offset + 1;
                     s.dist_down = acc.length(r) - pos.offset;
+                    if constexpr (Sum) {
+                        s.top_r = acc.top_lcp(r);
+                        s.int_r = acc.int_min(r);
+                        s.code_r = acc.code(r);
+                        s.part_down = s.dist_down - 1;
+                        s.sum_up = s.sum_down = INF;
+                        s.cont_len = 0;
+                        s.head_found = false;
+                    }
                     s.found_up = s.found_down = s.scanned_up = s.scanned_down = false;
                     s.pos = pos;
                     s.state = SCAN;
@@ -519,13 +575,35 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                     while (!s.scanned_up && s.u > s.lo) {
                         const auto r = acc.row(--s.u);
                         if (acc.code(r) == lf_sym[c]) s.found_up = s.scanned_up = true;
-                        else s.dist_up += acc.length(r);
+                        else {
+                            s.dist_up += acc.length(r);
+                            if constexpr (Sum) s.sum_up = std::min({s.sum_up, acc.top_lcp(r), acc.int_min(r)});
+                        }
                     }
                     if (s.u == 0) s.scanned_up = true;
                     while (!s.scanned_down && s.d < s.hi) {
                         const auto r = acc.row(++s.d);
-                        if (acc.code(r) == lf_sym[c]) s.found_down = s.scanned_down = true;
-                        else s.dist_down += acc.length(r);
+                        const uchar code = acc.code(r);
+                        if constexpr (Sum) {
+                            // Rows with the current row's character continue
+                            // its run; the first without starts the next run.
+                            if (!s.head_found) {
+                                if (code != s.code_r) {
+                                    s.head_found = true;
+                                    s.head_below = s.d;
+                                    idx.template prefetch_phi<PhiStarts>(idx.template phi_at_head<PhiStarts>(s.d).interval);
+                                } else {
+                                    s.cont_len += acc.length(r);
+                                }
+                            }
+                        }
+                        if (code == lf_sym[c]) {
+                            s.found_down = s.scanned_down = true;
+                            if constexpr (Sum) s.top_d = acc.top_lcp(r);
+                        } else {
+                            s.dist_down += acc.length(r);
+                            if constexpr (Sum) s.sum_down = std::min({s.sum_down, acc.top_lcp(r), acc.int_min(r)});
+                        }
                     }
                     if (s.d == last_run) s.scanned_down = true;
                     if (!s.scanned_up || !s.scanned_down) {
@@ -582,6 +660,47 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                             s.up.done = found_up;
                             s.down.done = found_down;
                             s.up.value = s.down.value = 0;
+                        } else if constexpr (Sum) {
+                            // The current row's part is pred's rows above the
+                            // current one, below the row's head, or succ's
+                            // rows below the current one.
+                            if (found_up) {
+                                Side& x = s.up;
+                                const ulint upper = std::min({s.sum_up, s.top_r, cap});
+                                if (s.pos.offset == 0 || s.int_r >= upper) {
+                                    x.done = true;
+                                    x.value = upper;
+                                    TMS_COUNT(sum_up_settled, 1);
+                                } else {
+                                    x.phi_on = true;
+                                    x.p = s.ph;
+                                    x.phi_min = upper;
+                                    x.floor = s.int_r;
+                                    x.phi_left = s.pos.offset;
+                                    TMS_COUNT(sum_up_walked, 1);
+                                }
+                            }
+                            if (found_down) {
+                                Side& x = s.down;
+                                const ulint upper = std::min({s.sum_down, s.top_d, cap});
+                                if (s.part_down == 0 || s.int_r >= upper) {
+                                    x.done = true;
+                                    x.value = upper;
+                                    TMS_COUNT(sum_down_settled, 1);
+                                } else {
+                                    // From the tail of the row above the next
+                                    // run head, one phi step from the head's.
+                                    x.phi_on = true;
+                                    x.p = idx.start_phi(idx.template phi_at_head<PhiStarts>(s.head_below));
+                                    idx.template prefetch_phi<PhiStarts>(x.p.interval);
+                                    x.phi_min = upper;
+                                    x.floor = s.int_r;
+                                    x.phi_left = s.cont_len + s.part_down;
+                                    x.cont_left = s.cont_len;
+                                    TMS_COUNT(sum_down_walked, 1);
+                                    TMS_COUNT(sum_cont_walks, s.cont_len > 0);
+                                }
+                            }
                         } else {
                             if (found_up) {
                                 setup(s.up, dist_up, cap);
@@ -698,7 +817,10 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
         throw std::invalid_argument("this mode or positions need an index built with phi");
     if (out_pos && !idx.has_phi_starts())
         throw std::invalid_argument("positions need phi's starts-based form, which this index was loaded without");
-    if (mode != TmsMode::PHI && !oracle && !idx.has_psi()) throw std::invalid_argument("this mode needs an index with psi");
+    if (mode != TmsMode::PHI && mode != TmsMode::PHISUM && !oracle && !idx.has_psi())
+        throw std::invalid_argument("this mode needs an index with psi");
+    if (mode == TmsMode::PHISUM && !idx.has_lcp_summary())
+        throw std::invalid_argument("--mode phisum needs an index with LCP summaries (tms-build --lcp-summary)");
     if (ft && (oracle || record))
         throw std::invalid_argument("recording or replaying repositions takes no ftab, which skips some of them");
     if (ft && (mode != TmsMode::PSI || out_pos) && !ft->has_toehold())
@@ -733,6 +855,7 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
     switch (mode) {
         case TmsMode::PSI: run_rec(std::integral_constant<TmsMode, TmsMode::PSI>{}); break;
         case TmsMode::PHI: run_rec(std::integral_constant<TmsMode, TmsMode::PHI>{}); break;
+        case TmsMode::PHISUM: run_rec(std::integral_constant<TmsMode, TmsMode::PHISUM>{}); break;
         case TmsMode::PHISKIP: run_rec(std::integral_constant<TmsMode, TmsMode::PHISKIP>{}); break;
         case TmsMode::DUAL: run_rec(std::integral_constant<TmsMode, TmsMode::DUAL>{}); break;
         case TmsMode::ORACLE: run(std::integral_constant<TmsMode, TmsMode::ORACLE>{}, std::false_type{}); break;
