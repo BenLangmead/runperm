@@ -73,25 +73,22 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "      -ominima file, or --lcp-bin, one 64-bit LCP per row, optionally after\n"
        << "      a 64-bit row count.  --lf-split sets Orbit's balancing factor for LF\n"
        << "      (positive; default: Orbit's default).  Results do not depend on it.\n"
-       << "  tms-build HEADS LENS INDEX [--phi FILE | --minima FILE | --lcp-bin FILE]\n"
+       << "  tms-build HEADS LENS INDEX [--minima FILE | --lcp-bin FILE] [--phi FILE]\n"
        << "            [--layout full|psi|phi] [--seq-ids FILE] [--no-phi-inv]\n"
-       << "            [--lf-split FACTOR] [--phi-split FACTOR] [--lcp-summary]\n"
-       << "      Build a tms index.  LF and psi need no LCP input; phi and phi_inv\n"
-       << "      need one of --phi (a TeraLCP -ophi file, which allows one terminator\n"
-       << "      per string, as in an FMD), --minima or --lcp-bin (which need one\n"
-       << "      terminator).  --layout keeps what some queries read: full (default)\n"
-       << "      keeps everything; psi keeps LF and psi and serves only --mode psi\n"
-       << "      without positions or SMEMs; phi keeps LF, phi and phi_inv and serves\n"
-       << "      every query but --mode psi, phiskip and dual.  --no-phi-inv drops\n"
+       << "            [--lf-split FACTOR] [--phi-split FACTOR]\n"
+       << "      Build a tms index.  LF and psi need no LCP input.  phi, phi_inv and\n"
+       << "      the LCP summaries --mode phi and dual read (each LF row's LCP at its\n"
+       << "      head and least LCP below it) need --minima (a TeraLCP -ominima file)\n"
+       << "      or --lcp-bin.  Alone, these need a BWT with one terminator; with\n"
+       << "      --phi (a TeraLCP -ophi file of the same BWT), phi comes from its\n"
+       << "      samples and the BWT may have one terminator per string, as an FMD\n"
+       << "      does.  --layout keeps what some queries read: full (default) keeps\n"
+       << "      everything; psi keeps LF and psi and serves only --mode psi without\n"
+       << "      positions or SMEMs; phi keeps LF, phi, phi_inv and the summaries and\n"
+       << "      serves every query but --mode psi and dual.  --no-phi-inv drops\n"
        << "      phi_inv, which only --report smem-all reads.  --seq-ids stores\n"
        << "      ropebwt3's sequence-ID table (the FMD's .len.gz) for smem-all.\n"
-       << "      --phi-split 0 leaves phi unsplit.  --lcp-summary adds each LF row's\n"
-       << "      LCP at its head and least LCP below it, which --mode phisum and\n"
-       << "      dualsum read; it needs --minima or --lcp-bin (or see tms-add-summary).\n"
-       << "  tms-add-summary INDEX MINIMA OUT\n"
-       << "      Write the tms index INDEX to OUT with the LCP summaries of\n"
-       << "      --lcp-summary, computed for its LF rows from the TeraLCP -ominima\n"
-       << "      file MINIMA of its BWT, copying its other sections unchanged.\n"
+       << "      --phi-split 0 leaves phi unsplit.\n"
        << "\n"
        << "Query:\n"
        << "  query INDEX READS [options]\n"
@@ -113,14 +110,14 @@ static void usage(std::ostream& os, bool advanced = false) {
        << "    --build-ftab[=KLEN]      build an ftab of KLEN-mers after loading\n"
        << "                             (default KLEN 14)\n"
        << "  tms index only:\n"
-       << "    --mode psi|phi|phisum|phiskip|dual|dualsum\n"
-       << "                             how repositions compute LCEs (default psi; psi,\n"
-       << "                             phiskip and dual need psi, phi needs phi; phisum\n"
-       << "                             walks phi only over the current row, taking whole\n"
-       << "                             rows' LCP minima from an index with LCP summaries\n"
-       << "                             (--lcp-summary); dualsum also needs psi, and on a\n"
-       << "                             side the summaries leave open races psi against\n"
-       << "                             phisum's walk as dual does)\n"
+       << "    --mode psi|phi|dual      how repositions compute LCEs: psi (default)\n"
+       << "                             compares the read with the candidate's suffix\n"
+       << "                             using psi; phi takes whole rows' LCP minima from\n"
+       << "                             the index's LCP summaries and walks phi only over\n"
+       << "                             the current row; dual does as phi, and where the\n"
+       << "                             summaries leave a side open, races a psi walk\n"
+       << "                             against phi's.  psi and dual need psi, phi and\n"
+       << "                             dual need phi.\n"
        << "    --positions              add a field with an occurrence position for each\n"
        << "                             value (-1 where it is 0); needs phi\n"
        << "    --report ms|smem-one|smem-all\n"
@@ -205,6 +202,26 @@ static void usage_advanced(std::ostream& os) {
        << "      wall_ns_per_base the elapsed time per base; flipped counts the reads\n"
        << "      --orient matched on the other strand.  With smem-all, DEPTH also sets\n"
        << "      how many phi and phi_inv walks list positions at once.\n"
+       << "\n"
+       << "Advanced tms query modes:\n"
+       << "    --mode phi-walk          walk phi over every row between the current row\n"
+       << "                             and the candidate; needs phi, not the summaries\n"
+       << "    --mode phiskip           psi if the match length is below the row distance,\n"
+       << "                             else phi-walk; needs psi and phi\n"
+       << "    --mode dual-walk         psi if the match length is below the row distance,\n"
+       << "                             else psi and phi-walk side by side, the first to\n"
+       << "                             finish deciding; needs psi and phi\n"
+       << "      Every mode gives the same output.\n"
+       << "\n"
+       << "Advanced tms-build options and commands:\n"
+       << "    --no-lcp-summary         build phi without the LCP summaries; the index\n"
+       << "                             serves phi-walk, phiskip and dual-walk, not phi or\n"
+       << "                             dual, and --phi needs no --minima or --lcp-bin\n"
+       << "  tms-add-summary INDEX MINIMA OUT\n"
+       << "      Write the tms index INDEX, built without LCP summaries, to OUT with\n"
+       << "      them, computed for its LF rows from the TeraLCP -ominima file MINIMA\n"
+       << "      of its BWT, copying its other sections unchanged.  OUT equals the\n"
+       << "      index tms-build writes with the summaries.\n"
        << "\n"
        << "Advanced build-rlbwt options:\n"
        << "    --minima-only            keep only the minima of --lcp-bin's LCPs, as a\n"
@@ -423,14 +440,21 @@ static void query_one(TmsIndex& idx, const std::string& s, QueryResults& r, size
     query_many(idx, {s}, 1, r, 0, first_read);
 }
 
+/** For the names phi and dual had when they were optional, the names they have. */
+static std::string unknown_mode_hint(const std::string& name) {
+    if (name == "phisum") return " (it is --mode phi)";
+    if (name == "dualsum") return " (it is --mode dual)";
+    return "";
+}
+
 /** Sets m to the tms mode named by name and returns true, or returns false. */
 static bool tms_mode_of(const std::string& name, TmsMode& m) {
     if (name == "psi") m = TmsMode::PSI;
     else if (name == "phi") m = TmsMode::PHI;
-    else if (name == "phisum") m = TmsMode::PHISUM;
+    else if (name == "phi-walk") m = TmsMode::PHI_WALK;
     else if (name == "phiskip") m = TmsMode::PHISKIP;
     else if (name == "dual") m = TmsMode::DUAL;
-    else if (name == "dualsum") m = TmsMode::DUALSUM;
+    else if (name == "dual-walk") m = TmsMode::DUAL_WALK;
     else if (name == "oracle") m = TmsMode::ORACLE;
     else if (name == "oracle-scan") m = TmsMode::ORACLE_SCAN;
     else return false;
@@ -450,7 +474,7 @@ static int tms_query_flag(int argc, char** argv, int& i, bool with_mode = true) 
     if (strcmp(argv[i], "--positions") == 0) g_tms_positions = true;
     else if (strcmp(argv[i], "--phi-starts") == 0) g_tms_phi_starts = true;
     else if (with_mode && opt_value(argc, argv, i, "--mode", v)) {
-        if (!tms_mode_of(v, g_tms_mode)) { std::cerr << "Unknown mode: " << v << "\n"; return -1; }
+        if (!tms_mode_of(v, g_tms_mode)) { std::cerr << "Unknown mode: " << v << unknown_mode_hint(v) << "\n"; return -1; }
     }
     else if (opt_value(argc, argv, i, "--report", v)) {
         if (v == "ms") g_tms_report = TmsReport::MS;
@@ -1052,13 +1076,13 @@ static int run_batch(const QueryOptions& o, std::optional<Index> (*read)(const s
                   << " scan_visits/rep=" << double(tms_stats.scan_visits) / tms_stats.repositions
                   << " lf_ff/step=" << double(tms_stats.lf_ff) / tms_stats.lf_steps
                   << " walk_visits/base=" << double(tms_stats.walk_visits) / tms_stats.bases << "\n";
-        if (g_tms_mode == TmsMode::DUALSUM)
-            std::cerr << "stats: dualsum up_raced=" << tms_stats.sum_up_raced << " down_raced=" << tms_stats.sum_down_raced
+        if (g_tms_mode == TmsMode::DUAL)
+            std::cerr << "stats: dual up_raced=" << tms_stats.sum_up_raced << " down_raced=" << tms_stats.sum_down_raced
                       << " up_psi_steps=" << tms_stats.sum_up_psi_steps << " down_psi_steps=" << tms_stats.sum_down_psi_steps
                       << " psi_decided=" << tms_stats.sum_psi_decided << " phi_decided=" << tms_stats.sum_phi_decided
                       << " psi_steps/base=" << double(tms_stats.psi_steps) / tms_stats.bases << "\n";
-        if (g_tms_mode == TmsMode::PHISUM || g_tms_mode == TmsMode::DUALSUM)
-            std::cerr << "stats: " << (g_tms_mode == TmsMode::PHISUM ? "phisum" : "dualsum") << " up_settled=" << tms_stats.sum_up_settled << " up_walked=" << tms_stats.sum_up_walked
+        if (g_tms_mode == TmsMode::PHI || g_tms_mode == TmsMode::DUAL)
+            std::cerr << "stats: " << (g_tms_mode == TmsMode::PHI ? "phi" : "dual") << " up_settled=" << tms_stats.sum_up_settled << " up_walked=" << tms_stats.sum_up_walked
                       << " down_settled=" << tms_stats.sum_down_settled << " down_walked=" << tms_stats.sum_down_walked
                       << " partial_steps=" << tms_stats.sum_partial_steps << " cont_walks=" << tms_stats.sum_cont_walks
                       << " cont_steps=" << tms_stats.sum_cont_steps
@@ -1144,11 +1168,11 @@ static int run_query(int argc, char** argv) {
     }
     if (o.mode == "standard") {
         std::cerr << "query: --mode standard is for ms indexes; " << o.idx_path
-                  << " is a tms index, whose modes are psi (the default), phi, phiskip and dual\n";
+                  << " is a tms index, whose modes are psi (the default), phi and dual\n";
         return 1;
     }
     if (!o.mode.empty() && !tms_mode_of(o.mode, g_tms_mode)) {
-        std::cerr << "Unknown mode: " << o.mode << "\n";
+        std::cerr << "Unknown mode: " << o.mode << unknown_mode_hint(o.mode) << "\n";
         return 1;
     }
     // Load only the parts the query reads; the load refuses an index that
@@ -1350,7 +1374,7 @@ static int run_command(int argc, char** argv) {
         }
         TmsBuildOptions opts;
         opts.report = true;
-        bool with_phi = false, lcp_summary = false;
+        bool with_phi = false, no_lcp_summary = false;
         std::string minima_path, lcp_bin_path, phi_path, seq_ids_path, v;
         for (int i = npos; i < argc; ++i) {
             if (opt_value(argc, argv, i, "--lf-split", v)) {
@@ -1367,16 +1391,19 @@ static int run_command(int argc, char** argv) {
             else if (opt_value(argc, argv, i, "--minima", v)) { minima_path = v; with_phi = true; }
             else if (opt_value(argc, argv, i, "--lcp-bin", v)) { lcp_bin_path = v; with_phi = true; }
             else if (opt_value(argc, argv, i, "--phi", v)) { phi_path = v; with_phi = true; }
+            else if (strcmp(argv[i], "--no-lcp-summary") == 0) no_lcp_summary = true;
             else if (opt_value(argc, argv, i, "--seq-ids", v)) seq_ids_path = v;
-            else if (strcmp(argv[i], "--lcp-summary") == 0) lcp_summary = true;
             else { std::cerr << "Unknown " << cmd << " option: " << argv[i] << "\n"; return 1; }
         }
-        if (lcp_summary && minima_path.empty() && lcp_bin_path.empty()) {
-            std::cerr << "--lcp-summary needs --minima or --lcp-bin\n";
+        // Every index with phi gets the LCP summaries unless told otherwise.
+        const bool lcp_summary = with_phi && !no_lcp_summary;
+        if (!minima_path.empty() && !lcp_bin_path.empty()) {
+            std::cerr << "give at most one of --minima and --lcp-bin\n";
             return 1;
         }
-        if (int(!minima_path.empty()) + int(!lcp_bin_path.empty()) + int(!phi_path.empty()) > 1) {
-            std::cerr << "give at most one of --phi, --minima and --lcp-bin\n";
+        if (lcp_summary && minima_path.empty() && lcp_bin_path.empty()) {
+            std::cerr << "--phi needs --minima or --lcp-bin for the LCP summaries --mode phi and dual read\n"
+                      << "(or --no-lcp-summary, for an index serving --mode phi-walk; see --help-advanced)\n";
             return 1;
         }
         if (opts.layout == TmsLayout::PSI && with_phi) {
@@ -1755,9 +1782,9 @@ static int run_command(int argc, char** argv) {
             os << "  = " << mb(total);
             return os.str();
         };
-        const char* modes[] = {"psi", "phi", "phisum", "phiskip", "dual", "dualsum", "oracle", "oracle-scan"};
-        const TmsMode mode_of[] = {TmsMode::PSI,  TmsMode::PHI,     TmsMode::PHISUM, TmsMode::PHISKIP,
-                                   TmsMode::DUAL, TmsMode::DUALSUM, TmsMode::ORACLE, TmsMode::ORACLE_SCAN};
+        const char* modes[] = {"psi", "phi", "phi-walk", "phiskip", "dual", "dual-walk", "oracle", "oracle-scan"};
+        const TmsMode mode_of[] = {TmsMode::PSI,     TmsMode::PHI,       TmsMode::PHI_WALK, TmsMode::PHISKIP,
+                                   TmsMode::DUAL,    TmsMode::DUAL_WALK, TmsMode::ORACLE,   TmsMode::ORACLE_SCAN};
         const char* reports[] = {"ms", "smem-one", "smem-all"};
         const TmsReport report_of[] = {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL};
         if (query) {

@@ -3,7 +3,7 @@
 //
 // Usage: tms_count_bench INDEX OUT_PREFIX [options] NAME=READS.fa[:MAX_READS] ...
 //   --k K            searches, walks or listings in flight (default 32)
-//   --mode M         psi (default), dual or phi: how matching statistics reposition
+//   --mode M         psi (default), phi, dual, phi-walk or dual-walk: how matching statistics reposition
 //   --row-shift R    backward search's row-start sampling (default 4)
 //   --caps a,b,...   positions listed per SMEM (default 1,100)
 //   --methods LIST   comma-separated walk, backward, adaptive (the defaults),
@@ -144,8 +144,12 @@ int main(int argc, char** argv) {
         else if (a == "--max-walk-steps" && i + 1 < argc) max_walk_steps = std::stoull(argv[++i]);
         else if (a == "--mode" && i + 1 < argc) {
             const std::string m = argv[++i];
-            mode = m == "psi" ? TmsMode::PSI : m == "dual" ? TmsMode::DUAL : m == "phi" ? TmsMode::PHI
-                                                                                       : throw std::invalid_argument(m);
+            mode = m == "psi"         ? TmsMode::PSI
+                   : m == "phi"       ? TmsMode::PHI
+                   : m == "dual"      ? TmsMode::DUAL
+                   : m == "phi-walk"  ? TmsMode::PHI_WALK
+                   : m == "dual-walk" ? TmsMode::DUAL_WALK
+                                      : throw std::invalid_argument(m);
         } else if (a == "--caps" && i + 1 < argc) {
             caps.clear();
             for (const auto& c : split(argv[++i], ',')) caps.push_back(std::stoull(c));

@@ -438,7 +438,7 @@ bool test_tms_batch(const std::string& data_dir) {
     std::cout << "Testing tms_query_batch in every mode against tms_query" << std::endl;
     std::mt19937 rng(41);
     const auto inputs = batch_inputs(data_dir, rng);
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     size_t checked = 0, positions = 0, access_rows = 0;
     for (const auto& in : inputs) {
         const std::string& T = in.text;
@@ -514,7 +514,7 @@ bool test_tms_batch(const std::string& data_dir) {
 bool test_orient_both_strands() {
     std::cout << "Testing --orient rc and qual on texts holding both strands" << std::endl;
     std::mt19937 rng(73);
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     size_t checked = 0, flipped = 0;
     for (int k = 0; k < 30; ++k) {
         std::string text;
@@ -773,7 +773,7 @@ bool test_smem_report(const std::string& data_dir) {
     std::cout << "Testing SMEM reports against every occurrence" << std::endl;
     std::mt19937 rng(43);
     const auto inputs = batch_inputs(data_dir, rng);
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     size_t smems = 0, positions = 0, capped = 0;
     // SMEMs with no rows above the toehold's, none below, and some on both sides.
     size_t none_up = 0, none_down = 0, both = 0;
@@ -973,7 +973,7 @@ bool test_tms_oracle(const std::string& data_dir) {
     std::cout << "Testing the oracle mode against the recording modes" << std::endl;
     std::mt19937 rng(53);
     const auto inputs = batch_inputs(data_dir, rng);
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     size_t replays = 0, decisions = 0;
     for (const auto& in : inputs) {
         auto pats = fuzz_patterns(in.text, rng, in.text.size() > 5000 ? 80 : 150);
@@ -1146,12 +1146,12 @@ bool test_layouts(const std::string& data_dir) {
 
             // Full indexes loaded with only what psi MS, and what phi queries, read.
             const TmsParts psi_need = tms_query_parts(TmsMode::PSI, false, TmsReport::MS);
-            const TmsParts phi_need = tms_query_parts(TmsMode::PHI, true, TmsReport::SMEM_ALL);
+            const TmsParts phi_need = tms_query_parts(TmsMode::PHI_WALK, true, TmsReport::SMEM_ALL);
             TmsIndex full_psi = round_trip(full, &psi_need), full_phi = round_trip(full, &phi_need);
             assert(parts_are(full_psi, true, false, false) && parts_are(full_phi, false, true, true));
             // Matching statistics alone load phi's lengths-based form, and
             // positions and SMEMs its starts-based form; a whole load has both.
-            const TmsParts phi_ms_need = tms_query_parts(TmsMode::PHI, false, TmsReport::MS);
+            const TmsParts phi_ms_need = tms_query_parts(TmsMode::PHI_WALK, false, TmsReport::MS);
             assert(!phi_ms_need.phi_starts && phi_need.phi_starts);
             TmsIndex full_phi_len = round_trip(full, &phi_ms_need), phi_len = round_trip(phi_built, &phi_ms_need);
             for (const TmsIndex* x : {&full_phi_len, &phi_len})
@@ -1169,7 +1169,7 @@ bool test_layouts(const std::string& data_dir) {
                     }
                     for (bool positions : {false, true})
                         for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
-                            const auto want_phi = query_output(full, pats, k, TmsMode::PHI, positions, report, packed);
+                            const auto want_phi = query_output(full, pats, k, TmsMode::PHI_WALK, positions, report, packed);
                             std::vector<TmsIndex*> xs = {&phi, &full_phi, &phi_built};
                             if (report != TmsReport::SMEM_ALL) xs.push_back(&phi_noinv);
                             if (!positions && report == TmsReport::MS) {
@@ -1177,7 +1177,7 @@ bool test_layouts(const std::string& data_dir) {
                                 xs.push_back(&phi_len);
                             }
                             for (TmsIndex* x : xs) {
-                                if (query_output(*x, pats, k, TmsMode::PHI, positions, report, packed) != want_phi) {
+                                if (query_output(*x, pats, k, TmsMode::PHI_WALK, positions, report, packed) != want_phi) {
                                     std::cout << "  FAILED: phi layout output differs, k " << k << std::endl;
                                     assert(false && "a phi index must answer as the full index does");
                                     return false;
@@ -1200,14 +1200,14 @@ bool test_layouts(const std::string& data_dir) {
             assert(throws<std::runtime_error>([&] { round_trip(phi_noinv_built, &phi_need); }, "needs phi_inv"));
             std::vector<std::vector<ulint>> len, pos;
             assert(throws<std::invalid_argument>([&] { tms_query_batch(phi, pats, 8, len, TmsMode::PSI); }, "psi"));
-            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi, pats, 8, len, TmsMode::DUAL); }, "psi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi, pats, 8, len, TmsMode::DUAL_WALK); }, "psi"));
             assert(throws<std::invalid_argument>([&] { tms_query(phi, "ACGT"); }, "psi"));
-            assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PHI); }, "phi"));
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PHI_WALK); }, "phi"));
             assert(throws<std::invalid_argument>([&] { tms_query_batch(psi, pats, 8, len, TmsMode::PSI, &pos); }, "phi"));
-            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi_len, pats, 8, len, TmsMode::PHI, &pos); },
+            assert(throws<std::invalid_argument>([&] { tms_query_batch(phi_len, pats, 8, len, TmsMode::PHI_WALK, &pos); },
                                                  "starts-based"));
             assert(throws<std::logic_error>([&] { round_trip(phi_len); }, "only some of its parts"));
-            tms_query_batch(phi_noinv, pats, 8, len, TmsMode::PHI, &pos);
+            tms_query_batch(phi_noinv, pats, 8, len, TmsMode::PHI_WALK, &pos);
             std::vector<TmsSmemHits> hits;
             assert(throws<std::invalid_argument>(
                 [&] { tms_report_smems_batch(phi_noinv, len, pos, 0, TmsReport::SMEM_ALL, 8, hits); }, "phi_inv"));
@@ -1240,7 +1240,7 @@ bool test_lf_rows(const std::string& data_dir) {
     std::cout << "Testing LF rows from LF split several ways" << std::endl;
     std::mt19937 rng(53);
     const auto inputs = batch_inputs(data_dir, rng);
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     size_t compared = 0, access_rows = 0, rows = 0, split_rows = 0;
     for (const auto& in : inputs) {
         const bool big = in.text.size() > 5000;
@@ -1674,7 +1674,7 @@ bool test_phi_import() {
     std::cout << "Testing phi and phi_inv from imported samples" << std::endl;
     std::mt19937 rng(61);
     size_t compared = 0, multi_checked = 0;
-    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL};
+    const TmsMode modes[] = {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK};
     for (const auto& s : fuzz_texts(rng)) {
         TextBwt t = make_text_bwt(s);
         std::vector<ulint> tops;
@@ -1704,7 +1704,7 @@ bool test_phi_import() {
                 assert(imported.phi_inv_intervals() == walked.phi_inv_intervals());
                 check_phi_against(imported, t.sa, t.isa, t.lcp);
                 for (TmsMode mode : modes) {
-                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI) continue;
+                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI_WALK) continue;
                     for (bool positions : {false, true})
                         for (TmsReport report : {TmsReport::MS, TmsReport::SMEM_ONE, TmsReport::SMEM_ALL}) {
                             const auto want = query_output(walked, pats, 8, mode, positions, report, true);
@@ -1753,7 +1753,7 @@ bool test_phi_import() {
                 TmsIndex idx = round_trip(built);
                 check_phi_against(idx, t.sa, t.isa, t.lcp);
                 for (TmsMode mode : modes) {
-                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI) continue;
+                    if (layout == TmsLayout::PHI && mode != TmsMode::PHI_WALK) continue;
                     std::vector<std::vector<ulint>> len, pos;
                     tms_query_batch(idx, pats, 8, len, mode, &pos, true);
                     // Matching statistics alone walk phi's lengths-based form.
@@ -1853,8 +1853,8 @@ size_t check_tms_with_ftab(TmsIndex& idx, const std::vector<std::string>& pats, 
                            const std::vector<std::vector<ulint>>& want, const std::vector<std::vector<ulint>>* want_pos,
                            const std::string& what) {
     size_t checked = 0;
-    for (TmsMode mode : {TmsMode::PSI, TmsMode::PHI, TmsMode::PHISKIP, TmsMode::DUAL}) {
-        if ((mode != TmsMode::PHI && !idx.has_psi()) || (mode != TmsMode::PSI && !idx.has_phi())) continue;
+    for (TmsMode mode : {TmsMode::PSI, TmsMode::PHI_WALK, TmsMode::PHISKIP, TmsMode::DUAL_WALK}) {
+        if ((mode != TmsMode::PHI_WALK && !idx.has_psi()) || (mode != TmsMode::PSI && !idx.has_phi())) continue;
         for (size_t k : {1, 3, 32})
             for (int access = 0; access < 4; ++access) {
                 const bool packed = access < 2, with_pos = access % 2 == 1;
@@ -1953,7 +1953,7 @@ bool test_ftab(const std::string& data_dir) {
                     bool refused = false;
                     try {
                         TmsIndex& full = idxs[0];
-                        tms_query_batch(full, pats, 8, got, TmsMode::PHI, nullptr, true, &ft);
+                        tms_query_batch(full, pats, 8, got, TmsMode::PHI_WALK, nullptr, true, &ft);
                     } catch (const std::invalid_argument&) {
                         refused = true;
                     }
@@ -1972,7 +1972,7 @@ bool test_ftab(const std::string& data_dir) {
                 bool refused = false;
                 try {
                     std::vector<std::vector<ulint>> got, pos;
-                    tms_query_batch(idx, pats, 8, got, TmsMode::PHI, &pos, true, &b.tab);
+                    tms_query_batch(idx, pats, 8, got, TmsMode::PHI_WALK, &pos, true, &b.tab);
                 } catch (const std::invalid_argument&) {
                     refused = true;
                 }
@@ -2162,19 +2162,19 @@ TmsLcpSummary exact_summaries(const std::vector<uchar>& heads, const std::vector
 }
 
 /**
- * tms_query_batch in PHISUM gives the lengths and positions PHI gives, and
- * in DUALSUM (full layout) those DUAL gives, for several numbers of patterns
+ * tms_query_batch in PHI gives the lengths and positions PHI_WALK gives, and
+ * in DUAL (full layout) those DUAL_WALK gives, for several numbers of patterns
  * in flight, with packed and column access, after a serialize and load, in
  * the full and phi layouts, and under splittings that cut runs into many LF
  * rows.  The summaries come from each run's minima-only pairs, as from a
  * minima file, and also, exactly, from the full LCPs.  Summaries from the
  * pairs added to a loaded index built without them (set_lcp_summary, as
- * tms-add-summary does) give the file a build with them writes.  PHISUM and
- * DUALSUM refuse an index without summaries.  Runs on the fuzz texts and, if
+ * tms-add-summary does) give the file a build with them writes.  PHI and
+ * DUAL refuse an index without summaries.  Runs on the fuzz texts and, if
  * its LF is a single cycle, on minishred.
  */
-bool test_tms_phisum(const std::string& data_dir) {
-    std::cout << "Testing tms_query_batch in phisum and dualsum modes against phi and dual" << std::endl;
+bool test_tms_lcp_summary(const std::string& data_dir) {
+    std::cout << "Testing tms_query_batch in phi and dual modes against phi-walk and dual-walk" << std::endl;
     std::mt19937 rng(43);
     struct LcpInput { std::vector<uchar> heads; std::vector<ulint> lens; std::vector<std::vector<ulint>> lcps; std::string str; };
     std::vector<LcpInput> inputs;
@@ -2224,15 +2224,15 @@ bool test_tms_phisum(const std::string& data_dir) {
                 TmsIndex plain(in.heads, in.lens, o, &tops);
                 if (!refused) {
                     std::vector<std::vector<ulint>> len;
-                    assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::PHISUM); },
-                                                         "--lcp-summary"));
-                    assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::DUALSUM); },
-                                                         "--lcp-summary"));
+                    assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::PHI); },
+                                                         "LCP summaries"));
+                    assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::DUAL); },
+                                                         "LCP summaries"));
                     refused = true;
                 }
                 std::vector<std::vector<ulint>> want, want_pos, want_dual, want_dual_pos;
-                tms_query_batch(plain, pats, 8, want, TmsMode::PHI, &want_pos);
-                if (layout == TmsLayout::FULL) tms_query_batch(plain, pats, 8, want_dual, TmsMode::DUAL, &want_dual_pos);
+                tms_query_batch(plain, pats, 8, want, TmsMode::PHI_WALK, &want_pos);
+                if (layout == TmsLayout::FULL) tms_query_batch(plain, pats, 8, want_dual, TmsMode::DUAL_WALK, &want_dual_pos);
                 const orbit::int_vector rows = TmsIndex::lf_row_lengths(in.heads, in.lens, o);
                 auto cut = ms_build::row_summaries(in.lens, rows, ms_build::lcp_vectors_source(in.lcps, true));
                 const TmsLcpSummary from_minima{std::move(cut.first), std::move(cut.second)};
@@ -2276,26 +2276,26 @@ bool test_tms_phisum(const std::string& data_dir) {
                         for (int access = 0; access < 4; ++access) {
                             const bool packed = access < 2, with_pos = access % 2 == 1;
                             std::vector<std::vector<ulint>> got, pos;
-                            tms_query_batch(k == 3 ? loaded : idx, pats, k, got, TmsMode::PHISUM, with_pos ? &pos : nullptr,
+                            tms_query_batch(k == 3 ? loaded : idx, pats, k, got, TmsMode::PHI, with_pos ? &pos : nullptr,
                                             packed);
                             if (got != want || (with_pos && pos != want_pos)) {
                                 std::cout << "  FAILED: " << (got != want ? "lengths" : "positions") << ", k " << k
                                           << ", packed " << packed << ", layout " << int(layout) << ", summaries "
                                           << (sum == &exact ? "exact" : "from minima") << std::endl;
-                                assert(false && "phisum must give phi's lengths and positions");
+                                assert(false && "phi must give phi-walk's lengths and positions");
                                 return false;
                             }
                             ++checked;
                             if (layout != TmsLayout::FULL) continue;
                             got.clear();
                             pos.clear();
-                            tms_query_batch(k == 3 ? loaded : idx, pats, k, got, TmsMode::DUALSUM,
+                            tms_query_batch(k == 3 ? loaded : idx, pats, k, got, TmsMode::DUAL,
                                             with_pos ? &pos : nullptr, packed);
                             if (got != want_dual || (with_pos && pos != want_dual_pos)) {
-                                std::cout << "  FAILED dualsum: " << (got != want_dual ? "lengths" : "positions") << ", k "
+                                std::cout << "  FAILED dual: " << (got != want_dual ? "lengths" : "positions") << ", k "
                                           << k << ", packed " << packed << ", summaries "
                                           << (sum == &exact ? "exact" : "from minima") << std::endl;
-                                assert(false && "dualsum must give dual's lengths and positions");
+                                assert(false && "dual must give dual-walk's lengths and positions");
                                 return false;
                             }
                             ++checked_dual;
@@ -2305,7 +2305,7 @@ bool test_tms_phisum(const std::string& data_dir) {
             }
         }
     }
-    std::cout << "  " << checked << " phisum and " << checked_dual << " dualsum batches over " << cont_rows
+    std::cout << "  " << checked << " phi and " << checked_dual << " dual batches over " << cont_rows
               << " rows continuing a run, " << added << " indexes given summaries after loading, PASSED" << std::endl;
     return true;
 }
@@ -2320,7 +2320,7 @@ bool run_all_tests(const std::string& data_dir) {
     std::cout << std::endl;
     test_tms_batch(data_dir);
     std::cout << std::endl;
-    test_tms_phisum(data_dir);
+    test_tms_lcp_summary(data_dir);
     std::cout << std::endl;
     test_ftab(data_dir);
     std::cout << std::endl;

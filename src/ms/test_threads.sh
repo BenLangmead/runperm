@@ -12,6 +12,7 @@ mkdir -p "$W"
 P="$DATA/minishred1_20_002"
 $M build-rlbwt "$P.bwt.heads" "$P.bwt.len" "$W/mini.idx" --lcp-bin "$P.lcp" > /dev/null 2>&1 || { echo "build failed"; exit 1; }
 $M tms-build "$P.bwt.heads" "$P.bwt.len" "$W/mini.tms" --lcp-bin "$P.lcp" > /dev/null 2>&1 || { echo "tms-build failed"; exit 1; }
+$M tms-build "$P.bwt.heads" "$P.bwt.len" "$W/nosum.tms" --lcp-bin "$P.lcp" --no-lcp-summary > /dev/null 2>&1 || { echo "tms-build --no-lcp-summary failed"; exit 1; }
 $M tms-text "$W/mini.tms" 2> /dev/null > "$W/text.txt"
 python3 - "$W" <<'PY'
 import random, sys
@@ -47,6 +48,8 @@ query mini.idx
 query mini.tms
 query mini.tms --mode phiskip --positions
 query mini.tms --mode phi --positions
+query mini.tms --mode phi-walk --positions
+query mini.tms --mode dual-walk --report smem-one
 query mini.tms --report smem-all
 query mini.tms --mode dual --report smem-one
 query mini.idx --orient rc
@@ -165,6 +168,17 @@ for o in --positions "--report smem-one" "--report smem-all" --phi-starts "--mod
     $M query mini.idx m.fa -o o.out $o 2> /dev/null && { echo "ms index accepted $o"; fails=$((fails + 1)); }
 done
 $M query mini.tms m.fa -o o.out --mode standard 2> /dev/null && { echo "tms index accepted --mode standard"; fails=$((fails + 1)); }
+for o in phisum dualsum; do
+    $M query mini.tms m.fa -o o.out --mode $o 2> /dev/null && { echo "tms index accepted --mode $o"; fails=$((fails + 1)); }
+done
+# An index built without LCP summaries serves phi-walk and dual-walk, not
+# phi and dual.
+for o in phi dual; do
+    $M query nosum.tms m.fa -o o.out --mode $o 2> /dev/null && { echo "an index without summaries served --mode $o"; fails=$((fails + 1)); }
+done
+$M query mini.tms reads.fa -o sum.pos --mode phi --positions 2> /dev/null
+$M query nosum.tms reads.fa -o o.out --mode phi-walk --positions 2> /dev/null || { echo "an index without summaries refused phi-walk"; fails=$((fails + 1)); }
+cmp -s sum.pos o.out || { echo "differs: phi-walk without summaries"; fails=$((fails + 1)); }
 $M query mini.idx reads.fa -o o.out --report ms 2> /dev/null || { echo "ms index refused --report ms"; fails=$((fails + 1)); }
 # Values given as --name=VALUE are the same as --name VALUE.
 $M query mini.tms reads.fa -o eq1.out --mode phi --positions --threads 3 --block-reads 13 2> /dev/null
@@ -179,7 +193,7 @@ echo "checked orientation"
 # the reverse complements with --orient rc.
 $M query mini.tms reads.fa -o ref.out --oracle-write ref.orc 2> err.txt || { echo "failed: oracle-write"; cat err.txt; exit 1; }
 $M query mini.tms reads.fa -o ref.pos --mode phi --positions 2> /dev/null
-for rec in "psi 0 1 1000" "phi 7 3 13" "dual 32 8 1" "phiskip 1 17 13"; do
+for rec in "psi 0 1 1000" "phi 7 3 13" "dual 32 8 1" "phi-walk 3 2 7" "dual-walk 8 4 1000" "phiskip 1 17 13"; do
     set -- $rec
     $M query mini.tms reads.fa -o o.out --mode $1 --interleave $2 --threads $3 --block-reads $4 --oracle-write o.orc 2> /dev/null
     cmp -s ref.orc o.orc || { echo "oracle differs: recorded with $rec"; fails=$((fails + 1)); }

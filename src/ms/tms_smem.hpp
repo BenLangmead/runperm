@@ -59,7 +59,7 @@ enum class TmsReport {
 inline TmsParts tms_query_parts(TmsMode mode, bool positions, TmsReport report) {
     TmsParts p;
     const bool oracle = mode == TmsMode::ORACLE || mode == TmsMode::ORACLE_SCAN;
-    p.psi = mode != TmsMode::PHI && mode != TmsMode::PHISUM && !oracle;
+    p.psi = mode != TmsMode::PHI_WALK && mode != TmsMode::PHI && !oracle;
     p.phi = (mode != TmsMode::PSI && !oracle) || positions || report != TmsReport::MS;
     p.phi_inv = report == TmsReport::SMEM_ALL;
     p.phi_starts = positions || report != TmsReport::MS;

@@ -39,7 +39,7 @@
  *  - Optionally, with phi, two LCP summary columns per LF row (see
  *    TmsLcpSummary): TOP_LCP, the LCP of the row's head with the row above,
  *    and INTERIOR_MIN, the least LCP of the row's other rows.  They let a phi
- *    reposition (--mode phisum) take whole rows' minima from the rows its
+ *    reposition (--mode phi) take whole rows' minima from the rows its
  *    scan reads, walking phi only over the current row.
  *  - With psi, a table of F block starts.  An F block starts at a row start
  *    (the image of the first run of its character), so a row's F character

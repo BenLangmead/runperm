@@ -65,7 +65,11 @@ check() {  # name, build command, options...
     local name=$1 cmd=$2
     shift 2
     "$OLD" "$cmd" "$H" "$L" "$W/$name.legacy" "$@" > /dev/null 2>&1
-    "$NEW" "$cmd" "$H" "$L" "$W/$name.new" "$@" > /dev/null 2>&1
+    # Legacy tms indexes have no LCP summaries, so the new build leaves
+    # them out too.
+    local extra=()
+    [[ $cmd == tms-build && " $* " == *" --lcp-bin "* ]] && extra=(--no-lcp-summary)
+    "$NEW" "$cmd" "$H" "$L" "$W/$name.new" "$@" ${extra[@]+"${extra[@]}"} > /dev/null 2>&1
     "$NEW" index-rewrap "$W/$name.legacy" "$W/$name.rewrapped" > /dev/null
     same "$W/$name.new" "$W/$name.rewrapped" || { echo "$name: rewrapped index differs from a new build"; exit 1; }
     "$NEW" index-verify "$W/$name.rewrapped" > /dev/null || { echo "$name: index-verify failed"; exit 1; }
@@ -101,10 +105,10 @@ check tms_phi_unsplit tms-build --lcp-bin "$LCP" --layout phi --phi-split 0 --lf
 "$NEW" query "$W/ms.rewrapped" "$reads" -o "$W/q.rw" > /dev/null 2>&1
 cmp -s "$W/q.new" "$W/q.rw" || { echo "ms query output differs"; exit 1; }
 for name in tms_full tms_full_noinv tms_phi tms_phi_unsplit; do
-    for q in "--mode psi" "--mode phi" "--mode dual --positions" "--mode phi --report smem-all"; do
-        # The phi layout serves phi mode alone, and smem-all needs phi_inv.
+    for q in "--mode psi" "--mode phi-walk" "--mode dual-walk --positions" "--mode phi-walk --report smem-all"; do
+        # The phi layout serves phi-walk alone, and smem-all needs phi_inv.
         case "$name:$q" in
-            tms_phi*:"--mode psi" | tms_phi*:"--mode dual --positions" | tms_full_noinv:*smem-all) continue ;;
+            tms_phi*:"--mode psi" | tms_phi*:"--mode dual-walk --positions" | tms_full_noinv:*smem-all) continue ;;
         esac
         # shellcheck disable=SC2086
         "$NEW" query "$W/$name.new" "$reads" -o "$W/q.new" $q > /dev/null 2>&1

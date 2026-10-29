@@ -39,13 +39,13 @@
 #ifdef TMS_STATS
 struct TmsStats { ulint bases = 0, repositions = 0, psi_steps = 0, phi_steps = 0, scan_rows = 0, dist = 0, len_at_rep = 0, lce = 0, lce_capped = 0, dist1 = 0,
                   lf_ff = 0, lf_steps = 0, scan_visits = 0, walk_visits = 0;
-                  // PHISUM: sides settled from the summaries alone and sides
+                  // PHI: sides settled from the summaries alone and sides
                   // that walked phi, the walks' steps over the current row's
                   // part, and the walks down that also crossed rows continuing
                   // the current row's run, with their steps there.
                   ulint sum_up_settled = 0, sum_up_walked = 0, sum_down_settled = 0, sum_down_walked = 0,
                         sum_partial_steps = 0, sum_cont_walks = 0, sum_cont_steps = 0;
-                  // DUALSUM: of the sides not settled, those whose phi walk
+                  // DUAL: of the sides not settled, those whose phi walk
                   // races psi, each side's psi steps, and the sides decided by
                   // psi and by phi.
                   ulint sum_up_raced = 0, sum_down_raced = 0, sum_up_psi_steps = 0, sum_down_psi_steps = 0,
@@ -181,13 +181,13 @@ inline std::vector<ulint> tms_query(TmsIndex& idx, const std::string& pattern) {
 
 /** How a reposition computes the LCE of the current row with a candidate. */
 enum class TmsMode {
-    PSI,      // compare the pattern with the candidate's suffix, read with psi
-    PHI,      // walk phi across the rows between, reading PLCP
-    PHISUM,   // as PHI, with whole rows' minima from the LCP summaries, walking only the current row
-    PHISKIP,  // psi if the match length is below the row distance, else phi
-    DUAL,     // psi if the match length is below the row distance, else both, first to finish wins
-    DUALSUM,  // as PHISUM, then on a side the summaries do not settle, DUAL's race on what is left
-    ORACLE,   // replay recorded outcomes: no candidate scan and no LCE (see RepositionOracle)
+    PSI,        // compare the pattern with the candidate's suffix, read with psi
+    PHI_WALK,   // walk phi across the rows between, reading PLCP
+    PHI,        // as PHI_WALK, with whole rows' minima from the LCP summaries, walking only the current row
+    PHISKIP,    // psi if the match length is below the row distance, else phi
+    DUAL_WALK,  // psi if the match length is below the row distance, else both, first to finish wins
+    DUAL,       // as PHI, then on a side the summaries do not settle, DUAL_WALK's race on what is left
+    ORACLE,     // replay recorded outcomes: no candidate scan and no LCE (see RepositionOracle)
     ORACLE_SCAN,  // replay recorded outcomes' side and LCE, but scan that side for the candidate
 };
 
@@ -220,14 +220,14 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  *  - for a pred reposition with positions, finish the phi step that gives
  *    the text position of the pred tail row.
  *
- * The pred and succ walks run side by side, and in DUAL each side can run a
+ * The pred and succ walks run side by side, and in DUAL_WALK each side can run a
  * psi and a phi walk at once.  A psi walk's count so far is a lower bound on
  * its side's capped LCE and a phi walk's minimum so far is an upper bound, so
  * a side stops as soon as it can no longer win (ties go to pred).  Every
  * mode therefore chooses the same candidate, and the lengths and positions
  * do not depend on the mode or on k.
  *
- * PHISUM splits each phi LCE into whole LF rows and the current row's part.
+ * PHI splits each phi LCE into whole LF rows and the current row's part.
  * The scan takes the minimum of the TOP_LCP and INTERIOR_MIN summaries (see
  * TmsLcpSummary) of the rows it crosses, and the candidate row's TOP_LCP on
  * the succ side, the current row's on the pred side.  That minimum, capped,
@@ -241,17 +241,17 @@ constexpr ulint TMS_NO_POS = std::numeric_limits<ulint>::max();
  * stored only at run heads; when the rows below the current one continue
  * its run (LF splitting), the walk crosses them too.
  *
- * DUALSUM settles sides as PHISUM does.  On a side left unsettled it runs a
+ * DUAL settles sides as PHI does.  On a side left unsettled it runs a
  * psi walk from the candidate, stopping at the upper bound rather than the
  * cap, and alongside it, when the cap is at least that walk's length,
- * PHISUM's phi walk; the first to finish decides the side, as in DUAL.
+ * PHI's phi walk; the first to finish decides the side, as in DUAL_WALK.
  *
  * Rows are read through the row access acc (TmsIndex::PackedAccess or
  * ColumnAccess).  out_len[j] receives the statistics for patterns[j]; if positions is true,
  * out_pos[j] receives for each one a text position where it occurs
  * (TMS_NO_POS with a statistic of 0).  Every mode but PSI, and positions,
- * need an index with phi; PSI, PHISKIP, DUAL and DUALSUM one with psi; and
- * PHISUM and DUALSUM one with LCP summaries.  PhiStarts
+ * need an index with phi; PSI, PHISKIP, DUAL_WALK and DUAL one with psi; and
+ * PHI and DUAL one with LCP summaries.  PhiStarts
  * says which form of phi the walks and the toehold use; positions need the
  * starts-based form.  With an ftab (ftab.hpp) built for idx, a pattern
  * whose last k-mer occurs starts from the table's state, k steps in; a
@@ -296,8 +296,8 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint phi_left;   // phi walk: LCP values still to read
         ulint value;      // the capped LCE, once done
         ulint floor;      // phi walk: a lower bound on the LCP values still to read
-        ulint cont_left;  // PHISUM succ walk: values still to read in rows continuing the current row's run
-        // DUALSUM: the summaries' upper bound on the capped LCE, where a psi walk stops.
+        ulint cont_left;  // PHI succ walk: values still to read in rows continuing the current row's run
+        // DUAL: the summaries' upper bound on the capped LCE, where a psi walk stops.
         ulint bound = std::numeric_limits<ulint>::max();
         bool psi_on, phi_on, done, lost;
 #ifdef TMS_REP_LOG
@@ -322,7 +322,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
         ulint lo, hi;     // the LF rows prefetched for the scans
         ulint dist_up, dist_down;  // rows from the current row to u's tail and d's head
         bool found_up, found_down, scanned_up, scanned_down;
-        // PHISUM: the current row's TOP_LCP, INTERIOR_MIN and character code, and
+        // PHI: the current row's TOP_LCP, INTERIOR_MIN and character code, and
         // its rows below the current one; the summaries' minima over the
         // rows the scans crossed and succ's TOP_LCP; and the first row below
         // the current one that starts a BWT run, once found, with the rows
@@ -446,17 +446,17 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
     };
     auto setup = [&](Side& x, ulint dist, ulint cap) {
         if constexpr (Mode == TmsMode::PSI) x.psi_on = true;
-        else if constexpr (Mode == TmsMode::PHI || Mode == TmsMode::PHISUM) x.phi_on = true;
+        else if constexpr (Mode == TmsMode::PHI_WALK || Mode == TmsMode::PHI) x.phi_on = true;
         else if constexpr (Mode == TmsMode::PHISKIP) { x.psi_on = cap < dist; x.phi_on = !x.psi_on; }
         else { x.psi_on = true; x.phi_on = cap >= dist; }
         x.psi_lce = 0;
         x.phi_min = INF;
         x.phi_left = dist;
     };
-    constexpr bool PsiWalks = Mode != TmsMode::PHI && Mode != TmsMode::PHISUM && !Replay,
+    constexpr bool PsiWalks = Mode != TmsMode::PHI_WALK && Mode != TmsMode::PHI && !Replay,
                    PhiWalks = Mode != TmsMode::PSI && !Replay;
-    constexpr bool DualSum = Mode == TmsMode::DUALSUM;
-    constexpr bool Sum = Mode == TmsMode::PHISUM || DualSum;
+    constexpr bool DualSum = Mode == TmsMode::DUAL;
+    constexpr bool Sum = Mode == TmsMode::PHI || DualSum;
     auto step_side = [&](Side& x, const char* rest, ulint cap) {
         if (PsiWalks && x.psi_on) {
             TMS_COUNT(psi_steps, 1);
@@ -775,7 +775,7 @@ inline void tms_query_batch_impl(TmsIndex& idx, const Access acc, const std::vec
                                     TMS_COUNT(sum_down_walked, 1);
                                     TMS_COUNT(sum_cont_walks, x.phi_on && s.cont_len > 0);
                                     if constexpr (DualSum) {
-                                        // Row d and the row below it, as in DUAL.
+                                        // Row d and the row below it, as in DUAL_WALK.
                                         x.psi_on = true;
                                         x.bound = upper;
                                         x.q = acc.psi_at_head(s.d);
@@ -915,11 +915,12 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
         throw std::invalid_argument("this mode or positions need an index built with phi");
     if (out_pos && !idx.has_phi_starts())
         throw std::invalid_argument("positions need phi's starts-based form, which this index was loaded without");
-    if (mode != TmsMode::PHI && mode != TmsMode::PHISUM && !oracle && !idx.has_psi())
+    if (mode != TmsMode::PHI_WALK && mode != TmsMode::PHI && !oracle && !idx.has_psi())
         throw std::invalid_argument("this mode needs an index with psi");
-    if ((mode == TmsMode::PHISUM || mode == TmsMode::DUALSUM) && !idx.has_lcp_summary())
-        throw std::invalid_argument(std::string("--mode ") + (mode == TmsMode::PHISUM ? "phisum" : "dualsum") +
-                                    " needs an index with LCP summaries (tms-build --lcp-summary or tms-add-summary)");
+    if ((mode == TmsMode::PHI || mode == TmsMode::DUAL) && !idx.has_lcp_summary())
+        throw std::invalid_argument(std::string("--mode ") + (mode == TmsMode::PHI ? "phi" : "dual") +
+                                    " needs an index with LCP summaries (tms-build with --minima or --lcp-bin, or "
+                                    "tms-add-summary); --mode phi-walk and dual-walk read one without them");
     if (ft && (oracle || record))
         throw std::invalid_argument("recording or replaying repositions takes no ftab, which skips some of them");
     if (ft && (mode != TmsMode::PSI || out_pos) && !ft->has_toehold())
@@ -953,11 +954,11 @@ inline void tms_query_batch(TmsIndex& idx, const std::vector<std::string>& patte
     };
     switch (mode) {
         case TmsMode::PSI: run_rec(std::integral_constant<TmsMode, TmsMode::PSI>{}); break;
+        case TmsMode::PHI_WALK: run_rec(std::integral_constant<TmsMode, TmsMode::PHI_WALK>{}); break;
         case TmsMode::PHI: run_rec(std::integral_constant<TmsMode, TmsMode::PHI>{}); break;
-        case TmsMode::PHISUM: run_rec(std::integral_constant<TmsMode, TmsMode::PHISUM>{}); break;
         case TmsMode::PHISKIP: run_rec(std::integral_constant<TmsMode, TmsMode::PHISKIP>{}); break;
+        case TmsMode::DUAL_WALK: run_rec(std::integral_constant<TmsMode, TmsMode::DUAL_WALK>{}); break;
         case TmsMode::DUAL: run_rec(std::integral_constant<TmsMode, TmsMode::DUAL>{}); break;
-        case TmsMode::DUALSUM: run_rec(std::integral_constant<TmsMode, TmsMode::DUALSUM>{}); break;
         case TmsMode::ORACLE: run(std::integral_constant<TmsMode, TmsMode::ORACLE>{}, std::false_type{}); break;
         case TmsMode::ORACLE_SCAN:
             run(std::integral_constant<TmsMode, TmsMode::ORACLE_SCAN>{}, std::false_type{});
