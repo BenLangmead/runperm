@@ -441,7 +441,7 @@ public:
         h.bwt_runs = bwt_runs_;
         h.info = info_;
         std::vector<SectionSource> srcs;
-        srcs.push_back(move_table_source(Section::LF, lf_, LF_COLS));
+        srcs.push_back(move_table_source(Section::LF, lf_, LF_COLS, SUMMARY_COLS));
         if (has_psi_) {
             SectionEntry e;
             e.id = Section::F_STARTS;
@@ -558,6 +558,63 @@ public:
     /** The LCP summaries of LF row k: the LCP at its head row, and the least of its other rows'. */
     ulint top_lcp(ulint k) const { return lf_.template get<TmsLFCols::TOP_LCP>(k); }
     ulint int_min(ulint k) const { return lf_.template get<TmsLFCols::INT_MIN>(k); }
+
+    /** The lengths of LF's rows, in row order: those that lf_row_lengths gave the build. */
+    orbit::int_vector row_lengths() const {
+        ulint max_len = 0;
+        for (ulint k = 0; k < lf_.intervals(); ++k) max_len = std::max<ulint>(max_len, lf_.get_length(k));
+        orbit::int_vector rows(lf_.intervals(), orbit::bit_width(max_len));
+        for (ulint k = 0; k < lf_.intervals(); ++k) rows.set(k, lf_.get_length(k));
+        return rows;
+    }
+
+    /** The lengths of the BWT runs: the maximal runs of one character in LF's rows. */
+    orbit::int_vector run_lengths() {
+        std::vector<ulint> lens;
+        lens.reserve(bwt_runs_);
+        ulint max_len = 0;
+        for (ulint k = 0, prev = 256; k < lf_.intervals(); ++k) {
+            const uchar c = lf_.get_character(k);
+            if (c != prev) lens.push_back(0);
+            lens.back() += lf_.get_length(k);
+            max_len = std::max(max_len, lens.back());
+            prev = c;
+        }
+        orbit::int_vector out(lens.size(), orbit::bit_width(max_len));
+        for (size_t i = 0; i < lens.size(); ++i) out.set(i, lens[i]);
+        return out;
+    }
+
+    /**
+     * Fill LF's LCP summary columns with sum, one value per row (see
+     * TmsLcpSummary), at the widths a build with them gives, replacing any
+     * summaries the index has.  Every other column keeps its values and
+     * width, so the index equals one built with the same summaries.
+     */
+    void set_lcp_summary(const TmsLcpSummary& sum) {
+        if (sum.top.size() != lf_.intervals() || sum.int_min.size() != lf_.intervals())
+            throw std::invalid_argument("LCP summaries must have one value per LF row");
+        ulint max_top = 0, max_int = 0;
+        for (size_t k = 0; k < sum.top.size(); ++k) {
+            max_top = std::max<ulint>(max_top, sum.top[k]);
+            max_int = std::max<ulint>(max_int, sum.int_min[k]);
+        }
+        std::array<uchar, static_cast<size_t>(TmsLFCols::COUNT)> widths{};
+        const auto& all = lf_.get_widths();
+        for (size_t c = 0; c < widths.size(); ++c) widths[c] = all[all.size() - widths.size() + c];
+        widths[col(TmsLFCols::TOP_LCP)] = std::max<uchar>(1, orbit::bit_width(max_top));
+        widths[col(TmsLFCols::INT_MIN)] = std::max<uchar>(1, orbit::bit_width(max_int));
+        lf_.set_data_widths(widths);
+        for (size_t k = 0; k < sum.top.size(); ++k) {
+            lf_.template set_data<TmsLFCols::TOP_LCP>(k, sum.top[k]);
+            lf_.template set_data<TmsLFCols::INT_MIN>(k, sum.int_min[k]);
+        }
+    }
+
+    /** LF's section (see index_format.hpp), as serialize writes it; the index must outlive the write. */
+    orbit_idx::SectionSource lf_source() {
+        return orbit_idx::move_table_source(orbit_idx::Section::LF, lf_, LF_COLS, SUMMARY_COLS);
+    }
     /** Whether phi's starts-based form, and its lengths-based form, are present. */
     bool has_phi_starts() const { return has_phi_starts_; }
     bool has_phi_lengths() const { return has_phi_len_; }
@@ -1119,6 +1176,10 @@ private:
     static constexpr std::array<Col, 10> LF_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::CHARACTER,
                                                  Col::PSI_INT, Col::PSI_OFF, Col::PHI_INT, Col::PHI_OFF,
                                                  Col::TOP_LCP, Col::INT_MIN};
+    // LF's last columns, TOP_LCP and INT_MIN, are written only with
+    // summaries, so an index without them has the LF section of a build
+    // that predates them, and such a section loads with them at width 0.
+    static constexpr size_t SUMMARY_COLS = 2;
     static constexpr std::array<Col, 4> PHI_LEN_COLS{Col::LENGTH, Col::POINTER, Col::OFFSET, Col::PLCP};
     static constexpr std::array<Col, 4> PHI_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCP};
     static constexpr std::array<Col, 4> PHI_INV_COLS{Col::START, Col::POINTER, Col::OFFSET, Col::PLCPB};
@@ -1160,7 +1221,7 @@ private:
         check_parts(held, want);
         const uint32_t mask = need ? sections_for(want) : h.held_mask();
         auto wants = [&](Section s) { return (mask & section_bit(s)) != 0; };
-        rd.load_move_table(Section::LF, lf_, LF_COLS);
+        rd.load_move_table(Section::LF, lf_, LF_COLS, SUMMARY_COLS);
         if (wants(Section::F_STARTS)) {
             const std::vector<uint64_t> v = rd.load_u64s(Section::F_STARTS);
             if (v.size() != F_BLOCKS) throw std::runtime_error("tms index has another number of F block starts");

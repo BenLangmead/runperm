@@ -46,7 +46,7 @@ The file ends where the last section ends; `ms index-verify` checks this along w
 | 40 | u32 | CRC-32 (IEEE) of the payload |
 | 48 | (u8, u8)[12] | (column code, width) per column, in row order |
 
-Column codes: 1 len, 2 start, 3 ptr, 4 off, 5 chr, 16 psi_int, 17 psi_off, 18 phi_int, 19 phi_off, 20 plcp, 21 plcpb, 22 top_lcp, 23 int_min, 32 lcp_top, 33 lcp_min_sub, 34 lcp_spill. A width of 0 means the column takes no bits and reads as 0, as with the LF columns a tms layout omits. Column 0 says whether a move table stores lengths (`len`) or absolute starts (`start`). In a tms LF, `phi_int` holds, at each row that starts a BWT run, the φ interval that starts at that row's text position (0 at other rows), and `phi_off` has width 0, since the φ points queries read all have offset 0. A tms LF has ten columns, the last two `top_lcp` and `int_min`, the LCP summaries of each row that `tms-build --lcp-summary` adds and `--mode phisum` reads (width 0 otherwise); a reader of this layout refuses an LF section with the earlier eight columns, so indexes built or rewrapped before them must be built again. Indexes rewrapped from TMSX v8 keep the nonzero `phi_off` width their builds gave it, which loads and answers the same.
+Column codes: 1 len, 2 start, 3 ptr, 4 off, 5 chr, 16 psi_int, 17 psi_off, 18 phi_int, 19 phi_off, 20 plcp, 21 plcpb, 22 top_lcp, 23 int_min, 32 lcp_top, 33 lcp_min_sub, 34 lcp_spill. A width of 0 means the column takes no bits and reads as 0, as with the LF columns a tms layout omits. Column 0 says whether a move table stores lengths (`len`) or absolute starts (`start`). In a tms LF, `phi_int` holds, at each row that starts a BWT run, the φ interval that starts at that row's text position (0 at other rows), and `phi_off` has width 0, since the φ points queries read all have offset 0. A tms LF may have two more columns after the eight above, `top_lcp` and `int_min`, the LCP summaries of each row that `tms-build --lcp-summary` or `tms-add-summary` adds and `--mode phisum` and `dualsum` read. Without summaries the section leaves them out, entry and payload alike, so it is the LF section of a build that predates them, and a reader loads an eight-column LF section with both at width 0. Indexes built or rewrapped before the summaries therefore load unchanged, and `tms-add-summary` gives one its summaries, rewriting LF alone. Indexes rewrapped from TMSX v8 keep the nonzero `phi_off` width their builds gave it, which loads and answers the same.
 
 Payloads:
 
@@ -76,8 +76,8 @@ This section describes the current `ms` binary, not the format.
 | `--mode psi` | LF, F_STARTS |
 | `--mode phi` or `phisum` | LF, PHI_LEN |
 | `--mode phi` with `--phi-starts`, `--positions` or `--report smem-one` | LF, PHI_START |
-| `--mode phiskip` or `dual` | LF, F_STARTS, PHI_LEN |
-| psi with `--positions` or `--report smem-one`; phiskip or dual with those or `--phi-starts` | LF, F_STARTS, PHI_START |
+| `--mode phiskip`, `dual` or `dualsum` | LF, F_STARTS, PHI_LEN |
+| psi with `--positions` or `--report smem-one`; phiskip, dual or dualsum with those or `--phi-starts` | LF, F_STARTS, PHI_START |
 | `--mode oracle` or `oracle-scan` (replaying recorded repositions) | LF |
 | `--mode oracle` or `oracle-scan` with `--positions` or `--report smem-one` | LF, PHI_START |
 | `--report smem-all` | LF, PHI_START, PHI_INV, SEQ_IDS if held, plus F_STARTS outside phi and oracle modes |

@@ -146,6 +146,19 @@ public:
         return table.get_widths();
     }
 
+    /**
+     * Repack the rows with the last num_data_cols columns at the widths
+     * data_widths, every value kept: each must fit its new width.
+     */
+    template<size_t num_data_cols>
+    void repack_data_widths(const std::array<uchar, num_data_cols>& data_widths) {
+        std::array<uchar, num_cols> widths = table.get_widths();
+        set_data_widths(widths, data_widths);
+        packed_vector<columns> repacked(table.size(), widths);
+        for (size_t i = 0; i < table.size(); ++i) repacked.set_row(i, table.get_row(i));
+        table = table_t<columns_t>(std::move(repacked));
+    }
+
     // === position Navigation ===
     position first() const {
         return position();

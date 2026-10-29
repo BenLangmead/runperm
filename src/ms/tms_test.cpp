@@ -1613,7 +1613,8 @@ bool test_index_format() {
     assert(h.tool == Tool::TMS && h.layout == Layout::FULL && h.n == idx.domain() && h.bwt_runs == idx.bwt_runs());
     assert(h.sections.size() == 5 && h.info == "built_by=test\n");
     const SectionEntry* lf = h.find(Section::LF);
-    assert(lf && lf->rows == idx.lf().intervals() && lf->cols.size() == 10);
+    // Without LCP summaries, LF's section leaves out their two columns.
+    assert(lf && lf->rows == idx.lf().intervals() && lf->cols.size() == 8);
     assert(lf->cols[4].first == static_cast<uint8_t>(Col::PSI_INT) && lf->cols[4].second == idx.lf().get_widths()[4]);
     for (const auto& e : h.sections) assert(e.offset % SECTION_ALIGN == 0);
     assert(file.size() == h.sections.back().offset + h.sections.back().bytes);
@@ -2161,16 +2162,19 @@ TmsLcpSummary exact_summaries(const std::vector<uchar>& heads, const std::vector
 }
 
 /**
- * tms_query_batch in PHISUM gives the lengths and positions PHI gives, for
- * several numbers of patterns in flight, with packed and column access,
- * after a serialize and load, in the full and phi layouts, and under
- * splittings that cut runs into many LF rows.  The summaries come from each
- * run's minima-only pairs, as from a minima file, and also, exactly, from
- * the full LCPs.  PHISUM refuses an index without summaries.  Runs on the
- * fuzz texts and, if its LF is a single cycle, on minishred.
+ * tms_query_batch in PHISUM gives the lengths and positions PHI gives, and
+ * in DUALSUM (full layout) those DUAL gives, for several numbers of patterns
+ * in flight, with packed and column access, after a serialize and load, in
+ * the full and phi layouts, and under splittings that cut runs into many LF
+ * rows.  The summaries come from each run's minima-only pairs, as from a
+ * minima file, and also, exactly, from the full LCPs.  Summaries from the
+ * pairs added to a loaded index built without them (set_lcp_summary, as
+ * tms-add-summary does) give the file a build with them writes.  PHISUM and
+ * DUALSUM refuse an index without summaries.  Runs on the fuzz texts and, if
+ * its LF is a single cycle, on minishred.
  */
 bool test_tms_phisum(const std::string& data_dir) {
-    std::cout << "Testing tms_query_batch in phisum mode against phi" << std::endl;
+    std::cout << "Testing tms_query_batch in phisum and dualsum modes against phi and dual" << std::endl;
     std::mt19937 rng(43);
     struct LcpInput { std::vector<uchar> heads; std::vector<ulint> lens; std::vector<std::vector<ulint>> lcps; std::string str; };
     std::vector<LcpInput> inputs;
@@ -2207,7 +2211,7 @@ bool test_tms_phisum(const std::string& data_dir) {
         o.lf_split = orbit::split_params(cap, std::nullopt);
         variants.push_back(o);
     }
-    size_t checked = 0, cont_rows = 0;
+    size_t checked = 0, checked_dual = 0, cont_rows = 0, added = 0;
     bool refused = false;
     for (const auto& in : inputs) {
         std::vector<ulint> tops;
@@ -2222,10 +2226,13 @@ bool test_tms_phisum(const std::string& data_dir) {
                     std::vector<std::vector<ulint>> len;
                     assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::PHISUM); },
                                                          "--lcp-summary"));
+                    assert(throws<std::invalid_argument>([&] { tms_query_batch(plain, pats, 8, len, TmsMode::DUALSUM); },
+                                                         "--lcp-summary"));
                     refused = true;
                 }
-                std::vector<std::vector<ulint>> want, want_pos;
+                std::vector<std::vector<ulint>> want, want_pos, want_dual, want_dual_pos;
                 tms_query_batch(plain, pats, 8, want, TmsMode::PHI, &want_pos);
+                if (layout == TmsLayout::FULL) tms_query_batch(plain, pats, 8, want_dual, TmsMode::DUAL, &want_dual_pos);
                 const orbit::int_vector rows = TmsIndex::lf_row_lengths(in.heads, in.lens, o);
                 auto cut = ms_build::row_summaries(in.lens, rows, ms_build::lcp_vectors_source(in.lcps, true));
                 const TmsLcpSummary from_minima{std::move(cut.first), std::move(cut.second)};
@@ -2237,6 +2244,31 @@ bool test_tms_phisum(const std::string& data_dir) {
                     for (ulint k = 1; k < idx.move_runs(); ++k) cont_rows += idx.get_character(k) == idx.get_character(k - 1);
                     std::stringstream ss;
                     idx.serialize(ss);
+                    if (sum == &from_minima) {
+                        // The summaries added to the plain index, loaded from
+                        // a file written without them, with its own rows and
+                        // runs.
+                        std::stringstream ps;
+                        plain.serialize(ps);
+                        TmsIndex aug;
+                        aug.load(ps);
+                        assert(!aug.has_lcp_summary());
+                        const orbit::int_vector run_lens = aug.run_lengths();
+                        assert(run_lens.size() == in.lens.size());
+                        for (size_t i = 0; i < in.lens.size(); ++i) assert(run_lens[i] == in.lens[i]);
+                        auto c = ms_build::row_summaries(run_lens, aug.row_lengths(),
+                                                         ms_build::lcp_vectors_source(in.lcps, true));
+                        aug.set_lcp_summary(TmsLcpSummary{std::move(c.first), std::move(c.second)});
+                        std::stringstream as;
+                        aug.serialize(as);
+                        if (as.str() != ss.str()) {
+                            std::cout << "  FAILED: summaries added to a loaded index give another file than a build "
+                                         "with them, layout " << int(layout) << std::endl;
+                            assert(false && "set_lcp_summary must give the index a build with summaries gives");
+                            return false;
+                        }
+                        ++added;
+                    }
                     TmsIndex loaded;
                     loaded.load(ss);
                     assert(loaded.has_lcp_summary());
@@ -2254,13 +2286,27 @@ bool test_tms_phisum(const std::string& data_dir) {
                                 return false;
                             }
                             ++checked;
+                            if (layout != TmsLayout::FULL) continue;
+                            got.clear();
+                            pos.clear();
+                            tms_query_batch(k == 3 ? loaded : idx, pats, k, got, TmsMode::DUALSUM,
+                                            with_pos ? &pos : nullptr, packed);
+                            if (got != want_dual || (with_pos && pos != want_dual_pos)) {
+                                std::cout << "  FAILED dualsum: " << (got != want_dual ? "lengths" : "positions") << ", k "
+                                          << k << ", packed " << packed << ", summaries "
+                                          << (sum == &exact ? "exact" : "from minima") << std::endl;
+                                assert(false && "dualsum must give dual's lengths and positions");
+                                return false;
+                            }
+                            ++checked_dual;
                         }
                     }
                 }
             }
         }
     }
-    std::cout << "  " << checked << " batches over " << cont_rows << " rows continuing a run PASSED" << std::endl;
+    std::cout << "  " << checked << " phisum and " << checked_dual << " dualsum batches over " << cont_rows
+              << " rows continuing a run, " << added << " indexes given summaries after loading, PASSED" << std::endl;
     return true;
 }
 

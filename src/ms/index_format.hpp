@@ -352,6 +352,77 @@ inline void write_zeros(std::ostream& out, uint64_t n) {
         n -= k;
     }
 }
+
+/**
+ * The offset of the column widths in a serialized Orbit permutation whose
+ * first have bytes are b: past the OBPT preamble, the split parameters (two
+ * flags, each followed by 8 bytes when set), and the OBMS and OBPM
+ * preambles.  0 if more bytes are needed to tell.
+ */
+inline size_t perm_widths_at(const char* b, size_t have) {
+    size_t p = 4 + 24;
+    for (int k = 0; k < 2; ++k) {
+        if (have <= p) return 0;
+        p += 1 + (b[p] ? 8 : 0);
+    }
+    return p + 4 + 24 + 16 + 4 + 24 + 8;
+}
+
+/**
+ * Passes a serialized Orbit permutation to dst with the drop column widths
+ * after the first keep left out.  The packed rows are unchanged when the
+ * columns left out have width 0 and come last.
+ */
+struct DropWidthsBuf : std::streambuf {
+    std::streambuf* dst;
+    size_t keep, drop;
+    std::string head;
+    bool passing = false;
+    DropWidthsBuf(std::streambuf* d, size_t k, size_t n) : dst(d), keep(k), drop(n) {}
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        const char ch = traits_type::to_char_type(c);
+        return xsputn(&ch, 1) == 1 ? c : traits_type::eof();
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        if (passing) return dst->sputn(s, n);
+        head.append(s, static_cast<size_t>(n));
+        const size_t p = perm_widths_at(head.data(), head.size());
+        if (p && head.size() >= p + keep + drop) {
+            passing = true;
+            const auto first = static_cast<std::streamsize>(p + keep);
+            const auto rest = static_cast<std::streamsize>(head.size() - (p + keep + drop));
+            if (dst->sputn(head.data(), first) != first ||
+                dst->sputn(head.data() + p + keep + drop, rest) != rest)
+                return 0;
+            head.clear();
+        }
+        return n;
+    }
+};
+
+/** Serves the bytes of pre, then those of src. */
+struct PrefixBuf : std::streambuf {
+    std::string pre;
+    std::streambuf* src;
+    char ch = 0;
+    PrefixBuf(std::string p, std::streambuf* s) : pre(std::move(p)), src(s) {
+        setg(pre.data(), pre.data(), pre.data() + pre.size());
+    }
+    int_type underflow() override {
+        const int_type c = src->sbumpc();
+        if (traits_type::eq_int_type(c, traits_type::eof())) return c;
+        ch = traits_type::to_char_type(c);
+        setg(&ch, &ch, &ch + 1);
+        return c;
+    }
+    std::streamsize xsgetn(char* s, std::streamsize n) override {
+        const std::streamsize take = std::min<std::streamsize>(n, egptr() - gptr());
+        std::memcpy(s, gptr(), static_cast<size_t>(take));
+        gbump(static_cast<int>(take));
+        return take + (n > take ? src->sgetn(s + take, n - take) : 0);
+    }
+};
 }  // namespace detail
 
 inline uint64_t align_up(uint64_t x) { return (x + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN; }
@@ -426,6 +497,30 @@ SectionSource move_table_source(Section id, Structure& x, const std::array<Col, 
     return SectionSource{move_table_entry(id, x, codes), [&x](std::ostream& o) { x.serialize(o); }};
 }
 
+/**
+ * As move_table_source, but the last optional columns are left out of the
+ * section, entry and payload alike, where they and every column after them
+ * have width 0, so that the section reads the same as one written by a
+ * build without them.  Reader::load_move_table with the same optional reads
+ * it back.
+ */
+template <typename Structure, size_t N>
+SectionSource move_table_source(Section id, Structure& x, const std::array<Col, N>& codes, size_t optional) {
+    SectionSource s = move_table_source(id, x, codes);
+    const auto& w = x.get_widths();
+    size_t keep = N;
+    while (keep > N - optional && w[keep - 1] == 0) --keep;
+    if (keep == N) return s;
+    s.entry.cols.resize(keep);
+    s.write = [&x, keep](std::ostream& o) {
+        detail::DropWidthsBuf d(o.rdbuf(), keep, N - keep);
+        std::ostream os(&d);
+        x.serialize(os);
+        if (!os.good() || !d.passing) o.setstate(std::ios::badbit);
+    };
+    return s;
+}
+
 // --- Reading -------------------------------------------------------------
 
 /**
@@ -446,20 +541,38 @@ public:
 
     /**
      * Load the move table of section id into x, which has the given column
-     * codes, and check it against its entry.  Throws if the section is
-     * missing or disagrees.
+     * codes, and check it against its entry.  The section may lack up to
+     * the last optional columns, which are then loaded with width 0.
+     * Throws if the section is missing or disagrees.
      */
     template <typename Structure, size_t N>
-    void load_move_table(Section id, Structure& x, const std::array<Col, N>& codes) {
+    void load_move_table(Section id, Structure& x, const std::array<Col, N>& codes, size_t optional = 0) {
         const SectionEntry& e = entry(id, Kind::MOVE_TABLE);
-        if (e.cols.size() != N) fail(e, "has another number of columns than this build reads");
-        for (size_t c = 0; c < N; ++c)
+        const size_t held = e.cols.size();
+        if (held > N || held + optional < N) fail(e, "has another number of columns than this build reads");
+        for (size_t c = 0; c < held; ++c)
             if (e.cols[c].first != static_cast<uint8_t>(codes[c]))
                 fail(e, std::string("has column ") + col_name(e.cols[c].first) + " where this build reads " +
                             col_name(static_cast<uint8_t>(codes[c])));
         seek(e.offset);
         try {
-            x.load(in_);
+            if (held == N) {
+                x.load(in_);
+            } else {
+                // The preamble and the widths held, then a zero width for
+                // each column the section lacks, then the rest as stored.
+                std::string head;
+                for (size_t p = 0; !p || head.size() < p + held; p = detail::perm_widths_at(head.data(), head.size())) {
+                    const int c = in_.get();
+                    if (c == std::char_traits<char>::eof()) fail(e, "is truncated");
+                    head.push_back(static_cast<char>(c));
+                }
+                head.append(N - held, '\0');
+                detail::PrefixBuf pb(std::move(head), &buf_);
+                std::istream is(&pb);
+                x.load(is);
+                if (!is.good()) in_.setstate(std::ios::failbit);
+            }
         } catch (const std::exception&) {
             // A structure cut short fails a check of the bytes it did not get.
             if (!in_.good()) fail(e, "is truncated");
@@ -468,7 +581,7 @@ public:
         check_end(e);
         const auto& w = x.get_widths();
         for (size_t c = 0; c < N; ++c)
-            if (w[c] != e.cols[c].second) fail(e, "has widths other than its header entry");
+            if (w[c] != (c < held ? e.cols[c].second : 0)) fail(e, "has widths other than its header entry");
         if (x.intervals() != e.rows || x.domain() != e.domain) fail(e, "has rows or domain other than its header entry");
     }
 
@@ -610,7 +723,7 @@ std::string rewrap_legacy(const std::string& from, const std::string& to, const 
  * Copy the index at from to to with section s added last, or put in place
  * of a section with the same id, and info appended to the provenance.  The
  * other sections' bytes are copied once each, checked against their CRC-32s,
- * and keep their offsets if s replaces none of them or the last.  Throws on
+ * and those before s keep their offsets.  Throws on
  * failure.
  */
 void add_section(const std::string& from, const std::string& to, SectionSource& s, const std::string& info);

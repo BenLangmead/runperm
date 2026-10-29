@@ -462,6 +462,15 @@ public:
         move_structure.template set<cols_traits::template data_column<col>()>(interval, value);
     }
 
+    /**
+     * Give the data columns the widths data_widths, keeping every value,
+     * each of which must fit its new width.  Integrated only.
+     */
+    void set_data_widths(const std::array<uchar, num_run_cols>& data_widths) {
+        static_assert(integrated_move_structure, "data is repacked in place only in an integrated move structure");
+        move_structure.repack_data_widths(data_widths);
+    }
+
     /** The width of data column col.  Integrated only. */
     template<data_columns col>
     uchar data_width() const {
