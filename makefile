@@ -30,6 +30,7 @@ help:
 	@echo "  debug: build with debug symbols"
 
 UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test \
+             $(UNIT_BUILD_DIR)/packed_row_reads_test \
              $(UNIT_BUILD_DIR)/alphabet_test \
              $(UNIT_BUILD_DIR)/columns_test \
              $(UNIT_BUILD_DIR)/api_test \
@@ -42,6 +43,7 @@ UNIT_TESTS = $(UNIT_BUILD_DIR)/packed_vector_test \
              $(UNIT_BUILD_DIR)/move_test \
              $(UNIT_BUILD_DIR)/permutation_test \
              $(UNIT_BUILD_DIR)/permutation_random_test \
+             $(UNIT_BUILD_DIR)/split_move_test \
              $(UNIT_BUILD_DIR)/rlbwt_row_test \
              $(UNIT_BUILD_DIR)/rlbwt_structure_test \
              $(UNIT_BUILD_DIR)/permutation_lf_fl_test \
@@ -63,6 +65,7 @@ example: examples/example.cpp examples/example.hpp $(HEADERS)
 
 test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(UNIT_BUILD_DIR)/packed_vector_test
+	$(UNIT_BUILD_DIR)/packed_row_reads_test
 	$(UNIT_BUILD_DIR)/alphabet_test
 	$(UNIT_BUILD_DIR)/columns_test
 	$(UNIT_BUILD_DIR)/interval_encoding_test
@@ -75,6 +78,7 @@ test: $(UNIT_TESTS) $(INTEGRATION_TESTS)
 	$(UNIT_BUILD_DIR)/move_test
 	$(UNIT_BUILD_DIR)/permutation_test
 	$(UNIT_BUILD_DIR)/permutation_random_test
+	$(UNIT_BUILD_DIR)/split_move_test
 	$(UNIT_BUILD_DIR)/rlbwt_row_test
 	$(UNIT_BUILD_DIR)/rlbwt_structure_test
 	$(UNIT_BUILD_DIR)/permutation_lf_fl_test
@@ -93,6 +97,10 @@ bench: $(BENCH_TESTS)
 
 # Unit tests (header-only data structures)
 $(UNIT_BUILD_DIR)/packed_vector_test: ./tests/unit/ds/packed_vector_test.cpp $(HEADERS)
+	mkdir -p $(UNIT_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(UNIT_BUILD_DIR)/packed_row_reads_test: ./tests/unit/ds/packed_row_reads_test.cpp $(HEADERS)
 	mkdir -p $(UNIT_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
@@ -141,6 +149,10 @@ $(UNIT_BUILD_DIR)/permutation_test: ./tests/unit/perm/permutation_test.cpp $(HEA
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 $(UNIT_BUILD_DIR)/permutation_random_test: ./tests/unit/perm/permutation_random_test.cpp $(HEADERS)
+	mkdir -p $(UNIT_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(UNIT_BUILD_DIR)/split_move_test: ./tests/unit/perm/split_move_test.cpp $(HEADERS)
 	mkdir -p $(UNIT_BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
